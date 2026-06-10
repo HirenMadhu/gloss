@@ -1,0 +1,58 @@
+[project]
+name = "gloss"
+version = "0.1.0"
+description = "HALOS — structured DocCards + Documentation Sufficiency Audit for relational foundation models ('names lie, meaning transfers')."
+readme = "README.md"
+requires-python = ">=3.12"
+# NOTE: torch / PyG-ecosystem / relbench come from custom indexes (PyTorch cu128 + data.pyg.org
+# find-links). Install via scripts/setup_env.sh (staged `uv pip install` with explicit indexes) rather
+# than a single `uv pip install -e .`, so torch resolves to the +cu128 build and not the CPU PyPI wheel.
+dependencies = [
+    # --- core relational / tabular stack ---
+    "torch==2.8.0",
+    "torch_geometric==2.8.0",
+    "pyg_lib==0.4.0",
+    "torch_scatter==2.1.2",
+    "relbench==2.1.2",
+    "pytorch-frame==0.3.0",
+    # --- frozen text encoder (Qwen3-Embedding-4B) ---
+    "sentence-transformers>=3.0",
+    "transformers>=4.51.2",
+    # --- Phase-2 proxy probe + Phase-5 audit ---
+    "lightgbm>=4.0",
+    "shap>=0.45",
+    "scikit-learn<=1.6.1",   # relbench 2.1.2 pins this cap
+    # --- data / io ---
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "duckdb",
+    "pooch",
+    "pyyaml",
+    "tqdm",
+    # --- harness (kept): Lightning + Hydra + W&B ---
+    "pytorch-lightning",
+    "hydra-core>=1.3",
+    "wandb",
+    "torchmetrics",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib", "ipdb"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gloss*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "relbench: tests that need a downloaded RelBench dataset (network); skipped if unavailable",
+    "slow: long-running tests (model/audit)",
+]

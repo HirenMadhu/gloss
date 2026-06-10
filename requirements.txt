@@ -1,0 +1,12 @@
+# -- Core ML stack --
+torch
+torchvision
+torchmetrics
+pytorch-lightning
+
+# -- Config & logging --
+hydra-core
+wandb
+
+# -- Utilities --
+ipdb

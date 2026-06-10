@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# data & outputs (root-anchored so gloss/data/ package is NOT ignored)
+/data/
+ckpt/
+logs/
+outputs/
+multirun/
+wandb/
+*.ckpt
+
+# HALOS caches / generated artifacts
+gloss/data/doccards_cache/
+*.text_cache/
+text_cache/
+*.npy
+*.npz
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
