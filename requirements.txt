@@ -1,12 +1,8 @@
-# -- Core ML stack --
-torch
-torchvision
-torchmetrics
-pytorch-lightning
-
-# -- Config & logging --
-hydra-core
-wandb
-
-# -- Utilities --
-ipdb
+# Dependencies are declared in pyproject.toml and installed via scripts/setup_env.sh
+# (staged uv install with custom indexes: PyTorch cu128 + data.pyg.org find-links).
+# Do NOT `pip install -r requirements.txt` — it would pull the CPU torch wheel from PyPI.
+#
+#   uv venv --python 3.12 .venv
+#   bash scripts/setup_env.sh
+#
+# See pyproject.toml [project.dependencies] for the authoritative list.

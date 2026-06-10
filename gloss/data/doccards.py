@@ -108,6 +108,43 @@ def default_card(table: str, column: str, dtype: str, fk_target: str | None = No
                    column_desc=f"the {column} field of {table}")
 
 
+def _infer_dtype(series) -> str:
+    import pandas as pd
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "datetime"
+    if pd.api.types.is_bool_dtype(series):
+        return "bool"
+    if pd.api.types.is_numeric_dtype(series):
+        return "numeric"
+    return "categorical"
+
+
+def cards_for_database(db, registry, planted=None, authored: dict | None = None) -> dict[int, DocCard]:
+    """Build ``{col_global_id: DocCard}`` for every column of a Database.
+
+    Precedence per column: ``authored`` (Claude-authored real card, keyed by ``(table, column)``) >
+    programmatic synthetic card (when ``planted`` is given) > schema-only ``default_card``. FK columns get
+    their ``fk_target``/``fk_role`` filled from the schema regardless of source.
+    """
+    authored = authored or {}
+    cards: dict[int, DocCard] = {}
+    for (table, column), cg in registry.col_global_id.items():
+        tbl = db.table_dict[table]
+        fk_target = tbl.fkey_col_to_pkey_table.get(column)
+        if (table, column) in authored:
+            card = authored[(table, column)]
+        elif planted is not None and table == "event" and column in (planted.causal_col, planted.decoy_col):
+            card = render_synthetic_card(table, column, planted)
+        else:
+            card = default_card(table, column, _infer_dtype(tbl.df[column]), fk_target)
+        if fk_target and not card.fk_target:
+            card.fk_target = f"{fk_target}.{db.table_dict[fk_target].pkey_col}"
+            card.fk_role = card.fk_role or f"{column} -> {card.fk_target}"
+        cards[cg] = card
+    return cards
+
+
 def render_synthetic_card(table: str, column: str, planted) -> DocCard:
     """Programmatic card for the synthetic generator — encodes the planted sign WITHOUT any LLM.
 

@@ -1,69 +1,48 @@
-# gloss
+# gloss — HALOS
 
-Minimal [PyTorch Lightning](https://lightning.ai/) + [Hydra](https://hydra.cc/) +
-[Weights & Biases](https://wandb.ai/) training template with multi-GPU (DDP) support.
+**HALOS** (*Heterogeneous Attention, Language Of Schema*) — a **measurement paper**:
+*"names lie, meaning transfers."* Across heterogeneous relational databases, column *names* are a brittle
+proxy; the transferable signal is documented column *meaning* (units, null semantics, coded-value
+dictionaries, FK-role descriptions). We **prove** the model uses meaning, not leaked names/labels.
 
-Structure follows the ImmunoFoundation convention: a root `train.py` with an
-`Experiment` class, nested plain-YAML configs (no `_target_` instantiation), and
-config sections passed straight into module constructors.
+Two headline contributions (the temporal kernel C2 is deferred to Paper #2):
+- **C1 — Structured DocCards**: per-column documentation as a frozen-LM modality, FiLM-fused into cells;
+  also fixes RT's dual-foreign-key ambiguity via distinct FK-role ids.
+- **C3 — Documentation Sufficiency Audit (DSA)**: a model-agnostic information-theoretic + faithfulness
+  audit (`Î(Y;Doc|Values,Structure)` + placebo + blind-authoring + Shapley) — *the product and the moat*.
 
-## Layout
+See [idea.md](idea.md) (rationale) and [implementation.md](implementation.md) (build spec) — both
+normative — and [PROGRESS.md](PROGRESS.md) for the phase-by-phase log.
 
+## Layout (`gloss/`)
 ```
-configs/train.yaml          # nested config: data / model / experiment
-train.py                    # Experiment class + @hydra.main entrypoint
-gloss/
-  data/MNISTDataModule.py   # LightningDataModule (takes data_cfg)
-  models/MNISTModule.py     # LightningModule   (takes model_cfg)
-  models/components/        # plain nn.Modules, selected via a registry dict
-  utils.py                  # rank-zero logger + config flattening for W&B
-scripts/train.sh            # SLURM + torchrun multi-GPU launcher
-tests/                      # CPU smoke tests
+data/   relbench_graph (leakage-safe temporal graph + sampler), doccards, doccard_authoring,
+        text_cache (frozen Qwen3-Embedding-4B), synthetic (planted-truth generator), collate
+proxy/  embed_probe                         # Phase 2: GATE 1 — the week-one proxy test
+model/  tokenizer fusion time_simple biases attention halos heads   # Phase 3 (stubs until GATE 1)
+audit/  cmi controls shapley faithfulness runner readback           # Phase 5 — THE PRODUCT
+train/  loop finetune pretrain losses       # Phase 4 (Lightning)
+eval/   gradient nameshuffle metrics         # Phase 6 (the headline map)
+utils/  seeding config logging flops
+ext/    time_scaleequiv                      # DEFERRED — Paper #2, do not build
 ```
 
-## Setup
-
+## Setup (Milgram / el8, CUDA 12.8)
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+uv venv --python 3.12 .venv
+bash scripts/setup_env.sh            # staged install: torch 2.8.0+cu128 + PyG + relbench + Qwen + harness
+sbatch scripts/build_flash_attn.sh   # optional: flash-attn from source (sm_86;sm_90); off the gate path
 ```
+Large caches go to scratch: `export HF_HOME=~/scratch60/hf GLOSS_SCRATCH=~/scratch60`.
 
-## Train
-
-Single process (W&B off — no run name set):
-
+## Run
 ```bash
-python train.py
+python scripts/run_finetune.py --dry-run                 # Phase 0 DoD: sample a batch, print shapes
+python scripts/build_text_cache.py --dataset synthetic --encoder qwen --regime all   # Phase 1
+python scripts/run_proxy_gate.py                         # Phase 2: GATE 1 (the first real result)
+pytest                                                   # Phase 0–1 green; Phase 3/5 skipped
 ```
 
-Enable W&B and override any config value from the CLI (Hydra dotlist):
-
-```bash
-python train.py experiment.wandb.name=my-run experiment.trainer.max_epochs=20
-```
-
-Multi-GPU via DDP (4 GPUs on one node):
-
-```bash
-torchrun --nproc_per_node=4 train.py experiment.wandb.name=my-run
-# or submit the SLURM script:
-sbatch scripts/train.sh
-```
-
-`experiment.num_devices` caps the GPU count; the actual number used is
-`min(num_devices, visible GPUs)`.
-
-## Test
-
-```bash
-pytest tests/
-```
-
-## Adapting it
-
-- New dataset → add a `LightningDataModule` under `gloss/data/`, swap it in `train.py`.
-- New architecture → add an `nn.Module` under `gloss/models/components/` and register
-  it in the `NETS` dict in `gloss/models/MNISTModule.py`.
-- New hyperparameters → add fields to `configs/train.yaml`; they're available as
-  `cfg.<section>.<field>` with no code changes.
+## Working agreement
+Measurement-first (not SOTA); **proxy before transformer** (stop at GATE 1); the audit is the deliverable;
+small & reproducible (≤~30M params, frozen cached text encoder, global seed). Don't build the C2 kernel.

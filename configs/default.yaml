@@ -1,0 +1,32 @@
+# HALOS default config (implementation.md §8). Hydra-composable; standalone scripts read via OmegaConf.
+seed: 0
+data:
+  dataset: synthetic
+  task: twin-sign
+  sampler: {num_neighbors: [12, 12], max_cells: 4096, time_attr: row_time}
+docs:
+  regime: full            # full | name_only | placebo
+  blind: false
+  arm: informed           # informed | blind  (real-DB Claude authoring)
+  encoder: Qwen/Qwen3-Embedding-4B   # 2560-dim, frozen, cached
+model:                    # Phase 3+ (not built until GATE 1 is green)
+  d_model: 256
+  n_heads: 8
+  n_layers: 12
+  masks: [column, feature, neighbor]      # full off by default
+  struct_bias: {mode: typed_metapath}     # none | scalar_hop | typed_metapath
+  temporal: {mode: log_decay}             # log_decay | rt_scalar  (NOT the deferred kernel)
+  fusion: film
+audit:                    # Phase 5
+  estimator: predictive_cmi
+  seeds: 5
+  controls: [placebo, blind]
+  faithfulness: [deletion, insertion, comprehensiveness, sufficiency, polarity]
+  run_on: [rt, relgt, halos]
+train:                    # Phase 4
+  lr: 3.0e-4
+  weight_decay: 0.01
+  batch_seeds: 64
+  max_steps: 50000
+  amp: true
+ext_temporal: false       # true ONLY for the deferred Paper-#2 kernel (Appendix E)
