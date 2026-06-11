@@ -24,7 +24,7 @@ echo "cutlass present: $(ls csrc/cutlass/include >/dev/null 2>&1 && echo yes || 
 
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
 export FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE
-export FLASH_ATTN_CUDA_ARCHS="86;90"
+export FLASH_ATTN_CUDA_ARCHS="80;90"
 export MAX_JOBS=8
 export NVCC_THREADS=2
 

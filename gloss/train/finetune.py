@@ -52,12 +52,12 @@ def docs_for_regime(bundle, dataset: str, regime: str, **kw):
     return g, doc_mp
 
 
-def train(
+def train_prebuilt(
+    bundle,
+    task,
+    grounding,
+    doc_per_metapath,
     *,
-    dataset: str = "rel-f1",
-    task_name: str = "driver-dnf",
-    regime: str = "full",
-    encoder: str = "qwen",
     model_kwargs: dict | None = None,
     num_neighbors: list[int] | None = None,
     batch_size: int = 64,
@@ -70,17 +70,12 @@ def train(
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
 ):
-    from relbench.tasks import get_task
-
+    """Train one HALOS run on a PREBUILT bundle + grounding (the H1 gate reuses these across configs)."""
     from ..utils.seeding import seed_everything
 
     seed_everything(seed)
-    bundle = build_gloss_graph(dataset)
-    task = get_task(dataset, task_name, download=False)
-    g, doc_mp = docs_for_regime(bundle, dataset, regime, encoder=encoder,
-                                d_text=(model_kwargs or {}).get("d_text", 64))
     module = HALOSLitModule(
-        bundle, g, doc_mp, task.entity_table,
+        bundle, grounding, doc_per_metapath, task.entity_table,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
     )
     dm = HALOSDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size)
@@ -92,5 +87,22 @@ def train(
         limit_val_batches=limit_val_batches or 1.0,
     )
     trainer.fit(module, dm)
-    metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
-    return module, metrics
+    return module, {k: float(v) for k, v in trainer.callback_metrics.items()}
+
+
+def train(
+    *,
+    dataset: str = "rel-f1",
+    task_name: str = "driver-dnf",
+    regime: str = "full",
+    encoder: str = "qwen",
+    model_kwargs: dict | None = None,
+    **kw,
+):
+    from relbench.tasks import get_task
+
+    bundle = build_gloss_graph(dataset)
+    task = get_task(dataset, task_name, download=False)
+    g, doc_mp = docs_for_regime(bundle, dataset, regime, encoder=encoder,
+                                d_text=(model_kwargs or {}).get("d_text", 64))
+    return train_prebuilt(bundle, task, g, doc_mp, model_kwargs=model_kwargs, **kw)

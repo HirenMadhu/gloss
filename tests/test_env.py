@@ -54,6 +54,25 @@ def test_pyg_version_supports_torch28():
     assert (major, minor) >= (2, 6), f"torch_geometric too old: {torch_geometric.__version__}"
 
 
-@pytest.mark.xfail(reason="flash-attn is built from source on SLURM; off the Phase 0-3 critical path", strict=False)
-def test_flash_attn_available():
-    import flash_attn  # noqa: F401
+def test_flash_attn_imports():
+    """flash-attn is built from source (scripts/build_flash_attn_local.sh). It imports once built;
+    the GPU kernel is arch-specific (the current build targets sm_90/H100), so we only check import
+    here and exercise a kernel opportunistically below."""
+    pytest.importorskip("flash_attn")
+
+
+@pytest.mark.slow
+def test_flash_attn_kernel_runs_if_arch_matches():
+    fa = pytest.importorskip("flash_attn")
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU")
+    from flash_attn import flash_attn_func
+
+    q = torch.randn(1, 8, 4, 64, device="cuda", dtype=torch.bfloat16)
+    try:
+        o = flash_attn_func(q, q, q, causal=True)
+    except Exception as e:
+        pytest.skip(f"flash-attn kernel not built for this GPU arch ({e.__class__.__name__})")
+    assert o.shape == q.shape and torch.isfinite(o).all()

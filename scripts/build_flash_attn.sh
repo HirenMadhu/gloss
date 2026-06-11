@@ -45,7 +45,7 @@ echo "cutlass present: $(ls csrc/cutlass/include >/dev/null 2>&1 && echo yes || 
 
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
 export FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE    # MUST match torch 2.8 (abiTRUE)
-export FLASH_ATTN_CUDA_ARCHS="86;90"           # A40 (sm_86) + H100 (sm_90)
+export FLASH_ATTN_CUDA_ARCHS="80;90"           # A40 (sm_86) + H100 (sm_90)
 export MAX_JOBS=16
 export NVCC_THREADS=2
 

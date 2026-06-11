@@ -101,3 +101,27 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
     (post-build) before it's competitive — and **before GATE 1 (H1) is meaningful** (a near-chance model
     can't resolve a 1–3% doc effect). H1/H2 machinery (`scripts/run_h1_gate.py`, `geometry_mode` toggle)
     is built and unit-tested; run it once the build frees the CPU.
+
+## Phase 5 — GATE 1 (H1 + H2): machinery built; result is a SMOKE run, NOT a verdict
+- `scripts/run_h1_gate.py` (graph + 3 groundings built ONCE, reused across configs via
+  `finetune.train_prebuilt`); `model.geometry_mode ∈ {generated, free_learned}` for H2.
+- **FlexAttention** backend added (`attn_impl={sdpa,flex}`) + GPU parity test — the "flash for HALOS".
+- **Smoke gate (1 seed, 1 epoch, 12 train batches, d_model=64 — UNDERTRAINED, near chance):**
+  | H1 regime | val AP | val AUROC |   | H2 mode | val AP | val AUROC |
+  |---|---|---|---|---|---|---|
+  | full | 0.788 | 0.477 |   | generated | 0.788 | 0.477 |
+  | shuffled_spans | 0.788 | 0.479 |   | free_learned | 0.746 | 0.429 |
+  | null | 0.786 | 0.473 |   | | | |
+- **NOT a GO/NO-GO.** All AUROCs ≈ 0.5 (model barely trained), so H1 cannot resolve any doc effect and
+  H2 is noise. The blocker is **compute in this interactive session**: the PyG disjoint neighbor sampler
+  is CPU-bound (~2 min per short run), and the flash-attn build was saturating the 8 CPUs for ~1 h.
+- **To get a real gate:** run on **SLURM (H100 + more CPUs)** with proper training (≥5 epochs to
+  convergence, full batches, ≥5 seeds). The code is ready (`run_h1_gate.py`); only compute is missing.
+  Reminder: rel-f1 is well-named, so even a converged H1 may be small — the existence proof is Phase-6 synthetic.
+
+## flash-attn build (Stage A)
+- Built + installed `flash_attn 2.8.3` from source on the A40 node. **BUT targeted sm_90 (H100) only** —
+  flash-attn maps Ampere→sm_80 and my `ARCHS="86;90"` dropped it, so the kernel errors on this A40
+  ("no kernel image"). Fixed both build scripts to `ARCHS="80;90"` for a future rebuild. Off the critical
+  path (HALOS uses SDPA/Flex; Qwen cache already built), so not rebuilt now. `test_env` checks import +
+  arch-guards the kernel.
