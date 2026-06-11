@@ -67,6 +67,7 @@ def train_prebuilt(
     accelerator: str = "auto",
     logger=False,
     seed: int = 0,
+    num_workers: int = 0,
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
 ):
@@ -78,7 +79,8 @@ def train_prebuilt(
         bundle, grounding, doc_per_metapath, task.entity_table,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
     )
-    dm = HALOSDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size)
+    dm = HALOSDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
+                         num_workers=num_workers)
     trainer = pl.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices=1,
         logger=logger, enable_checkpointing=False, enable_model_summary=False,

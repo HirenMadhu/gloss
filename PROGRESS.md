@@ -125,3 +125,11 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
   ("no kernel image"). Fixed both build scripts to `ARCHS="80;90"` for a future rebuild. Off the critical
   path (HALOS uses SDPA/Flex; Qwen cache already built), so not rebuilt now. `test_env` checks import +
   arch-guards the kernel.
+
+## GATE 1 — proper run submitted to SLURM (multi-GPU array)
+- `scripts/gate_run.py` (one config per process: `--index`, `--list`, `--aggregate`) +
+  `scripts/run_gate.sh` (`#SBATCH --array=0-19%4`, h100:1 each, 12 CPUs, num_workers=8, 10 epochs,
+  d_model=256/n_layers=8, full batches). 20 configs = 5 seeds × {full,shuffled,null}-generated + full-free_learned.
+- Submitted: **job array 28963902_[0-19%4]** (4 H100s in parallel). Independent runs → array, not DDP.
+- Harvest when done: `.venv/bin/python scripts/gate_run.py --aggregate` → H1/H2 tables (mean±std over 5 seeds);
+  paste into this file with the Go/No-go decision + the well-named-rel-f1 caveat.
