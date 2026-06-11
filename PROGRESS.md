@@ -54,3 +54,15 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
   fk .92). Encoder-specific knob; revisit at the H1 gate (Phase 5).
 - **Tests:** test_corpus, test_grounding (controllable BoW encoder + HashEncoder; null fallback, placebo
   decorrelation, determinism, cache idempotency) — all green. Full suite: **48 passed, 1 xfailed**.
+
+## Phase 2 — doc-conditioned node encoder ✅
+- `gloss/model/time_encoding.py`: `node_tau` (τ_u = log((seed−row)/T_ctx), float64, valid only for
+  timed positive-gap rows; **scale-invariant** by construction) + `BochnerTime` (learnable Fourier
+  features of τ).
+- `gloss/model/column_encoder.py`: per-cell embeddings via pytorch-frame `StypeWiseFeatureEncoder`
+  (reused, not reinvented) → **per-column FiLM** `x_c=γ(d_c)⊙W_v Enc(v_c)+β(d_c)` → **doc-keyed
+  attention pool** over columns → `h_u = pool + E_type(t) + W_t φ(τ_u)`. Ungrounded columns / null
+  regime fall back to a learned `d_null`.
+- **Tests:** test_time_encoding (formula, scale-invariance, Bochner) hermetic; test_column_encoder
+  (guarded rel-f1): finite `[B,N,d_model]`, pad=0, and **FiLM responds to full↔null regime**.
+- DoD met. Full suite: **53 passed, 1 xfailed**.
