@@ -42,6 +42,8 @@ class GlossBatch:
     # per-seed [B]
     seed_time: Tensor              # float64
     t_ctx: Tensor                  # float64; median nonzero gap per subgraph (>=1)
+    target: Tensor                 # [B] float; label per seed (0 where absent)
+    has_target: Tensor             # [B] bool; True where a label was attached
     # pairwise [B, N_max, N_max]
     attend_mask: Tensor            # bool; True = j may attend to i (<=2-hop or self, same subgraph)
     metapath_id: Tensor            # long; {PAD,SELF,MULTIHOP} + per-relation
@@ -62,6 +64,7 @@ class GlossBatch:
             node_type_id=mv(self.node_type_id), pad_mask=mv(self.pad_mask), is_seed=mv(self.is_seed),
             is_timed=mv(self.is_timed), row_time=mv(self.row_time), n_id=mv(self.n_id),
             seed_time=mv(self.seed_time), t_ctx=mv(self.t_ctx),
+            target=mv(self.target), has_target=mv(self.has_target),
             attend_mask=mv(self.attend_mask), metapath_id=mv(self.metapath_id),
             fk_role_id=mv(self.fk_role_id), dt=mv(self.dt), tau=mv(self.tau),
             temporal_valid=mv(self.temporal_valid),
@@ -136,6 +139,16 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
 
     B = int(seg.max().item()) + 1
     seed_time = _seed_time_per_segment(batch[entity_table], B)
+
+    # labels (attached by AttachTargetTransform to the entity store as `y`); absent in --dry-run
+    ent = batch[entity_table]
+    target = torch.zeros(B, dtype=torch.float32)
+    has_target = torch.zeros(B, dtype=torch.bool)
+    if "y" in ent:
+        y = ent.y.to(torch.float32)
+        yb = ent.batch[: y.numel()] if y.numel() != ent.batch.numel() else ent.batch
+        target[yb] = y
+        has_target[yb] = True
 
     # local index within each segment (0..n_b-1) and per-segment counts
     local_pos = torch.empty(total, dtype=torch.long)
@@ -266,6 +279,7 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
         num_seeds=B, n_max=n_max,
         node_type_id=node_type_id, pad_mask=pad_mask, is_seed=is_seed_g, is_timed=is_timed_g,
         row_time=row_time_g, n_id=n_id_g, seed_time=seed_time, t_ctx=t_ctx,
+        target=target, has_target=has_target,
         attend_mask=attend_mask, metapath_id=metapath_id, fk_role_id=fk_role_id,
         dt=dt, tau=tau, temporal_valid=temporal_valid,
         tf_dict=tf_dict, placement=placement,

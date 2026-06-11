@@ -58,34 +58,45 @@ class BiasGenerator(nn.Module):
         hidden: int = 128,
         sigma_floor: float = 0.1,
         absolute_anchor: bool = False,
+        geometry_mode: str = "generated",
     ):
         super().__init__()
+        assert geometry_mode in ("generated", "free_learned")
         self.num_metapaths = num_metapaths
         self.n_heads = n_heads
         self.sigma_floor = sigma_floor
         self.absolute_anchor = absolute_anchor
+        self.geometry_mode = geometry_mode
         self.n_out = 5 if absolute_anchor else 4
 
-        self.e_metapath = nn.Embedding(num_metapaths, d_meta)
-        self.null_doc = nn.Parameter(torch.zeros(d_text))
-        self.mlp = nn.Sequential(
-            nn.Linear(d_meta + d_text, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, n_heads * self.n_out),
-        )
+        if geometry_mode == "free_learned":
+            # H2 baseline: a free learned (a,μ,σ,b) per metapath — no docs, no g_θ. Tests whether
+            # generating geometry FROM documentation beats just learning a constant per relation.
+            self.free = nn.Parameter(torch.randn(num_metapaths, n_heads, self.n_out) * 0.02)
+        else:
+            self.e_metapath = nn.Embedding(num_metapaths, d_meta)
+            self.null_doc = nn.Parameter(torch.zeros(d_text))
+            self.mlp = nn.Sequential(
+                nn.Linear(d_meta + d_text, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, n_heads * self.n_out),
+            )
 
     def compile(self, doc_per_metapath: Tensor | None = None) -> GeometryTable:
         """Run g_θ over all metapath ids -> a GeometryTable. ``doc_per_metapath`` is ``[P, d_text]``
         (pooled FK-role docs); rows left as None fall back to the learned ``null_doc``."""
         P = self.num_metapaths
-        ids = torch.arange(P, device=self.e_metapath.weight.device)
-        e = self.e_metapath(ids)                                  # [P, d_meta]
-        if doc_per_metapath is None:
-            doc = self.null_doc.unsqueeze(0).expand(P, -1)
+        if self.geometry_mode == "free_learned":
+            out = self.free                                       # [P, H, n_out] — docs ignored
         else:
-            doc = doc_per_metapath.to(e.dtype).to(e.device)
-        out = self.mlp(torch.cat([e, doc], dim=-1))               # [P, H*n_out]
-        out = out.view(P, self.n_heads, self.n_out)
+            ids = torch.arange(P, device=self.e_metapath.weight.device)
+            e = self.e_metapath(ids)                              # [P, d_meta]
+            if doc_per_metapath is None:
+                doc = self.null_doc.unsqueeze(0).expand(P, -1)
+            else:
+                doc = doc_per_metapath.to(e.dtype).to(e.device)
+            out = self.mlp(torch.cat([e, doc], dim=-1))           # [P, H*n_out]
+            out = out.view(P, self.n_heads, self.n_out)
         a, mu, sig_raw, b = out[..., 0], out[..., 1], out[..., 2], out[..., 3]
         sigma = F.softplus(sig_raw) + self.sigma_floor
         anchor_w = out[..., 4] if self.absolute_anchor else None

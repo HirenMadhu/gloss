@@ -84,3 +84,20 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
 - **Tests:** test_bias_generator, test_attention, test_fk_role (dual-FK fixture: distinct geometry +
   role-swap changes preds), test_scale_equivariance (full rel-f1 model invariant; absolute_anchor breaks
   it). DoD: forward runs, geometry report renders. **65 passed, 1 xfailed.**
+
+## Phase 4 — training loop + LightGBM floor ✅ (preliminary numbers)
+- `gloss/train/{datamodule,loop,finetune,losses}.py`: Lightning `DataModule` over the disjoint temporal
+  loaders + `HALOSLitModule` (BCEWithLogits; raw batch → `GlossBatch` in `transfer_batch_to_device`);
+  `make_loader` now attaches labels via `AttachTargetTransform` → `GlossBatch.target/has_target`.
+- `gloss/eval/metrics.py`: val AP/AUROC/log_loss via **sklearn** (relbench's `log_loss` is buggy on this
+  numpy). `gloss/eval/baselines.py`: LightGBM-on-aggregated-raw-features floor.
+- `scripts/run_finetune.py --train` (+ `--baseline`, `--regime`, `--encoder`).
+- **Tests:** `test_train.py` — overfits a single batch to <0.1 loss (GPU), val metrics finite. Suite green.
+- **DoD numbers (PRELIMINARY — undertrained):** the flash-attn build saturated the 8 CPUs (the neighbor
+  sampler is CPU-bound), forcing a tiny config (d_model=128, n_layers=4, 2 epochs × 20 train batches).
+  - HALOS-full val: **AP 0.813, AUROC 0.556** (near chance — far from converged).
+  - LightGBM floor val: **AP 0.929, AUROC 0.786** (n_val=566, 31 feats).
+  - ⇒ The loop works end-to-end and produces val metrics, but HALOS needs a **proper run on clean CPU**
+    (post-build) before it's competitive — and **before GATE 1 (H1) is meaningful** (a near-chance model
+    can't resolve a 1–3% doc effect). H1/H2 machinery (`scripts/run_h1_gate.py`, `geometry_mode` toggle)
+    is built and unit-tested; run it once the build frees the CPU.

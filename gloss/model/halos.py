@@ -50,6 +50,7 @@ class HALOS(nn.Module):
         n_freq: int = 16,
         sigma_floor: float = 0.1,
         absolute_anchor: bool = False,
+        geometry_mode: str = "generated",
         out_dim: int = 1,
     ):
         super().__init__()
@@ -57,7 +58,7 @@ class HALOS(nn.Module):
         self.encoder = ColumnEncoder(bundle, d_model=d_model, d_text=d_text, n_freq=n_freq)
         self.bias_gen = BiasGenerator(
             bundle.num_metapaths, n_heads, d_text=d_text,
-            sigma_floor=sigma_floor, absolute_anchor=absolute_anchor,
+            sigma_floor=sigma_floor, absolute_anchor=absolute_anchor, geometry_mode=geometry_mode,
         )
         self.layers = nn.ModuleList([HALOSLayer(d_model, n_heads) for _ in range(n_layers)])
         self.head = EntityHead(d_model, out_dim)

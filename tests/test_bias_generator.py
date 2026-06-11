@@ -50,3 +50,16 @@ def test_absolute_anchor_emits_extra_coefficient():
     bg = BiasGenerator(P, H, d_text=DT, absolute_anchor=True)
     geom = bg.compile()
     assert geom.anchor_w is not None and geom.anchor_w.shape == (P, H)
+
+
+def test_free_learned_mode_ignores_docs():
+    # H2 baseline: geometry is a free learned table, independent of documentation.
+    torch.manual_seed(0)
+    bg = BiasGenerator(P, H, d_text=DT, geometry_mode="free_learned")
+    docA = torch.zeros(P, DT)
+    docB = torch.randn(P, DT)
+    gA, gB = bg.compile(docA), bg.compile(docB)
+    assert torch.equal(gA.a, gB.a) and torch.equal(gA.mu, gB.mu)   # docs have no effect
+    assert (gA.sigma >= bg.sigma_floor - 1e-6).all()
+    # and it still produces a valid, diverse table
+    assert not torch.allclose(gA.a[0], gA.a[1])
