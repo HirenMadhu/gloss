@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
 import torch
 
 from gloss.data.collate import to_gloss_batch
@@ -57,3 +58,26 @@ def test_masked_pairs_do_not_leak(dualfk_batch, dualfk_bundle):
         mp[:, 0, 1] = (mp[:, 0, 1] + 1) % geom.num_metapaths
         out = attn(h, dataclasses.replace(gb_masked, metapath_id=mp), geom)
     assert torch.allclose(base[gb.pad_mask], out[gb.pad_mask], atol=1e-6)
+
+
+@pytest.mark.slow
+def test_flex_matches_sdpa(dualfk_batch, dualfk_bundle):
+    """FlexAttention backend parity with SDPA on real (non-pad) rows. Marked slow (torch.compile)."""
+    if not torch.cuda.is_available():
+        pytest.skip("FlexAttention needs a GPU/Triton backend")
+    dev = torch.device("cuda")
+    gb, geom, _attn, h = _setup(dualfk_batch, dualfk_bundle)
+    gb, h = gb.to(dev), h.to(dev)
+    geom = dataclasses.replace(geom, a=geom.a.to(dev), mu=geom.mu.to(dev),
+                               sigma=geom.sigma.to(dev), b=geom.b.to(dev))
+    torch.manual_seed(1)
+    sdpa = RelationalAttention(D_MODEL, H, attn_impl="sdpa").to(dev).eval()
+    flex = RelationalAttention(D_MODEL, H, attn_impl="flex").to(dev).eval()
+    flex.load_state_dict(sdpa.state_dict())   # identical weights
+    with torch.no_grad():
+        out_sdpa = sdpa(h, gb, geom)
+        try:
+            out_flex = flex(h, gb, geom)
+        except Exception as e:                # flex needs a recent triton/compile stack
+            pytest.skip(f"flex_attention unavailable in this env: {e}")
+    assert torch.allclose(out_sdpa[gb.pad_mask], out_flex[gb.pad_mask], atol=1e-3)

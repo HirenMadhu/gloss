@@ -22,10 +22,11 @@ from .heads import EntityHead
 class HALOSLayer(nn.Module):
     """Pre-norm relational-attention block + FFN."""
 
-    def __init__(self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, ff_mult: int = 4, dropout: float = 0.0,
+                 *, attn_impl: str = "sdpa"):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = RelationalAttention(d_model, n_heads)
+        self.attn = RelationalAttention(d_model, n_heads, attn_impl=attn_impl)
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model), nn.GELU(),
@@ -51,6 +52,7 @@ class HALOS(nn.Module):
         sigma_floor: float = 0.1,
         absolute_anchor: bool = False,
         geometry_mode: str = "generated",
+        attn_impl: str = "sdpa",
         out_dim: int = 1,
     ):
         super().__init__()
@@ -60,7 +62,9 @@ class HALOS(nn.Module):
             bundle.num_metapaths, n_heads, d_text=d_text,
             sigma_floor=sigma_floor, absolute_anchor=absolute_anchor, geometry_mode=geometry_mode,
         )
-        self.layers = nn.ModuleList([HALOSLayer(d_model, n_heads) for _ in range(n_layers)])
+        self.layers = nn.ModuleList(
+            [HALOSLayer(d_model, n_heads, attn_impl=attn_impl) for _ in range(n_layers)]
+        )
         self.head = EntityHead(d_model, out_dim)
 
     def compile_geometry(self, doc_per_metapath: Tensor | None = None) -> GeometryTable:

@@ -23,11 +23,13 @@ NEG_INF = float("-inf")
 
 
 class RelationalAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, *, attn_impl: str = "sdpa"):
         super().__init__()
         assert d_model % n_heads == 0
+        assert attn_impl in ("sdpa", "flex")
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.attn_impl = attn_impl
         self.q = nn.Linear(d_model, d_model)
         self.k = nn.Linear(d_model, d_model)
         self.v = nn.Linear(d_model, d_model)
@@ -68,8 +70,45 @@ class RelationalAttention(nn.Module):
             return x.view(B, N, H, dh).transpose(1, 2)            # [B, H, N, dh]
 
         q, k, v = split(self.q(h)), split(self.k(h)), split(self.v(h))
-        attn_mask = self._bias(gb, geom, log_t_ctx, h.dtype, h.device)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)   # [B, H, N, dh]
+        if self.attn_impl == "flex":
+            out = self._flex(q, k, v, gb, geom, log_t_ctx)
+        else:
+            attn_mask = self._bias(gb, geom, log_t_ctx, h.dtype, h.device)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)   # [B, H, N, dh]
         out = out.transpose(1, 2).reshape(B, N, d)
         out = self.o(out)
         return out * gb.pad_mask.to(h.device).unsqueeze(-1)
+
+    def _flex(self, q, k, v, gb: GlossBatch, geom: GeometryTable, log_t_ctx: Tensor | None) -> Tensor:
+        """FlexAttention backend: the Gaussian-in-τ bias as a fused ``score_mod`` — no [N,N] bias is
+        materialized (the real 'flash for HALOS' at scale). Standard flash-attn can't take this bias.
+
+        NOTE: flex recompiles per distinct N (subgraph size varies), so it's only a win at large N /
+        pretraining; SDPA stays the default. Parity with SDPA on real rows is the tested contract.
+        """
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        dev = q.device
+        a, mu, sigma, b = geom.a.to(dev), geom.mu.to(dev), geom.sigma.to(dev), geom.b.to(dev)
+        mp = gb.metapath_id.to(dev)                  # [B, N, N]
+        tau = gb.tau.to(dev).to(q.dtype)
+        tv = gb.temporal_valid.to(dev)
+        attend = gb.attend_mask.to(dev)
+        anchor = geom.anchor_w.to(dev) if (geom.anchor_w is not None and log_t_ctx is not None) else None
+        ltc = log_t_ctx.to(dev) if log_t_ctx is not None else None
+
+        def score_mod(score, bi, hi, qi, ki):
+            p = mp[bi, qi, ki]
+            mu_p = mu[p, hi]
+            if anchor is not None:
+                mu_p = mu_p + anchor[p, hi] * ltc[bi]
+            gauss = a[p, hi] * torch.exp(-((tau[bi, qi, ki] - mu_p) ** 2) / (2 * sigma[p, hi] ** 2))
+            gauss = torch.where(tv[bi, qi, ki], gauss, torch.zeros_like(gauss))
+            return score + b[p, hi] + gauss
+
+        def mask_mod(bi, hi, qi, ki):
+            return attend[bi, qi, ki] | (qi == ki)   # keep diagonal so padded rows never fully mask
+
+        Bn, _, N, _ = q.shape
+        block_mask = create_block_mask(mask_mod, Bn, None, N, N, device=str(dev))
+        return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
