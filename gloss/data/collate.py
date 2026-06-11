@@ -246,9 +246,15 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
     t_ctx = torch.ones(B, dtype=torch.float64)
     tau = torch.zeros(B, n_max, n_max, dtype=torch.float64)
     for b in range(B):
-        gaps = dt[b][temporal_valid[b] & (dt[b] > 0)]
-        if gaps.numel() > 0:
-            t_ctx[b] = torch.median(gaps)
+        pair_gaps = dt[b][temporal_valid[b] & (dt[b] > 0)]
+        # also fold in node recencies (seed_time - row_time): this keeps T_ctx a REAL timescale (so it
+        # scales with a global clock rescale) even for subgraphs with no valid pairwise gap — otherwise
+        # the fallback T_ctx=1.0 would make the node-time term log((seed-row)/1) non-invariant.
+        rec = (seed_time[b] - row_time_g[b])[is_timed_g[b]]
+        rec = rec[rec > 0]
+        all_gaps = torch.cat([pair_gaps, rec])
+        if all_gaps.numel() > 0:
+            t_ctx[b] = torch.median(all_gaps)
         tv = temporal_valid[b] & (dt[b] > 0)
         tau[b][tv] = torch.log(dt[b][tv] / t_ctx[b])
     # pairs with dt==0 but both timed are not "temporal" (same instant) -> structural bucket

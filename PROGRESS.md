@@ -66,3 +66,21 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
 - **Tests:** test_time_encoding (formula, scale-invariance, Bochner) hermetic; test_column_encoder
   (guarded rel-f1): finite `[B,N,d_model]`, pad=0, and **FiLM responds to full↔null regime**.
 - DoD met. Full suite: **53 passed, 1 xfailed**.
+
+## Phase 3 — the core operator (doc-generated geometry) ✅
+- `gloss/model/bias_generator.py` (**CORE**): `g_θ` maps `ctx(p)=[E_metapath(p); doc(p)]` → per-head
+  `(a,μ,σ,b)` (σ=softplus+floor). `compile()` runs once per DB over the metapath set → `GeometryTable`
+  (recomputed each forward; gradients flow). `absolute_anchor` emits an extra `log T_ctx` coefficient.
+- `gloss/model/attention.py`: `B_h(i,j)=b + temporal_valid·a·exp(−(τ−μ)²/2σ²)`; additive bias via
+  `F.scaled_dot_product_attention` (SDPA mem-efficient; flash-attn can't take per-pair bias). Diagonal
+  kept finite so padded rows don't NaN.
+- `gloss/model/halos.py`: `ColumnEncoder` → compile geometry → `HALOSLayer` (pre-norm attn + FFN) stack →
+  `EntityHead` seed readout. `build_doc_per_metapath` pools FK-role docs into the geometry context.
+- `gloss/model/heads.py`, `gloss/eval/geometry_report.py` (+ `scripts/run_geometry_report.py`): the
+  readable per-FK-role kernel exhibit (renders untrained).
+- **Invariance fix:** absolute timestamp *cell features* are dropped (time enters only via τ); and
+  `T_ctx` now folds in node recencies `(seed−row)` so it always scales with the clock (the old 1.0
+  fallback made the node-time term non-invariant). Result: **logits bit-identical under t→c·t (1e-5)**.
+- **Tests:** test_bias_generator, test_attention, test_fk_role (dual-FK fixture: distinct geometry +
+  role-swap changes preds), test_scale_equivariance (full rel-f1 model invariant; absolute_anchor breaks
+  it). DoD: forward runs, geometry report renders. **65 passed, 1 xfailed.**

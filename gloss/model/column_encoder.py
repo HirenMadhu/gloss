@@ -28,6 +28,16 @@ from ..docs.grounding import GroundingResult
 from .time_encoding import BochnerTime, node_tau
 
 
+def _timestamp_cols(col_names_dict) -> set[str]:
+    """Timestamp-stype column names. We ENCODE them (StypeWiseFeatureEncoder needs an encoder for every
+    stype in the frame) but DROP them from node features: an absolute row timestamp is a *dimensioned*
+    clock, and feeding it as a cell value would break exact scale-equivariance. Time enters HALOS only
+    through the dimensionless τ (node-time term + bias generator), never as a raw cell value."""
+    import torch_frame
+
+    return set(col_names_dict.get(torch_frame.timestamp, []))
+
+
 def _default_stype_encoders(col_names_dict):
     import torch_frame
     from torch_frame.nn import (
@@ -66,15 +76,17 @@ class ColumnEncoder(nn.Module):
         enc_channels = enc_channels or d_model
         self.enc_channels = enc_channels
 
-        # one per-cell stype encoder per node type, plus the ordered (col_name -> grounding key) map
+        # one per-cell stype encoder per node type; timestamp columns are dropped from features post-hoc
         self.cell_encoders = nn.ModuleDict()
-        self._col_keys: dict[str, list[str]] = {}
+        self._drop_cols: dict[str, set[str]] = {}
         for nt in bundle.node_types:
             tf = bundle.data[nt].tf
             col_names_dict = tf.col_names_dict
             stype_enc = _default_stype_encoders(col_names_dict)
-            if not stype_enc:
-                self._col_keys[nt] = []
+            self._drop_cols[nt] = _timestamp_cols(col_names_dict)
+            # build only if there is at least one *feature* (non-timestamp) column
+            n_feature_cols = sum(len(c) for st, c in col_names_dict.items()) - len(self._drop_cols[nt])
+            if not stype_enc or n_feature_cols <= 0:
                 continue
             self.cell_encoders[nt] = StypeWiseFeatureEncoder(
                 out_channels=enc_channels,
@@ -82,8 +94,6 @@ class ColumnEncoder(nn.Module):
                 col_names_dict=col_names_dict,
                 stype_encoder_dict=stype_enc,
             )
-            ordered = [c for st in col_names_dict for c in col_names_dict[st]]
-            self._col_keys[nt] = [f"col::{nt}::{c}" for c in ordered]
 
         # FiLM from doc embedding; value projection; doc-keyed attention pool
         self.gamma = nn.Linear(d_text, d_model)
@@ -111,6 +121,14 @@ class ColumnEncoder(nn.Module):
         if nt not in self.cell_encoders:
             return self.pool_query.new_zeros(n, self.d_model)
         x, col_names = self.cell_encoders[nt](tf)            # x: [n, C, enc_channels]
+        # drop timestamp columns (computed but excluded from features — see _timestamp_cols)
+        drop = self._drop_cols.get(nt, set())
+        if drop:
+            keep = [i for i, c in enumerate(col_names) if c not in drop]
+            x = x[:, keep]
+            col_names = [col_names[i] for i in keep]
+        if x.shape[1] == 0:
+            return self.pool_query.new_zeros(n, self.d_model)
         keys = [f"col::{nt}::{c}" for c in col_names]
         d_c = self._doc_for_columns(keys, grounding)         # [C, d_text]
         gamma = self.gamma(d_c).unsqueeze(0)                 # [1, C, d_model]
