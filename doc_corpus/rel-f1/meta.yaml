@@ -1,0 +1,17 @@
+# Provenance + blind-authoring attestation for the rel-f1 doc corpus.
+# This metadata is what makes the audit's blind-authoring control credible.
+dataset: rel-f1
+tier: 2                      # 0=genuine upstream docs, 1=blind human, 2=LLM-drafted (blind rules)
+author: claude-code          # authored in-session by Claude Code
+blind: true                  # author saw ONLY schema + sample rows
+attestation: >
+  Authored from the table/column schema and general Formula-1 domain knowledge only. The author did
+  NOT consult the task definitions, training labels, target columns, or train/val/test splits. No
+  predictive target (e.g. any driver-level outcome label) is described as a target anywhere in docs.md;
+  columns are documented as a database, not for any task.
+coverage_target: 0.65        # ~60-80% of columns mentioned, by design (realistic partial coverage)
+style: prose                 # senior-dev README prose; no per-column bullet templates
+encoder: Qwen/Qwen3-Embedding-4B
+notes: >
+  constructor_results is intentionally undocumented; several columns (e.g. rank, number, circuitRef
+  slugs) are mentioned only in passing or omitted to keep coverage realistic and mixed-granularity.

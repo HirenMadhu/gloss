@@ -13,7 +13,7 @@ docs:
   regime: full
   encoder: Qwen/Qwen3-Embedding-4B
   d_text: 2560
-  grounding: {chunk_sentences: 3, top_k: 4, sim_threshold: 0.3, temp: 0.1}
+  grounding: {chunk_sentences: 3, top_k: 4, sim_threshold: 0.60, temp: 0.1}  # 0.60 calibrated for Qwen
 
 model:
   d_model: 256

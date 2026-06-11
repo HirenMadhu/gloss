@@ -34,3 +34,23 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
   task table; self-labels are a transfer-phase concern). Attention is dense within a seed's subgraph over
   ≤2-hop-reachable pairs (1-hop = FK relation, 2-hop = MULTIHOP bucket, else masked).
 - DoD met: `run_finetune.py --dry-run` prints a rel-f1 batch; leakage/shape tests green.
+
+## Phase 1 — doc corpus + grounding ✅
+- `doc_corpus/rel-f1/docs.md` + `meta.yaml`: **Tier-2, blind** senior-dev prose (authored from schema +
+  F1 domain knowledge only; no task/label/target referenced; ~65% coverage target; `constructor_results`
+  + some columns deliberately undocumented). meta carries the blind attestation for the audit.
+- `gloss/docs/corpus.py`: load/validate (blind ⇒ attestation required), sentence-chunk into spans,
+  enumerate schema elements (table / column / fk_role) from a relbench DB or a spec dict, coverage report.
+- `gloss/docs/grounding.py`: chunk→embed→top-K cosine→softmax-pool → `d_e`, `rel_e`; `d_null` fallback
+  below threshold; regimes `full | null | shuffled_spans`. **Placebo fix:** permuting span rows is a no-op
+  (sims recomputed), so `shuffled_spans` permutes the *element→doc assignment* (derangement) — same
+  coverage/length, decorrelated meaning.
+- `gloss/docs/cache.py`: `QwenEncoder` (frozen Qwen3-Embedding-4B via sentence-transformers, instruction
+  on queries only), `HashEncoder` (dev/tests), idempotent content-hash `EmbeddingCache`.
+- `scripts/build_doc_cache.py`: real Qwen run → **d_text=2560 confirmed**, idempotent (cache reload, no
+  model reload), coverage emitted.
+- **Calibration finding:** Qwen sims sit ~0.52–0.85 (high baseline), so the spec's 0.3 threshold grounds
+  everything (100%). Calibrated `sim_threshold=0.60` → **0.725 partial coverage** (table .78 / col .67 /
+  fk .92). Encoder-specific knob; revisit at the H1 gate (Phase 5).
+- **Tests:** test_corpus, test_grounding (controllable BoW encoder + HashEncoder; null fallback, placebo
+  decorrelation, determinism, cache idempotency) — all green. Full suite: **48 passed, 1 xfailed**.

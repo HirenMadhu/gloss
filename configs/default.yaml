@@ -16,7 +16,9 @@ docs:
   grounding:
     chunk_sentences: 3        # ~2-4 sentence spans
     top_k: 4                  # spans pooled per schema element
-    sim_threshold: 0.3        # below this -> d_null fallback
+    # below this max-cosine -> d_null fallback. CALIBRATED for Qwen3-Embedding-4B (its sims sit in
+    # ~0.52-0.85); gives ~0.72 partial coverage on rel-f1. Encoder-specific — revisit at the H1 gate.
+    sim_threshold: 0.60
     temp: 0.1                 # softmax temperature over cosine sims
 
 model:                        # Phases 2-3
