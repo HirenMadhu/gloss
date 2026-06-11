@@ -1,1 +1,1 @@
-"""gloss.data — Leakage-safe relational graph + temporal sampler, DocCards, frozen text cache, synthetic generator."""
+"""gloss.data — relational graph substrate, leakage-safe temporal sampler, dense collate."""

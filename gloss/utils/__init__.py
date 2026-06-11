@@ -1,1 +1,1 @@
-"""gloss.utils — Seeding, config glue, logging, FLOPs accounting."""
+"""gloss.utils — seeding, config loading, logging."""

@@ -1,42 +1,39 @@
-"""Config loading glue.
+"""Config loading — thin OmegaConf helpers so standalone scripts and Hydra share one schema.
 
-Configs live in ``configs/*.yaml`` with the schema of implementation.md §8. We use OmegaConf (ships
-with hydra-core) so plain ``load_config`` works in standalone scripts (proxy/audit) while Hydra drives
-the Lightning training entry points. Env-var expansion routes large caches to scratch (see §A of the plan).
+Scripts merge a named config (e.g. configs/rel-f1.yaml) over configs/default.yaml, then apply
+CLI dotlist overrides. We deliberately avoid a hard Hydra dependency at import time so unit tests
+can build configs in-memory.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from omegaconf import DictConfig, OmegaConf
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = REPO_ROOT / "configs"
+CONFIGS_DIR = Path(__file__).resolve().parents[2] / "configs"
 
 
-def load_config(name_or_path: str, overrides: list[str] | None = None) -> DictConfig:
-    """Load a YAML config by bare name (resolved under ``configs/``) or explicit path.
+def load_config(
+    name: str = "default",
+    *,
+    overrides: Sequence[str] | None = None,
+    merge_default: bool = True,
+) -> DictConfig:
+    """Load ``configs/<name>.yaml`` merged over ``configs/default.yaml`` + dotlist overrides.
 
-    ``overrides`` is a dotlist (e.g. ``["docs.regime=placebo", "seed=1"]``) applied on top.
+    >>> cfg = load_config("rel-f1", overrides=["docs.regime=null"])
     """
-    path = Path(name_or_path)
-    if not path.exists():
-        cand = CONFIG_DIR / name_or_path
-        path = cand if cand.exists() else CONFIG_DIR / f"{name_or_path}.yaml"
-    cfg = OmegaConf.load(path)
+    default_path = CONFIGS_DIR / "default.yaml"
+    cfg = OmegaConf.load(default_path) if (merge_default and default_path.exists()) else OmegaConf.create({})
+    if name and name != "default":
+        named = CONFIGS_DIR / f"{name}.yaml"
+        if not named.exists():
+            raise FileNotFoundError(f"config not found: {named}")
+        cfg = OmegaConf.merge(cfg, OmegaConf.load(named))
     if overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
     return cfg  # type: ignore[return-value]
-
-
-def scratch_dir(sub: str = "") -> Path:
-    """Resolve a writable scratch directory (NOT home quota): ``$GLOSS_SCRATCH`` or ``~/scratch60``."""
-    root = Path(os.environ.get("GLOSS_SCRATCH", Path.home() / "scratch60"))
-    d = root / sub if sub else root
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
 def to_container(cfg: DictConfig) -> dict[str, Any]:

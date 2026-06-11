@@ -4,21 +4,13 @@ __pycache__/
 venv/
 *.egg-info/
 
-# data & outputs (root-anchored so gloss/data/ package is NOT ignored)
-/data/
+# data & outputs
+data/
 ckpt/
 logs/
 outputs/
-multirun/
 wandb/
 *.ckpt
-
-# HALOS caches / generated artifacts
-gloss/data/doccards_cache/
-*.text_cache/
-text_cache/
-*.npy
-*.npz
 
 # editor / os
 .DS_Store

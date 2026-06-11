@@ -1,8 +1,37 @@
-# Dependencies are declared in pyproject.toml and installed via scripts/setup_env.sh
-# (staged uv install with custom indexes: PyTorch cu128 + data.pyg.org find-links).
-# Do NOT `pip install -r requirements.txt` — it would pull the CPU torch wheel from PyPI.
-#
-#   uv venv --python 3.12 .venv
-#   bash scripts/setup_env.sh
-#
-# See pyproject.toml [project.dependencies] for the authoritative list.
+# HALOS / gloss — environment is already provisioned in .venv (uv, py3.12, torch 2.8.0+cu128).
+# This file documents the stack; see pyproject.toml. torch + pyg extensions come from CUDA-specific
+# indexes (download.pytorch.org/whl/cu128, data.pyg.org/whl/torch-2.8.0+cu128.html).
+
+# -- relational substrate --
+torch>=2.8
+torch_geometric>=2.6
+pytorch-frame>=0.2
+relbench>=1.0
+
+# -- frozen text encoder (Qwen3-Embedding-4B) --
+sentence-transformers>=3.0
+transformers>=4.51
+
+# -- audit / baselines (later phases) --
+shap>=0.45
+lightgbm>=4.0
+scikit-learn
+
+# -- utilities --
+numpy
+pandas
+pyyaml
+tqdm
+
+# -- harness --
+pytorch-lightning
+hydra-core>=1.3
+wandb
+torchmetrics
+
+# -- dev --
+pytest
+matplotlib
+ipdb
+
+# flash-attn: built from source on SLURM (scripts/build_flash_attn.sh), not pip-installable here.

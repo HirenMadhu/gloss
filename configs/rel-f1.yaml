@@ -1,0 +1,23 @@
+# rel-f1 (Ergast Formula-1) — the first dev dataset. Cached at ~/.cache/relbench/rel-f1.
+# Inherits structure from default.yaml; only deltas are meaningful (scripts merge over default).
+seed: 0
+
+data:
+  dataset: rel-f1
+  task: driver-dnf            # binary EntityTask (did the driver Did-Not-Finish)
+  sampler:
+    num_neighbors: [12, 12]
+    max_nodes: 4096
+
+docs:
+  regime: full
+  encoder: Qwen/Qwen3-Embedding-4B
+  d_text: 2560
+  grounding: {chunk_sentences: 3, top_k: 4, sim_threshold: 0.3, temp: 0.1}
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 8
+  eps_mode: relative
+  geometry: {absolute_anchor: false, content_modulated: false, sigma_floor: 0.1, n_freq: 16}

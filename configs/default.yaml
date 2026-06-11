@@ -1,32 +1,33 @@
-# HALOS default config (implementation.md §8). Hydra-composable; standalone scripts read via OmegaConf.
+# HALOS default config (v3: documentation-conditioned geometry).
+# Hydra-composable; standalone scripts read via OmegaConf. Phase-specific keys are documented inline.
 seed: 0
+
 data:
-  dataset: synthetic
-  task: twin-sign
-  sampler: {num_neighbors: [12, 12], max_cells: 4096, time_attr: row_time}
+  dataset: rel-f1
+  task: driver-dnf
+  sampler:
+    num_neighbors: [12, 12]   # count/order-based (required for scale-equivariance); per-hop fanout
+    max_nodes: 4096           # cap on sampled subgraph size (pairwise bias is O(N^2))
+
 docs:
-  regime: full            # full | name_only | placebo
-  blind: false
-  arm: informed           # informed | blind  (real-DB Claude authoring)
-  encoder: Qwen/Qwen3-Embedding-4B   # 2560-dim, frozen, cached
-model:                    # Phase 3+ (not built until GATE 1 is green)
+  regime: full                # full | shuffled_spans (placebo) | null
+  encoder: Qwen/Qwen3-Embedding-4B
+  d_text: 2560                # VERIFY at first cache build; flows into FiLM + g_theta
+  grounding:
+    chunk_sentences: 3        # ~2-4 sentence spans
+    top_k: 4                  # spans pooled per schema element
+    sim_threshold: 0.3        # below this -> d_null fallback
+    temp: 0.1                 # softmax temperature over cosine sims
+
+model:                        # Phases 2-3
   d_model: 256
   n_heads: 8
-  n_layers: 12
-  masks: [column, feature, neighbor]      # full off by default
-  struct_bias: {mode: typed_metapath}     # none | scalar_hop | typed_metapath
-  temporal: {mode: log_decay}             # log_decay | rt_scalar  (NOT the deferred kernel)
-  fusion: film
-audit:                    # Phase 5
-  estimator: predictive_cmi
-  seeds: 5
-  controls: [placebo, blind]
-  faithfulness: [deletion, insertion, comprehensiveness, sufficiency, polarity]
-  run_on: [rt, relgt, halos]
-train:                    # Phase 4
-  lr: 3.0e-4
-  weight_decay: 0.01
-  batch_seeds: 64
-  max_steps: 50000
-  amp: true
-ext_temporal: false       # true ONLY for the deferred Paper-#2 kernel (Appendix E)
+  n_layers: 8
+  eps_mode: relative          # tau = log(dt / T_ctx); zero-gap/timeless -> structural bucket (exact invariance)
+  geometry:
+    absolute_anchor: false    # append log T_ctx to ctx(p) -> BREAKS strict invariance (ablation)
+    content_modulated: false  # residual d_mu,d_sigma from [h_u;h_w] (v2 ablation)
+    sigma_floor: 0.1          # sigma = softplus(.) + sigma_floor
+    n_freq: 16                # Bochner features of tau
+
+# Phases 4-8 (train/audit/transfer) are NOT built this session — keys added when those phases land.

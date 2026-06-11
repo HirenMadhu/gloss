@@ -1,36 +1,32 @@
 [project]
 name = "gloss"
 version = "0.1.0"
-description = "HALOS — structured DocCards + Documentation Sufficiency Audit for relational foundation models ('names lie, meaning transfers')."
+description = "HALOS — a node-level temporal graph transformer whose attention geometry is generated from prose schema documentation."
 readme = "README.md"
 requires-python = ">=3.12"
-# NOTE: torch / PyG-ecosystem / relbench come from custom indexes (PyTorch cu128 + data.pyg.org
-# find-links). Install via scripts/setup_env.sh (staged `uv pip install` with explicit indexes) rather
-# than a single `uv pip install -e .`, so torch resolves to the +cu128 build and not the CPU PyPI wheel.
+# NOTE: the .venv is already provisioned. torch 2.8.0 was installed from the cu128 index
+# (https://download.pytorch.org/whl/cu128) and torch_geometric/pyg extensions from
+# https://data.pyg.org/whl/torch-2.8.0+cu128.html. These are NOT re-resolved here; this list
+# documents the environment for reproducibility. Do not `uv sync` blindly over the working venv.
 dependencies = [
-    # --- core relational / tabular stack ---
-    "torch==2.8.0",
-    "torch_geometric==2.8.0",
-    "pyg_lib==0.4.0",
-    "torch_scatter==2.1.2",
-    "relbench==2.1.2",
-    "pytorch-frame==0.3.0",
+    # --- relational substrate ---
+    "torch>=2.8",
+    "torch_geometric>=2.6",
+    "pytorch-frame>=0.2",
+    "relbench>=1.0",
     # --- frozen text encoder (Qwen3-Embedding-4B) ---
     "sentence-transformers>=3.0",
-    "transformers>=4.51.2",
-    # --- Phase-2 proxy probe + Phase-5 audit ---
-    "lightgbm>=4.0",
+    "transformers>=4.51",
+    # --- audit / baselines (later phases) ---
     "shap>=0.45",
-    "scikit-learn<=1.6.1",   # relbench 2.1.2 pins this cap
-    # --- data / io ---
+    "lightgbm>=4.0",          # baseline only
+    "scikit-learn",
+    # --- utilities ---
     "numpy",
     "pandas",
-    "pyarrow",
-    "duckdb",
-    "pooch",
     "pyyaml",
     "tqdm",
-    # --- harness (kept): Lightning + Hydra + W&B ---
+    # --- harness (Lightning training arrives in Phase 4) ---
     "pytorch-lightning",
     "hydra-core>=1.3",
     "wandb",
@@ -39,10 +35,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "matplotlib", "ipdb"]
-
-[build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+# flash-attn is built from source via scripts/build_flash_attn.sh (SLURM); its only consumer is the
+# frozen Qwen encoder forward. HALOS's own attention uses PyTorch SDPA. Not declared here on purpose.
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -51,8 +45,3 @@ exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
-markers = [
-    "relbench: tests that need a downloaded RelBench dataset (network); skipped if unavailable",
-    "slow: long-running tests (model/audit)",
-]

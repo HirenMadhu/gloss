@@ -1,82 +1,73 @@
-#!/usr/bin/env python
-"""run_finetune.py — Phase-4 fine-tuning entry point (TRAINING is a Phase-4 stub).
+"""run_finetune.py — Phase-0 DoD entry point.
 
-For now its ``--dry-run`` is the **Phase-0 Definition of Done**: load a (synthetic or RelBench) task,
-sample a batch of leakage-safe subgraphs, collate to a TokenBatch, and print shapes. This proves the
-data path end-to-end before any model exists.
+`--dry-run` builds the rel-f1 graph, samples one leakage-safe disjoint minibatch, collates it into a
+dense GlossBatch, and prints shapes. (Actual fine-tuning lands in Phase 4.)
 
-    python scripts/run_finetune.py --dry-run                       # synthetic (offline)
-    python scripts/run_finetune.py --dry-run --dataset rel-f1 --task driver-dnf
+    .venv/bin/python scripts/run_finetune.py --dry-run
+    .venv/bin/python scripts/run_finetune.py --dry-run --config rel-f1 --batch-size 8
 """
 from __future__ import annotations
 
 import argparse
+import sys
 import warnings
 
-warnings.filterwarnings("ignore")
+# make `gloss` importable when run as a script
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+
+from gloss.utils.config import load_config  # noqa: E402
+from gloss.utils.logging import get_logger  # noqa: E402
+from gloss.utils.seeding import seed_everything  # noqa: E402
+
+log = get_logger("gloss.dry_run")
 
 
-def _load_bundle(args):
-    if args.dataset == "synthetic":
-        from gloss.data.synthetic import make_synthetic_bundle
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="sample one batch and print shapes")
+    ap.add_argument("--config", default="rel-f1")
+    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--split", default="train")
+    args = ap.parse_args()
 
-        bundle, planted = make_synthetic_bundle(seed=args.seed)
-        print(f"[synthetic] planted_truth = {planted.as_dict()}")
-        return bundle
-    from gloss.data.relbench_graph import load_task_bundle
+    if not args.dry_run:
+        log.error("only --dry-run is implemented in Phase 0 (training is Phase 4)")
+        return 2
 
-    return load_task_bundle(args.dataset, args.task, download=True)
+    warnings.filterwarnings("ignore")
+    cfg = load_config(args.config)
+    seed_everything(int(cfg.seed))
 
+    from relbench.tasks import get_task
 
-def dry_run(args) -> None:
-    from gloss.data.collate import collate_subgraphs
-    from gloss.utils.seeding import seed_everything
+    from gloss.data.collate import to_gloss_batch
+    from gloss.data.graph import build_gloss_graph, make_loader
 
-    seed_everything(args.seed)
-    bundle = _load_bundle(args)
-    print(f"[bundle] dataset={bundle.dataset} task={bundle.task_name} "
-          f"tables={bundle.registry.num_tables} cols={bundle.registry.num_cols} "
-          f"fk_roles={bundle.registry.num_fk_roles}")
+    log.info("building graph for dataset=%s task=%s", cfg.data.dataset, cfg.data.task)
+    bundle = build_gloss_graph(cfg.data.dataset)
+    log.info(
+        "graph: %d node types, %d edge types | fk_roles=%d metapaths=%d",
+        bundle.num_node_types, len(bundle.edge_types), bundle.num_fk_roles, bundle.num_metapaths,
+    )
 
-    sampler = bundle.make_sampler(num_neighbors=args.num_neighbors, max_cells=args.max_cells, seed=args.seed)
-    seeds = bundle.task.get_table("train").df.head(args.batch_seeds)
-    subs = [
-        sampler.sample(bundle.entity_table, getattr(r, bundle.entity_col),
-                       getattr(r, bundle.time_col), getattr(r, bundle.target_col))
-        for r in seeds.itertuples(index=False)
-    ]
-    tb = collate_subgraphs(subs, bundle.db, bundle.registry)
+    task = get_task(cfg.data.dataset, cfg.data.task, download=False)
+    loader = make_loader(
+        bundle, task, args.split,
+        num_neighbors=list(cfg.data.sampler.num_neighbors),
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+    raw = next(iter(loader))
+    gb = to_gloss_batch(raw, bundle, task.entity_table, max_nodes=int(cfg.data.sampler.max_nodes))
+    print(gb.pretty_shapes())
 
-    rows_per_seed = [len(sg.rows) for sg in subs]
-    print(f"[batch] B={tb.batch_size} T_max={tb.max_cells} "
-          f"real_cells={int(tb.pad_mask.sum())} rows/seed(min/mean/max)="
-          f"{min(rows_per_seed)}/{sum(rows_per_seed)/len(rows_per_seed):.1f}/{max(rows_per_seed)}")
-    print("[shapes]")
-    for name, shape in tb.shapes().items():
-        print(f"   {name:16s} {shape}")
-    # leakage sanity on the materialized batch
-    real = tb.pad_mask
-    bad = ((tb.row_time > tb.seed_time) & real).sum().item()
-    print(f"[leakage] cells with row_time>seed_time among real cells: {bad} (must be 0)")
-    assert bad == 0
-    print("DRY_RUN_OK")
-
-
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--dataset", default="synthetic")
-    p.add_argument("--task", default="driver-dnf")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--batch-seeds", dest="batch_seeds", type=int, default=16)
-    p.add_argument("--num-neighbors", dest="num_neighbors", type=int, nargs="+", default=[12, 12])
-    p.add_argument("--max-cells", dest="max_cells", type=int, default=4096)
-    args = p.parse_args()
-    if args.dry_run:
-        dry_run(args)
-    else:
-        raise SystemExit("Training is a Phase-4 stub. Use --dry-run for the Phase-0 DoD.")
+    # leakage sanity (the headline invariant)
+    rt_i = gb.row_time.unsqueeze(2)
+    seedt = gb.seed_time.view(-1, 1, 1)
+    bad = (gb.is_timed.unsqueeze(2) & (rt_i > seedt)).sum().item()
+    log.info("leakage check: timestamped nodes with row_time > seed_time = %d (expect 0)", bad)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

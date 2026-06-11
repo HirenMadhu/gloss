@@ -1,59 +1,45 @@
-"""test_leakage.py — THE core invariant: no context cell has ``row_time > seed_time`` (impl §9, §4.2)."""
+"""Phase 0 — the headline invariant: no context row has row_time > seed_time.
+
+Checked on the synthetic fixture (controlled) and, when rel-f1 is cached, on a real sampled batch
+(the relbench temporal sampler must never leak the future into a seed's subgraph).
+"""
 from __future__ import annotations
 
-import pytest
+import torch
 
-from gloss.data.relbench_graph import MASK_NEIGHBOR
-from gloss.data.synthetic import make_synthetic_bundle
-
-
-def _all_rows_respect_leakage(bundle, sampler, n_seeds=60, seed=0):
-    seeds = bundle.task.get_table("train").df
-    seeds = seeds.sample(n=min(n_seeds, len(seeds)), random_state=seed)
-    checked, timed_context = 0, 0
-    for row in seeds.itertuples():
-        sg = sampler.sample("entity", row.id, row.date, row.target)
-        for r in sg.rows:
-            # TIME_MIN (timeless static rows) trivially satisfies <= ; event rows must be in the past
-            assert r.row_time_ns <= sg.seed_time_ns, (
-                f"LEAKAGE: {r.table} row_time {r.row_time_ns} > seed_time {sg.seed_time_ns}")
-            checked += 1
-            if r.mask_kind == MASK_NEIGHBOR:  # a real timestamped event pulled into context
-                timed_context += 1
-    # guard against a vacuous pass: the invariant must be exercised on actual timestamped context rows
-    return checked, timed_context
+from gloss.data.collate import to_gloss_batch
+from tests.conftest import make_dualfk_batch, rel_f1_available
 
 
-def test_synthetic_no_temporal_leakage():
-    bundle, _ = make_synthetic_bundle(seed=0, num_entities=200)
-    sampler = bundle.make_sampler(num_neighbors=[10, 10], max_cells=2048, seed=0)
-    checked, timed_context = _all_rows_respect_leakage(bundle, sampler)
-    assert checked > 0, "sampler returned no cells to check"
-    assert timed_context > 0, "no timestamped event context sampled — leakage check would be vacuous"
+def _violations(gb) -> int:
+    # timestamped node row_time must be <= its segment's seed_time
+    return int((gb.is_timed & (gb.row_time > gb.seed_time.view(-1, 1))).sum())
 
 
-def test_leakage_holds_across_fanouts_and_seeds():
-    for s in (1, 2):
-        bundle, _ = make_synthetic_bundle(seed=s, num_entities=150)
-        for fanout in ([4], [8, 8], [6, 6, 6]):
-            sampler = bundle.make_sampler(num_neighbors=fanout, max_cells=4096, seed=s)
-            _all_rows_respect_leakage(bundle, sampler, n_seeds=25, seed=s)
+def test_synthetic_leakfree(dualfk_bundle):
+    gb = to_gloss_batch(make_dualfk_batch(seed_time=100.0), dualfk_bundle, "user", max_nodes=64)
+    assert _violations(gb) == 0
 
 
-@pytest.mark.relbench
-def test_relf1_no_temporal_leakage():
-    """Same invariant on real data (rel-f1). Skipped if the dataset isn't downloaded / no network."""
-    rb = pytest.importorskip("relbench")
-    from gloss.data.relbench_graph import load_task_bundle
+def test_synthetic_detects_planted_leak(dualfk_bundle):
+    # plant an event AFTER the seed time; the *check* must catch it (guards the assertion itself)
+    leaky = make_dualfk_batch(seed_time=25.0, event_times=(10.0, 20.0, 30.0, 40.0))
+    gb = to_gloss_batch(leaky, dualfk_bundle, "user", max_nodes=64)
+    assert _violations(gb) > 0
 
-    try:
-        bundle = load_task_bundle("rel-f1", "driver-dnf", download=True)
-    except Exception as e:  # network / cache miss
-        pytest.skip(f"rel-f1 unavailable: {e}")
-    sampler = bundle.make_sampler(num_neighbors=[8, 8], max_cells=4096, seed=0)
-    seeds = bundle.task.get_table("train").df.sample(n=40, random_state=0)
-    for row in seeds.itertuples(index=False):
-        sg = sampler.sample(bundle.entity_table, getattr(row, bundle.entity_col),
-                            getattr(row, bundle.time_col), getattr(row, bundle.target_col))
-        for r in sg.rows:
-            assert r.row_time_ns <= sg.seed_time_ns
+
+@rel_f1_available
+def test_real_rel_f1_sampler_is_leakfree():
+    from relbench.tasks import get_task
+
+    from gloss.data.graph import build_gloss_graph, make_loader
+
+    bundle = build_gloss_graph("rel-f1")
+    task = get_task("rel-f1", "driver-dnf", download=False)
+    loader = make_loader(bundle, task, "train", num_neighbors=[10, 10], batch_size=16, shuffle=False)
+    raw = next(iter(loader))
+    gb = to_gloss_batch(raw, bundle, task.entity_table, max_nodes=4096)
+    assert _violations(gb) == 0
+    # also: every temporal_valid pair links two real, timed nodes
+    tv = gb.temporal_valid
+    assert bool((tv <= (gb.is_timed.unsqueeze(2) & gb.is_timed.unsqueeze(1))).all())

@@ -1,1 +1,2 @@
-"""gloss.model — HALOS-minimal relational transformer (Phase 3). Stubs until GATE 1 is green."""
+"""gloss.model — doc-conditioned node encoder, dimensionless time, the doc-generated bias generator
+(core operator), attention, encoder stack, heads."""

@@ -1,7 +1,0 @@
-# Real-DB config (implementation.md §8 example).
-seed: 0
-data:
-  dataset: rel-stack
-  task: user-engagement
-  sampler: {num_neighbors: [12, 12], max_cells: 4096, time_attr: row_time}
-docs: {regime: full, blind: false, arm: informed, encoder: Qwen/Qwen3-Embedding-4B}

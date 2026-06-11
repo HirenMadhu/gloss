@@ -1,1 +1,1 @@
-"""gloss.eval — The gradient map (headline result), name-shuffle survival, metrics (Phase 6)."""
+"""gloss.eval — geometry report (the readable-geometry exhibit) and (later) metrics/transfer."""
