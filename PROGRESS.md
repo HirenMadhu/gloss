@@ -148,7 +148,7 @@ HALOS trained to **AUROC ≈ 0.795** ≈ the LightGBM floor (0.786) — the mode
 | mode | val AP | val AUROC | n |
 |---|---|---|---|
 | generated | 0.9212 ± 0.0044 | 0.7949 ± 0.0027 | 5 |
-| free_learned | 0.9186 ± 0.0025 | 0.7928 ± 0.0023 | 4 (1 crashed, backfilling) |
+| free_learned | 0.9200 ± 0.0036 | 0.7933 ± 0.0024 | 5 (backfill 28964162 done) |
 
 **Verdict: no measurable documentation effect on rel-f1.** full ≈ shuffled ≈ null (AUROC Δ ≤ 0.4%, within
 ~1–1.5 σ; AP ordering inconsistent — full < shuffled). H2: generated ≈ free_learned in-DB. This is the
