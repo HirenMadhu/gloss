@@ -163,3 +163,22 @@ Phase 7)**. Do NOT conclude the method fails from one well-named DB.
 
 Note: config 7 (seed 1, free_learned) crashed on a flaky pytorch-frame `MultiEmbeddingTensor` index
 assertion under multi-worker slicing (other free_learned seeds fine) — resubmitted.
+
+## Extension — depth-matched text tower + doc cross-attention (user-requested architecture)
+A second, **trainable** text encoder over the FROZEN-cached Qwen span memory, with cross-attention into
+the graph transformer. Both paths **default OFF** (FiLM/pooled-d_e path unchanged); config
+`model.doc_cross_attn.{feature,geometry}` or `run_finetune.py --doc-feature/--doc-geometry`.
+- `gloss/model/text_tower.py`: `TextTower` (L self-attn blocks, **L = graph n_layers**, over projected
+  span memory `[M,d_text]→[M,d_model]`, per-layer states T¹..Tᴸ) + `DocCrossAttention` (queries attend a
+  doc memory; empty memory → exactly zero, so the `null` regime contributes nothing).
+- **Feature-side** (`HALOSLayer`): graph nodes cross-attend Tˡ per layer (self-attn → cross-attn → FFN).
+- **Geometry-side** (`bias_generator`): the metapath query cross-attends Tᴸ to build `ctx(p)` for g_θ —
+  richer docs *for generating geometry* (on-thesis), vs RELATE-like feature-side.
+- `grounding.py`: `GroundingResult.span_emb`/`span_memory()` expose the raw span set (empty under `null`).
+- **Verified:** two-tower forward finite; full vs null differ (cross-attn responds to docs); **exact
+  scale-equivariance still holds with both paths ON** (docs are time-independent) — 0.0 logit diff under
+  t→c·t. Tests: `test_text_tower.py` (+ existing suite). **75 passed, 1 skipped.**
+- **Caveats:** feature-side ≈ RELATE — keep doc-generated *geometry* as the headline (geometry-side is the
+  novel use). The cross-attn *placebo* (shuffled_spans for a SET-consuming tower) is not yet a true
+  control — meaningful contrast for now is full vs null. Evaluate on Phase-6 synthetic / poorly-named DBs,
+  NOT rel-f1 (GATE 1 showed docs are redundant there regardless of fusion).

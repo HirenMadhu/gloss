@@ -37,6 +37,8 @@ def main() -> int:
     ap.add_argument("--n-layers", type=int, default=4)
     ap.add_argument("--limit-train-batches", type=int, default=None)
     ap.add_argument("--baseline", action="store_true", help="also run the LightGBM floor")
+    ap.add_argument("--doc-feature", action="store_true", help="feature-side doc cross-attention")
+    ap.add_argument("--doc-geometry", action="store_true", help="geometry-side doc cross-attention")
     args = ap.parse_args()
 
     if args.train:
@@ -88,9 +90,12 @@ def _train(args) -> int:
     from gloss.train.finetune import train
 
     d_text = 2560 if args.encoder == "qwen" else 64
+    dca = cfg.model.get("doc_cross_attn", {})
     mk = dict(d_model=args.d_model, n_heads=int(cfg.model.n_heads), n_layers=args.n_layers,
               d_text=d_text, n_freq=int(cfg.model.geometry.get("n_freq", 16)),
-              sigma_floor=float(cfg.model.geometry.sigma_floor))
+              sigma_floor=float(cfg.model.geometry.sigma_floor),
+              doc_cross_attn_feature=args.doc_feature or bool(dca.get("feature", False)),
+              doc_cross_attn_geometry=args.doc_geometry or bool(dca.get("geometry", False)))
     log.info("training HALOS regime=%s encoder=%s epochs=%d d_model=%d n_layers=%d",
              args.regime, args.encoder, args.epochs, args.d_model, args.n_layers)
     _module, metrics = train(

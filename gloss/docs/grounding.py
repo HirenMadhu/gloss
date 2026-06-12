@@ -45,6 +45,14 @@ class GroundingResult:
     rel: Tensor                     # [E]          (max cosine; 0 where ungrounded)
     grounded: Tensor                # [E] bool
     key_to_row: dict                # key -> row index
+    span_emb: Tensor | None = None  # [M, d_text] raw doc-span memory (for the text tower / cross-attn);
+                                    # empty [0, d_text] under the `null` regime (docs off)
+
+    def span_memory(self) -> Tensor:
+        """The document span memory the text tower consumes. ``[M, d_text]`` ([0, d_text] if no docs)."""
+        if self.span_emb is None:
+            return torch.zeros(0, self.d_text)
+        return self.span_emb
 
     def grounded_by_key(self) -> dict[str, bool]:
         return {k: bool(self.grounded[i]) for k, i in self.key_to_row.items()}
@@ -86,10 +94,12 @@ def ground(
     E = len(elements)
 
     if regime == "null" or span_emb.numel() == 0:
+        # null => docs OFF everywhere: empty span memory so the text tower / cross-attn contribute nothing.
         return GroundingResult(
             d_text=d_text, regime=regime, keys=keys,
             emb=torch.zeros(E, d_text), rel=torch.zeros(E),
             grounded=torch.zeros(E, dtype=torch.bool), key_to_row=key_to_row,
+            span_emb=torch.zeros(0, d_text),
         )
 
     q_emb = encode([e.query for e in elements], kind="query")          # [E, d]
@@ -111,9 +121,13 @@ def ground(
         perm = _derangement(E, seed)
         emb, rel, grounded = emb[perm], rel[perm], grounded[perm]
 
+    # span memory for the text tower = the real spans. NOTE: the pooled-d_e placebo (element->doc
+    # derangement, above) does NOT decorrelate a SET-consuming text tower (a set is permutation-
+    # invariant). A proper cross-attn placebo (random / other-DB span content) is future work; for the
+    # new cross-attn path the meaningful H1 contrast is full vs null (empty memory).
     return GroundingResult(
         d_text=d_text, regime=regime, keys=keys, emb=emb, rel=rel,
-        grounded=grounded, key_to_row=key_to_row,
+        grounded=grounded, key_to_row=key_to_row, span_emb=span_emb,
     )
 
 

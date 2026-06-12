@@ -31,5 +31,8 @@ model:                        # Phases 2-3
     content_modulated: false  # residual d_mu,d_sigma from [h_u;h_w] (v2 ablation)
     sigma_floor: 0.1          # sigma = softplus(.) + sigma_floor
     n_freq: 16                # Bochner features of tau
+  doc_cross_attn:             # depth-matched text tower + cross-attention (both default OFF)
+    feature: false            # graph node states cross-attend the doc span memory per layer (RELATE-like)
+    geometry: false           # metapath query cross-attends the span memory to build ctx(p) for g_theta
 
 # Phases 4-8 (train/audit/transfer) are NOT built this session — keys added when those phases land.

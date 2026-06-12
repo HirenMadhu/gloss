@@ -29,6 +29,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .text_tower import DocCrossAttention
+
 
 @dataclass
 class GeometryTable:
@@ -59,6 +61,8 @@ class BiasGenerator(nn.Module):
         sigma_floor: float = 0.1,
         absolute_anchor: bool = False,
         geometry_mode: str = "generated",
+        geometry_cross_attn: bool = False,
+        d_model: int = 256,
     ):
         super().__init__()
         assert geometry_mode in ("generated", "free_learned")
@@ -67,6 +71,7 @@ class BiasGenerator(nn.Module):
         self.sigma_floor = sigma_floor
         self.absolute_anchor = absolute_anchor
         self.geometry_mode = geometry_mode
+        self.geometry_cross_attn = geometry_cross_attn
         self.n_out = 5 if absolute_anchor else 4
 
         if geometry_mode == "free_learned":
@@ -75,23 +80,41 @@ class BiasGenerator(nn.Module):
             self.free = nn.Parameter(torch.randn(num_metapaths, n_heads, self.n_out) * 0.02)
         else:
             self.e_metapath = nn.Embedding(num_metapaths, d_meta)
-            self.null_doc = nn.Parameter(torch.zeros(d_text))
+            if geometry_cross_attn:
+                # doc(p) for ctx(p) comes from a metapath query cross-attending the doc span memory
+                # (richer than the fixed pooled d_e) — still "geometry generated FROM documentation".
+                self.mp_query = nn.Embedding(num_metapaths, d_model)
+                self.geo_cross = DocCrossAttention(d_model, n_heads)
+                doc_dim = d_model
+            else:
+                self.null_doc = nn.Parameter(torch.zeros(d_text))
+                doc_dim = d_text
             self.mlp = nn.Sequential(
-                nn.Linear(d_meta + d_text, hidden),
+                nn.Linear(d_meta + doc_dim, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, n_heads * self.n_out),
             )
 
-    def compile(self, doc_per_metapath: Tensor | None = None) -> GeometryTable:
-        """Run g_θ over all metapath ids -> a GeometryTable. ``doc_per_metapath`` is ``[P, d_text]``
-        (pooled FK-role docs); rows left as None fall back to the learned ``null_doc``."""
+    def compile(self, doc_per_metapath: Tensor | None = None, doc_memory: Tensor | None = None) -> GeometryTable:
+        """Run g_θ over all metapath ids -> a GeometryTable.
+
+        Pooled mode: ``doc_per_metapath`` ``[P, d_text]`` (None -> learned ``null_doc``).
+        Cross-attn mode (``geometry_cross_attn``): the metapath query attends the doc span memory
+        ``doc_memory`` ``[M, d_model]`` (empty/None -> zeros, i.e. geometry from the metapath embedding only).
+        """
         P = self.num_metapaths
         if self.geometry_mode == "free_learned":
             out = self.free                                       # [P, H, n_out] — docs ignored
         else:
             ids = torch.arange(P, device=self.e_metapath.weight.device)
             e = self.e_metapath(ids)                              # [P, d_meta]
-            if doc_per_metapath is None:
+            if self.geometry_cross_attn:
+                q = self.mp_query.weight.unsqueeze(0)             # [1, P, d_model]
+                if doc_memory is None or doc_memory.shape[0] == 0:
+                    doc = torch.zeros(P, q.shape[-1], device=e.device, dtype=e.dtype)
+                else:
+                    doc = self.geo_cross(q, doc_memory.to(e.dtype).to(e.device)).squeeze(0)  # [P, d_model]
+            elif doc_per_metapath is None:
                 doc = self.null_doc.unsqueeze(0).expand(P, -1)
             else:
                 doc = doc_per_metapath.to(e.dtype).to(e.device)
