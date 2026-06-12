@@ -133,3 +133,33 @@ HALOS / `gloss` — v3 (documentation-conditioned geometry). Build log; one sect
 - Submitted: **job array 28963902_[0-19%4]** (4 H100s in parallel). Independent runs → array, not DDP.
 - Harvest when done: `.venv/bin/python scripts/gate_run.py --aggregate` → H1/H2 tables (mean±std over 5 seeds);
   paste into this file with the Go/No-go decision + the well-named-rel-f1 caveat.
+
+## GATE 1 — RESULT (job array 28963902; 19/20 configs, proper training to convergence)
+HALOS trained to **AUROC ≈ 0.795** ≈ the LightGBM floor (0.786) — the model is competitive, not broken.
+
+**H1 — doc regime (generated geometry, 5 seeds):**
+| regime | val AP (mean±std) | val AUROC (mean±std) |
+|---|---|---|
+| full | 0.9212 ± 0.0044 | **0.7949 ± 0.0027** |
+| shuffled_spans | 0.9228 ± 0.0033 | 0.7915 ± 0.0019 |
+| null | 0.9187 ± 0.0054 | 0.7913 ± 0.0017 |
+
+**H2 — geometry mode (regime=full):**
+| mode | val AP | val AUROC | n |
+|---|---|---|---|
+| generated | 0.9212 ± 0.0044 | 0.7949 ± 0.0027 | 5 |
+| free_learned | 0.9186 ± 0.0025 | 0.7928 ± 0.0023 | 4 (1 crashed, backfilling) |
+
+**Verdict: no measurable documentation effect on rel-f1.** full ≈ shuffled ≈ null (AUROC Δ ≤ 0.4%, within
+~1–1.5 σ; AP ordering inconsistent — full < shuffled). H2: generated ≈ free_learned in-DB. This is the
+**expected outcome for a well-named schema** (spec calibration ~1–3%; here <0.5%) and is consistent with
+risk #1 ("docs redundant on real DBs"): the measurement *is* the result, not a failure.
+
+**Decision: GO (to Phase 6), with the conclusion that rel-f1 is the wrong place to see the effect.** The
+gate confirms the pipeline trains competitively and grounding isn't feeding noise (full not worse than
+null). The mechanism's leverage must be shown where docs are load-bearing: the **Phase-6 synthetic
+existence proof** (docs the ONLY disambiguator) + poorly-named/coded schemas and **OOD transfer (H2-OOD,
+Phase 7)**. Do NOT conclude the method fails from one well-named DB.
+
+Note: config 7 (seed 1, free_learned) crashed on a flaky pytorch-frame `MultiEmbeddingTensor` index
+assertion under multi-worker slicing (other free_learned seeds fine) — resubmitted.
