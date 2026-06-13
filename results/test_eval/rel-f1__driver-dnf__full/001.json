@@ -1,0 +1,1 @@
+{"seed": 1, "regime": "full", "feature": false, "geometry": false, "test_roc_auc": 0.8202361782071927, "test_ap": 0.9110966893567636, "val_auroc": 0.7947392463684082, "val_ap": 0.9262729287147522, "dataset": "rel-f1", "task": "driver-dnf"}

@@ -45,11 +45,30 @@ def make_grounding(
     return ground(elements, spans, enc, cfg, regime=regime)
 
 
-def docs_for_regime(bundle, dataset: str, regime: str, **kw):
-    """-> (grounding, doc_per_metapath). null => no doc-conditioned geometry (doc_mp=None)."""
-    g = make_grounding(bundle, dataset, regime=regime, **kw)
-    doc_mp = None if regime == "null" else build_doc_per_metapath(bundle, g)
-    return g, doc_mp
+def null_grounding(dataset: str, d_text: int = 2560) -> GroundingResult:
+    """An all-ungrounded GroundingResult built straight from the DB schema (NO doc corpus needed).
+    Lets us run the architecture (null regime) on any RelBench DB without authoring docs."""
+    import torch
+    from relbench.datasets import get_dataset
+
+    db = get_dataset(dataset, download=False).get_db(upto_test_timestamp=False)
+    keys = [e.key for e in schema_elements_from_db(db)]
+    E = len(keys)
+    return GroundingResult(
+        d_text=d_text, regime="null", keys=keys,
+        emb=torch.zeros(E, d_text), rel=torch.zeros(E),
+        grounded=torch.zeros(E, dtype=torch.bool), key_to_row={k: i for i, k in enumerate(keys)},
+        span_emb=torch.zeros(0, d_text),
+    )
+
+
+def docs_for_regime(bundle, dataset: str, regime: str, *, encoder: str = "qwen", d_text: int = 64, **kw):
+    """-> (grounding, doc_per_metapath). null => empty grounding (no corpus needed), doc_mp=None.
+    full/shuffled => grounding from the authored doc corpus + the FK-doc geometry table."""
+    if regime == "null":
+        return null_grounding(dataset, d_text), None
+    g = make_grounding(bundle, dataset, regime=regime, encoder=encoder, d_text=d_text, **kw)
+    return g, build_doc_per_metapath(bundle, g)
 
 
 def train_prebuilt(

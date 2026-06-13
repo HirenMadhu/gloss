@@ -24,11 +24,17 @@ log = get_logger("gloss.eval_test")
 OUT = Path(__file__).resolve().parents[1] / "results" / "test_eval"
 
 
+def _cfg_dir(dataset, task, regime):
+    return OUT / f"{dataset}__{task}__{regime}"
+
+
 def run_one(args) -> int:
     warnings.filterwarnings("ignore")
     cfg = load_config(args.config)
-    dataset, task_name = str(cfg.data.dataset), str(cfg.data.task)
-    OUT.mkdir(parents=True, exist_ok=True)
+    dataset = args.dataset or str(cfg.data.dataset)
+    task_name = args.task or str(cfg.data.task)
+    out_dir = _cfg_dir(dataset, task_name, args.regime)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     import torch
     from relbench.tasks import get_task
@@ -53,32 +59,42 @@ def run_one(args) -> int:
     test = evaluate_test(lambda gb: module(gb), bundle, task,
                          num_neighbors=list(cfg.data.sampler.num_neighbors),
                          batch_size=args.batch_size, device=module.device)
-    rec = {"seed": args.index, "regime": args.regime, "feature": feat, "geometry": geo,
+    rec = {"dataset": dataset, "task": task_name, "seed": args.index, "regime": args.regime,
+           "feature": feat, "geometry": geo,
            "test_roc_auc": test.get("roc_auc"), "test_ap": test.get("average_precision"),
            "val_auroc": val.get("val/auroc"), "val_ap": val.get("val/ap")}
-    (OUT / f"{args.index:03d}.json").write_text(json.dumps(rec))
+    (out_dir / f"{args.index:03d}.json").write_text(json.dumps(rec))
     log.info("seed %d done: TEST roc_auc=%.4f ap=%.4f | val_auroc=%.4f",
              args.index, rec["test_roc_auc"], rec["test_ap"], rec["val_auroc"] or float("nan"))
     return 0
 
 
+# GelGT "Ours" test numbers from the paper's Table 1 (for the comparison column).
+GELGT = {("rel-f1", "driver-dnf"): 0.7608, ("rel-f1", "driver-top3"): 0.8408,
+         ("rel-event", "user-repeat"): 0.8357, ("rel-event", "user-ignore"): 0.8779,
+         ("rel-trial", "study-outcome"): 0.7254}
+
+
 def aggregate() -> int:
-    recs = [json.loads(p.read_text()) for p in sorted(OUT.glob("*.json"))]
-    if not recs:
-        log.error("no results in %s", OUT)
+    dirs = sorted(d for d in OUT.glob("*__*__*") if d.is_dir())
+    if not dirs:
+        log.error("no result dirs in %s", OUT)
         return 1
 
-    def agg(key):
+    def agg(recs, key):
         xs = [r[key] for r in recs if r.get(key) is not None]
         return (stats.mean(xs), stats.pstdev(xs) if len(xs) > 1 else 0.0) if xs else (float("nan"), 0.0)
 
-    tm, ts = agg("test_roc_auc")
-    am, as_ = agg("test_ap")
-    vm, vs = agg("val_auroc")
-    print(f"\nHALOS rel-f1 driver-dnf — {len(recs)} seeds")
-    print(f"  TEST roc_auc : {tm:.4f} +/- {ts:.4f}   (GelGT table: 0.7608 +/- 0.0175)")
-    print(f"  TEST AP      : {am:.4f} +/- {as_:.4f}")
-    print(f"  (val auroc   : {vm:.4f} +/- {vs:.4f})")
+    print(f"\n{'dataset/task (regime)':34s} {'HALOS TEST roc_auc':>22s} {'GelGT':>8s} {'n':>3s}")
+    for d in dirs:
+        recs = [json.loads(p.read_text()) for p in sorted(d.glob("*.json"))]
+        if not recs:
+            continue
+        ds, tk, rg = recs[0]["dataset"], recs[0]["task"], recs[0]["regime"]
+        tm, ts = agg(recs, "test_roc_auc")
+        g = GELGT.get((ds, tk))
+        gtxt = f"{g:.4f}" if g else "  -  "
+        print(f"{ds+'/'+tk+' ('+rg+')':34s} {tm:9.4f} ± {ts:.4f}   {gtxt:>8s} {len(recs):3d}")
     return 0
 
 
@@ -89,6 +105,8 @@ def main() -> int:
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--aggregate", action="store_true")
+    ap.add_argument("--dataset", default=None)
+    ap.add_argument("--task", default=None)
     ap.add_argument("--regime", default="full")
     ap.add_argument("--encoder", default="qwen")
     ap.add_argument("--doc-feature", action="store_true")
