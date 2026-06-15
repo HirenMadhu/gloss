@@ -1,0 +1,1 @@
+{"dataset": "rel-trial", "task": "study-outcome", "seed": 3, "regime": "null", "feature": false, "geometry": false, "test_roc_auc": 0.6934485973387576, "test_ap": 0.7547711382888026, "val_auroc": 0.6138429641723633, "val_ap": 0.6597453951835632}

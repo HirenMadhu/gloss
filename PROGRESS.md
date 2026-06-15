@@ -182,3 +182,23 @@ the graph transformer. Both paths **default OFF** (FiLM/pooled-d_e path unchange
   novel use). The cross-attn *placebo* (shuffled_spans for a SET-consuming tower) is not yet a true
   control — meaningful contrast for now is full vs null. Evaluate on Phase-6 synthetic / poorly-named DBs,
   NOT rel-f1 (GATE 1 showed docs are redundant there regardless of fusion).
+
+## Multi-task TEST-set sanity check (vs GelGT table) — HALOS is competitive, NOT SOTA
+5 seeds each, RelBench test split via `task.evaluate` (leaderboard-comparable):
+
+| dataset / task | HALOS test roc_auc | GelGT | Δ |
+|---|---|---|---|
+| rel-f1 / driver-dnf (full) | 0.8247 ± 0.0052 | 0.7608 | +0.064 (win) |
+| rel-f1 / driver-top3 (full) | 0.6791 ± 0.0238 | 0.8408 | −0.162 (loss) |
+| rel-trial / study-outcome (null) | 0.6947 ± 0.0071 | 0.7254 | −0.030 (loss) |
+
+**Verdict: the driver-dnf win does NOT generalize.** HALOS wins one, loses two → a competitive but
+task-dependent architecture, not a SOTA-beater. (Consistent with the spec's explicit non-goal of beating
+SOTA accuracy; the contribution is mechanism + invariances + transfer, not leaderboard wins.)
+- driver-dnf rewards recent-failure-history → fits HALOS's temporal-geometry attention; driver-top3 needs
+  driver/car *quality* (cell content), where our HashEmbedder cell-text (noise) + weak id-column handling
+  under-powers it.
+- study-outcome run in NULL regime (no docs) on a doc-rich domain — real rel-trial docs might help.
+- **Pipeline bug caught + fixed:** the first driver-top3 run gave 0.42 (below chance) because 5 concurrent
+  array tasks raced downloading the task parquet and corrupted it. Lesson: pre-cache every task serially
+  before a multi-seed array. Clean re-run -> 0.679.

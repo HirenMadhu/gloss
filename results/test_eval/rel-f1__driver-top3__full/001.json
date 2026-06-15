@@ -1,0 +1,1 @@
+{"dataset": "rel-f1", "task": "driver-top3", "seed": 1, "regime": "full", "feature": false, "geometry": false, "test_roc_auc": 0.6541727633779264, "test_ap": 0.2677692167859198, "val_auroc": 0.6225654482841492, "val_ap": 0.27508431673049927}
