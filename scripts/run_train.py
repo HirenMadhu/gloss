@@ -43,6 +43,7 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--limit-train-batches", type=int, default=None)
     ap.add_argument("--limit-val-batches", type=int, default=None)
+    ap.add_argument("--num-workers", type=int, default=None, help="override config train.num_workers")
     ap.add_argument("--seq-len", type=int, default=None, help="override config seq_len (smaller=faster)")
     ap.add_argument("--baseline", action="store_true", help="also run the LightGBM floor")
     args = ap.parse_args()
@@ -113,7 +114,7 @@ def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int
         batch_size=args.batch_size or int(cfg.train.batch_size),
         lr=float(cfg.train.lr), weight_decay=float(cfg.train.weight_decay),
         max_epochs=args.epochs or int(cfg.train.max_epochs), seed=int(cfg.seed),
-        num_workers=int(cfg.train.num_workers),
+        num_workers=args.num_workers if args.num_workers is not None else int(cfg.train.num_workers),
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
     )
