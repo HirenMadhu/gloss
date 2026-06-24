@@ -1,93 +1,87 @@
-"""Phase 0 — collate: dense pairwise batch invariants on the synthetic dual-FK fixture."""
+"""Hermetic tests for the cell-token collate + the RT relational masks/substrate."""
 from __future__ import annotations
-
-import math
 
 import torch
 
-from gloss.data.collate import to_gloss_batch
-from gloss.data.graph import FK_NONE, MP_SELF
+from gloss.data.collate import column_vocab, feature_col_names, to_cell_batch
+from gloss.model.rt_substrate import RTSubstrate, build_relational_masks
+
+from .conftest import ENTITY, make_synth_batch, synthetic_bundle
 
 
-def _gb(dualfk_batch, dualfk_bundle):
-    return to_gloss_batch(dualfk_batch, dualfk_bundle, "user", max_nodes=64)
+def _cb(seq_len=16, max_fk=2):
+    return to_cell_batch(make_synth_batch(), synthetic_bundle(), ENTITY, seq_len=seq_len, max_fk=max_fk)
 
 
-def test_node_counts_and_padding(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    assert gb.num_seeds == 2
-    # each segment: 1 user + 2 events = 3 real nodes
-    assert gb.n_max == 3
-    assert int(gb.pad_mask.sum()) == 6
-    assert gb.pad_mask.all()  # no padding in this balanced fixture (3 each)
-    # exactly one seed per segment
-    assert gb.is_seed.sum(dim=1).tolist() == [1, 1]
+def test_cell_batch_contract():
+    cb = _cb()
+    assert cb.num_seeds == 2 and cb.seq_len == 16
+    real = ~cb.is_padding
+    # per seed: 1 user cell (1 col) + 2 events * 2 cols = 5 real cells
+    assert real.sum(1).tolist() == [5, 5]
+    # exactly one seed (user) row per seed -> 1 seed cell each (user has 1 feature col)
+    assert cb.is_seed_cell.sum().item() == 2
+    # column ids valid on real cells, -1 on pad
+    assert (cb.col_idxs[real] >= 0).all()
+    assert (cb.col_idxs[~real] == -1).all()
+    # events are timed and <= seed_time; users untimed
+    assert (cb.row_time[cb.is_timed] <= 100.0).all()
 
 
-def test_seed_time_and_timed_flags(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    assert torch.allclose(gb.seed_time, torch.tensor([100.0, 100.0], dtype=torch.float64))
-    # users timeless, events timed -> 2 timed per segment
-    assert gb.is_timed.sum(dim=1).tolist() == [2, 2]
+def test_feature_col_order_is_sorted():
+    cb = _cb()
+    tf = cb.tf_dict["event"]
+    assert feature_col_names(tf) == sorted(feature_col_names(tf))
+    vocab = column_vocab(synthetic_bundle())
+    # same column of same table -> one id; distinct columns -> distinct ids
+    assert vocab[("event", "e_x")] != vocab[("event", "e_y")]
+    assert vocab[("event", "e_x")] != vocab[("user", "u_attr")]
 
 
-def test_diagonal_is_self_metapath(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    for b in range(gb.num_seeds):
-        for i in range(gb.n_max):
-            assert gb.metapath_id[b, i, i].item() == MP_SELF
-            assert gb.attend_mask[b, i, i].item() is True or bool(gb.attend_mask[b, i, i])
+def test_f2p_neighbors_point_to_parent_user():
+    cb = _cb()
+    # a cell of an event row must list its parent user's local node idx as an f2p neighbor
+    event_tid = synthetic_bundle().node_type_id["event"]
+    user_tid = synthetic_bundle().node_type_id["user"]
+    b = 0
+    user_nodes = set(cb.node_idxs[b][cb.table_idxs[b] == user_tid].tolist())
+    ev_cells = (cb.table_idxs[b] == event_tid).nonzero(as_tuple=True)[0]
+    assert len(ev_cells) > 0
+    for s in ev_cells.tolist():
+        nbrs = [x for x in cb.f2p_nbr_idxs[b, s].tolist() if x >= 0]
+        assert nbrs and set(nbrs).issubset(user_nodes)
 
 
-def test_attend_mask_symmetric_and_within_subgraph(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    am = gb.attend_mask
-    assert torch.equal(am, am.transpose(1, 2)), "attend mask must be symmetric"
-    # no attention across segments is possible (dense tensors are per-segment), and all within-seg
-    # event<->event are 2-hop via the shared user, so fully connected 3-node subgraph -> all True
-    assert am.sum().item() == 2 * 3 * 3
+def test_relational_masks():
+    cb = _cb()
+    m = build_relational_masks(cb)
+    B, S = cb.node_idxs.shape
+    for name in ("col", "feat", "nbr", "full"):
+        assert m[name].shape == (B, S, S) and m[name].dtype == torch.bool
+        # no query row fully masked (identity OR-ed in) -> finite softmax
+        assert m[name].any(dim=2).all()
+    b = 0
+    user_tid = synthetic_bundle().node_type_id["user"]
+    event_tid = synthetic_bundle().node_type_id["event"]
+    user_cells = (cb.table_idxs[b] == user_tid).nonzero(as_tuple=True)[0]
+    event_cells = (cb.table_idxs[b] == event_tid).nonzero(as_tuple=True)[0]
+    su, se = int(user_cells[0]), int(event_cells[0])
+    # feat: an event cell attends its parent user (forward FK); nbr is the reverse
+    assert bool(m["feat"][b, se, su])
+    assert bool(m["nbr"][b, su, se])
+    # real cells never attend pad cells
+    pad = cb.is_padding[b]
+    assert not bool(m["full"][b, su][pad].any())
 
 
-def test_fk_role_on_one_hop_pairs(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    bundle = dualfk_bundle
-    buyer = bundle.relation_fk_role("f2p_buyer")
-    seller = bundle.relation_fk_role("f2p_seller")
-    # find the user (seed) local index and the two event indices in segment 0
-    seg = 0
-    types = gb.node_type_id[seg]
-    user_idx = (types == bundle.node_type_id["user"]).nonzero().flatten().tolist()
-    event_idx = (types == bundle.node_type_id["event"]).nonzero().flatten().tolist()
-    assert len(user_idx) == 1 and len(event_idx) == 2
-    u = user_idx[0]
-    roles = {gb.fk_role_id[seg, u, e].item() for e in event_idx} | {
-        gb.fk_role_id[seg, e, u].item() for e in event_idx
-    }
-    assert buyer in roles and seller in roles  # both FK roles present and distinct
-    # event<->event (2-hop) carries no direct fk role
-    e0, e1 = event_idx
-    assert gb.fk_role_id[seg, e0, e1].item() == FK_NONE
-
-
-def test_temporal_valid_and_tau_formula(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    seg = 0
-    types = gb.node_type_id[seg]
-    bundle = dualfk_bundle
-    event_idx = (types == bundle.node_type_id["event"]).nonzero().flatten().tolist()
-    e0, e1 = event_idx
-    # event<->event pair is both-timed and attends -> temporal_valid; user pairs are timeless -> not
-    assert bool(gb.temporal_valid[seg, e0, e1])
-    user_idx = (types == bundle.node_type_id["user"]).nonzero().flatten().item()
-    assert not bool(gb.temporal_valid[seg, user_idx, e0])
-    # tau = log(dt / T_ctx); with a single nonzero gap, T_ctx = that gap -> tau = 0
-    dt = gb.dt[seg, e0, e1].item()
-    assert dt == abs(10.0 - 20.0)
-    assert math.isclose(gb.tau[seg, e0, e1].item(), math.log(dt / gb.t_ctx[seg].item()), abs_tol=1e-9)
-
-
-def test_no_temporal_valid_crosses_seed_time(dualfk_batch, dualfk_bundle):
-    gb = _gb(dualfk_batch, dualfk_bundle)
-    # every timed node's row_time must be <= its seed_time (leak-free fixture)
-    bad = (gb.is_timed & (gb.row_time > gb.seed_time.view(-1, 1))).sum().item()
-    assert bad == 0
+def test_substrate_forward_finite_and_pad_zero():
+    cb = _cb()
+    torch.manual_seed(0)
+    x = torch.randn(cb.num_seeds, cb.seq_len, 16)
+    sub = RTSubstrate(d_model=16, n_blocks=2, n_heads=4, d_ff=32)
+    with torch.no_grad():
+        y = sub(x, cb)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    # padded positions are zeroed out
+    assert torch.allclose(y[cb.is_padding], torch.zeros_like(y[cb.is_padding]))

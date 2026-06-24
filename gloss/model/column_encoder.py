@@ -1,41 +1,32 @@
-"""Phase 2 — documentation-conditioned node encoder.
+"""Phase 2 (DOC-RT core) — the documentation-conditioned **cell** encoder.
 
-Per cell (column ``c``, value ``v``): encode the value with a pytorch-frame stype encoder, then
-**FiLM-modulate by the column's grounded documentation** ``d_c``:
+Per cell (row ``u``, feature column ``c``, value ``v``): encode the value with a pytorch-frame stype
+encoder, FiLM-modulate it by the column's grounded documentation ``d_c``, and add an RT-style
+column-**name** token:
 
-    x_c = γ(d_c) ⊙ W_v Enc_dtype(v_c) + β(d_c)
+    e_{u,c} = W_v Enc_dtype(v_{u,c})                      # pytorch-frame dtype cell embedding
+    x_{u,c} = γ(d_c) ⊙ e_{u,c} + β(d_c)  +  W_name name_c # FiLM by docs + RT name-as-string token
 
-Pool cells to a node vector with a **doc-keyed** attention pool (documentation decides which columns
-matter), then add a node-type embedding and the dimensionless node-time term:
+``d_c`` comes from the regime-dependent grounding ``emb`` (full=docs, null=d_null, shuffled=placebo,
+name_only=name). Ungrounded columns fall back to a learned ``d_null`` — so the encoder degrades
+gracefully to RT's name-only regime instead of breaking. The RT name token (``name_c``) is the same in
+every regime, so it never confounds the docs comparison.
 
-    h_u = AttnPool_c(x_c; keys = d_c) + E_type(t) + W_t φ(τ_u)
+Cells stay as **tokens** (no pooling here): the encoder scatters per-cell vectors into the dense
+``[B, S, d_model]`` grid using the collate's ``cell_placement`` map; the RT substrate
+(``rt_substrate.py``) contextualizes them, and a head pools afterward.
 
-Ungrounded columns (below the grounding threshold, or the ``null`` regime) fall back to a learned
-``d_null`` — so the encoder degrades gracefully toward name-only instead of breaking. The doc regime is
-already baked into the ``GroundingResult`` passed in, which is how switching full↔null changes features.
-
-Per-cell embeddings come from ``torch_frame.nn.StypeWiseFeatureEncoder`` (the building block relbench's
-``HeteroEncoder`` wraps), so HALOS reuses pytorch-frame's dtype encoders rather than reinventing them.
+Value encoders are ``torch_frame.nn.StypeWiseFeatureEncoder`` (the block relbench's ``HeteroEncoder``
+wraps), so DOC-RT reuses pytorch-frame's dtype encoders rather than reinventing them.
 """
 from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
 
-from ..data.collate import GlossBatch
+from ..data.collate import CellBatch, feature_col_names
 from ..data.graph import GraphBundle
 from ..docs.grounding import GroundingResult
-from .time_encoding import BochnerTime, node_tau
-
-
-def _timestamp_cols(col_names_dict) -> set[str]:
-    """Timestamp-stype column names. We ENCODE them (StypeWiseFeatureEncoder needs an encoder for every
-    stype in the frame) but DROP them from node features: an absolute row timestamp is a *dimensioned*
-    clock, and feeding it as a cell value would break exact scale-equivariance. Time enters HALOS only
-    through the dimensionless τ (node-time term + bias generator), never as a raw cell value."""
-    import torch_frame
-
-    return set(col_names_dict.get(torch_frame.timestamp, []))
 
 
 def _default_stype_encoders(col_names_dict):
@@ -58,7 +49,7 @@ def _default_stype_encoders(col_names_dict):
     return {st: defaults[st]() for st in col_names_dict if st in defaults}
 
 
-class ColumnEncoder(nn.Module):
+class CellEncoder(nn.Module):
     def __init__(
         self,
         bundle: GraphBundle,
@@ -66,7 +57,6 @@ class ColumnEncoder(nn.Module):
         d_model: int = 256,
         d_text: int = 2560,
         enc_channels: int | None = None,
-        n_freq: int = 16,
     ):
         super().__init__()
         from torch_frame.nn.encoder.stypewise_encoder import StypeWiseFeatureEncoder
@@ -76,17 +66,15 @@ class ColumnEncoder(nn.Module):
         enc_channels = enc_channels or d_model
         self.enc_channels = enc_channels
 
-        # one per-cell stype encoder per node type; timestamp columns are dropped from features post-hoc
         self.cell_encoders = nn.ModuleDict()
-        self._drop_cols: dict[str, set[str]] = {}
+        self._sorted_cols: dict[str, list[str]] = {}
         for nt in bundle.node_types:
             tf = bundle.data[nt].tf
             col_names_dict = tf.col_names_dict
             stype_enc = _default_stype_encoders(col_names_dict)
-            self._drop_cols[nt] = _timestamp_cols(col_names_dict)
-            # build only if there is at least one *feature* (non-timestamp) column
-            n_feature_cols = sum(len(c) for st, c in col_names_dict.items()) - len(self._drop_cols[nt])
-            if not stype_enc or n_feature_cols <= 0:
+            sorted_cols = feature_col_names(tf)
+            self._sorted_cols[nt] = sorted_cols
+            if not stype_enc or not sorted_cols:
                 continue
             self.cell_encoders[nt] = StypeWiseFeatureEncoder(
                 out_channels=enc_channels,
@@ -95,67 +83,44 @@ class ColumnEncoder(nn.Module):
                 stype_encoder_dict=stype_enc,
             )
 
-        # FiLM from doc embedding; value projection; doc-keyed attention pool
+        # FiLM from doc embedding; value projection; RT name token; null fallback
         self.gamma = nn.Linear(d_text, d_model)
         self.beta = nn.Linear(d_text, d_model)
         self.w_v = nn.Linear(enc_channels, d_model)
-        self.key_proj = nn.Linear(d_text, d_model)
-        self.pool_query = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.name_proj = nn.Linear(d_text, d_model)
         self.d_null = nn.Parameter(torch.zeros(d_text))
 
-        self.e_type = nn.Embedding(bundle.num_node_types, d_model)
-        self.bochner = BochnerTime(n_freq)
-        self.w_t = nn.Linear(n_freq, d_model)
-        self.node_type_id = dict(bundle.node_type_id)
-
-    def _doc_for_columns(self, keys: list[str], grounding: GroundingResult) -> Tensor:
-        """Gather d_c per column; substitute the learned d_null where ungrounded. -> [C, d_text]."""
-        emb, _rel, grounded = grounding.gather(keys)
-        emb = emb.to(self.d_null.dtype).to(self.d_null.device)
+    def _doc_name_for_columns(self, keys: list[str], grounding: GroundingResult) -> tuple[Tensor, Tensor]:
+        """-> (d_c [C, d_text] with d_null where ungrounded, name [C, d_text])."""
+        emb, name, _rel, grounded = grounding.gather(keys)
+        emb = emb.to(self.d_null)
+        name = name.to(self.d_null)
         grounded = grounded.to(self.d_null.device)
-        return torch.where(grounded.unsqueeze(-1), emb, self.d_null.unsqueeze(0))
+        d_c = torch.where(grounded.unsqueeze(-1), emb, self.d_null.unsqueeze(0))
+        return d_c, name
 
     def encode_type(self, nt: str, tf, grounding: GroundingResult) -> Tensor:
-        """Encode all rows of one node type -> [n, d_model]."""
-        n = tf.num_rows
-        if nt not in self.cell_encoders:
-            return self.pool_query.new_zeros(n, self.d_model)
-        x, col_names = self.cell_encoders[nt](tf)            # x: [n, C, enc_channels]
-        # drop timestamp columns (computed but excluded from features — see _timestamp_cols)
-        drop = self._drop_cols.get(nt, set())
-        if drop:
-            keep = [i for i, c in enumerate(col_names) if c not in drop]
-            x = x[:, keep]
-            col_names = [col_names[i] for i in keep]
-        if x.shape[1] == 0:
-            return self.pool_query.new_zeros(n, self.d_model)
-        keys = [f"col::{nt}::{c}" for c in col_names]
-        d_c = self._doc_for_columns(keys, grounding)         # [C, d_text]
-        gamma = self.gamma(d_c).unsqueeze(0)                 # [1, C, d_model]
+        """Encode all rows of one node type -> per-cell ``[n, C, d_model]`` (columns in sorted order)."""
+        x, col_names = self.cell_encoders[nt](tf)                 # [n, C0, enc_channels]
+        sorted_cols = self._sorted_cols[nt]
+        perm = [col_names.index(c) for c in sorted_cols]
+        x = x[:, perm, :]                                          # [n, C, enc_channels]
+        keys = [f"col::{nt}::{c}" for c in sorted_cols]
+        d_c, name = self._doc_name_for_columns(keys, grounding)   # [C, d_text]
+        gamma = self.gamma(d_c).unsqueeze(0)                      # [1, C, d_model]
         beta = self.beta(d_c).unsqueeze(0)
-        x_c = gamma * self.w_v(x) + beta                     # [n, C, d_model]  (FiLM per column)
-        # doc-keyed attention pool over columns (weights shared across rows)
-        col_keys = self.key_proj(d_c)                        # [C, d_model]
-        scores = (col_keys @ self.pool_query) / (self.d_model ** 0.5)   # [C]
-        weights = torch.softmax(scores, dim=0).view(1, -1, 1)          # [1, C, 1]
-        return (weights * x_c).sum(dim=1)                    # [n, d_model]
+        film = gamma * self.w_v(x) + beta                         # [n, C, d_model]  FiLM by docs
+        film = film + self.name_proj(name).unsqueeze(0)           # + RT name token (per column)
+        return film
 
-    def forward(self, gb: GlossBatch, grounding: GroundingResult) -> Tensor:
-        """-> node states ``[B, N_max, d_model]`` (zeros at pad positions)."""
-        B, N = gb.num_seeds, gb.n_max
-        dev = self.pool_query.device
-        h = torch.zeros(B, N, self.d_model, device=dev)
-        for nt, tf in gb.tf_dict.items():
-            h_nt = self.encode_type(nt, tf, grounding)       # [n_t, d_model]
-            seg, pos = gb.placement[nt]
-            h[seg.to(dev), pos.to(dev)] = h_nt.to(dev)
-
-        # + node-type embedding (real nodes only)
-        ntid = gb.node_type_id.clamp_min(0).to(dev)
-        h = h + self.e_type(ntid) * gb.pad_mask.unsqueeze(-1).to(dev)
-
-        # + node-time term W_t φ(τ_u) for timed nodes
-        tau_u, valid = node_tau(gb.seed_time, gb.row_time, gb.t_ctx, gb.is_timed)
-        phi = self.bochner(tau_u.to(dev))                    # [B, N, n_freq]
-        h = h + self.w_t(phi) * valid.to(dev).unsqueeze(-1)
-        return h * gb.pad_mask.unsqueeze(-1).to(dev)
+    def forward(self, cb: CellBatch, grounding: GroundingResult) -> Tensor:
+        """-> cell states ``[B, S, d_model]`` (zeros at pad positions)."""
+        dev = self.d_null.device
+        h = torch.zeros(cb.num_seeds, cb.seq_len, self.d_model, device=dev)
+        for nt in cb.tf_dict:
+            if nt not in self.cell_encoders or nt not in cb.cell_placement:
+                continue
+            x = self.encode_type(nt, cb.tf_dict[nt], grounding)   # [n, C, d_model]
+            b_idx, s_idx, row_idx, col_idx = cb.cell_placement[nt]
+            h[b_idx.to(dev), s_idx.to(dev)] = x[row_idx.to(dev), col_idx.to(dev)]
+        return h * (~cb.is_padding).to(dev).unsqueeze(-1)

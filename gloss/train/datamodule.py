@@ -1,6 +1,6 @@
-"""Phase 4 — Lightning DataModule over the leakage-safe disjoint temporal loaders.
+"""Phase 3 — Lightning DataModule over the leakage-safe disjoint temporal loaders.
 
-The loaders yield raw PyG `HeteroData` minibatches; conversion to the dense `GlossBatch` happens in the
+The loaders yield raw PyG `HeteroData` minibatches; conversion to the dense `CellBatch` happens in the
 LightningModule's `transfer_batch_to_device` (it needs the bundle + entity table). num_workers=0 keeps
 the sampler/transform simple to pickle.
 """
@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 from ..data.graph import GraphBundle, make_loader
 
 
-class HALOSDataModule(pl.LightningDataModule):
+class DOCRTDataModule(pl.LightningDataModule):
     def __init__(
         self,
         bundle: GraphBundle,

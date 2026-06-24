@@ -1,38 +1,39 @@
-# HALOS default config (v3: documentation-conditioned geometry).
-# Hydra-composable; standalone scripts read via OmegaConf. Phase-specific keys are documented inline.
+# DOC-RT default config. Hydra-composable; standalone scripts read via OmegaConf.
+# DOC-RT = RT cell-token substrate + documentation-conditioned cell encoding (FiLM). No temporal
+# geometry, no tau, no scale-equivariance (those were the retired HALOS design; see archive/halos/).
 seed: 0
 
 data:
   dataset: rel-f1
   task: driver-dnf
   sampler:
-    num_neighbors: [12, 12]   # count/order-based (required for scale-equivariance); per-hop fanout
-    max_nodes: 4096           # cap on sampled subgraph size (pairwise bias is O(N^2))
+    num_neighbors: [12, 12]    # per-hop fanout for the leakage-safe temporal neighbor sampler
+  collate:
+    seq_len: 512               # fixed cell-token cap per seed; rel-f1 max≈353 cells/seed -> 0% truncation
+    max_fk: 5                  # max foreign-key neighbors per row (RT f2p_nbr width)
 
 docs:
-  regime: full                # full | shuffled_spans (placebo) | null
+  # full | null (docs OFF = RT names-only) | shuffled (placebo) | name_only (RELATE-style control)
+  regime: full
   encoder: Qwen/Qwen3-Embedding-4B
-  d_text: 2560                # VERIFY at first cache build; flows into FiLM + g_theta
+  d_text: 2560                 # VERIFY at first cache build; flows into FiLM + the RT name token
   grounding:
-    chunk_sentences: 3        # ~2-4 sentence spans
-    top_k: 4                  # spans pooled per schema element
-    # below this max-cosine -> d_null fallback. CALIBRATED for Qwen3-Embedding-4B (its sims sit in
-    # ~0.52-0.85); gives ~0.72 partial coverage on rel-f1. Encoder-specific — revisit at the H1 gate.
+    chunk_sentences: 3         # ~2-4 sentence spans
+    top_k: 4                   # spans pooled per schema element
+    # below this max-cosine -> d_null fallback. CALIBRATED for Qwen3-Embedding-4B (sims ~0.52-0.85).
     sim_threshold: 0.60
-    temp: 0.1                 # softmax temperature over cosine sims
+    temp: 0.1                  # softmax temperature over cosine sims
 
-model:                        # Phases 2-3
+model:
   d_model: 256
   n_heads: 8
-  n_layers: 8
-  eps_mode: relative          # tau = log(dt / T_ctx); zero-gap/timeless -> structural bucket (exact invariance)
-  geometry:
-    absolute_anchor: false    # append log T_ctx to ctx(p) -> BREAKS strict invariance (ablation)
-    content_modulated: false  # residual d_mu,d_sigma from [h_u;h_w] (v2 ablation)
-    sigma_floor: 0.1          # sigma = softplus(.) + sigma_floor
-    n_freq: 16                # Bochner features of tau
-  doc_cross_attn:             # depth-matched text tower + cross-attention (both default OFF)
-    feature: false            # graph node states cross-attend the doc span memory per layer (RELATE-like)
-    geometry: false           # metapath query cross-attends the span memory to build ctx(p) for g_theta
+  n_blocks: 8                  # RelationalBlocks (each = col/feat/nbr/full attention + SwiGLU FFN)
+  d_ff: 1024                   # SwiGLU inner dim (null -> 4*d_model)
+  enc_channels: 256            # pytorch-frame stype-encoder out channels
 
-# Phases 4-8 (train/audit/transfer) are NOT built this session — keys added when those phases land.
+train:
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 0.01
+  max_epochs: 10
+  num_workers: 0

@@ -10,8 +10,8 @@ def test_node_type_vocab_sorted_and_contiguous():
     assert nt == {"event": 0, "user": 1}
 
 
-def test_dual_fk_relations_get_distinct_ids(dualfk_bundle):
-    b = dualfk_bundle
+def test_dual_fk_relations_get_distinct_ids(synth_bundle):
+    b = synth_bundle
     # the two FKs into `user` must be distinct roles — the whole point
     assert b.relation_fk_role("f2p_buyer") != b.relation_fk_role("f2p_seller")
     assert b.relation_metapath("f2p_buyer") != b.relation_metapath("f2p_seller")
@@ -27,8 +27,8 @@ def test_dual_fk_relations_get_distinct_ids(dualfk_bundle):
     assert len(fk) == 2 and len(mp) == 2
 
 
-def test_bundle_counts(dualfk_bundle):
-    b = dualfk_bundle
+def test_bundle_counts(synth_bundle):
+    b = synth_bundle
     assert b.num_node_types == 2
     assert b.num_fk_roles == 1 + 2        # + FK_NONE; 2 canonical FK columns (buyer, seller)
     assert b.num_metapaths == 3 + 2       # + reserved

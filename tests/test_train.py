@@ -1,65 +1,77 @@
-"""Phase 4 — training: a step decreases loss and the model can overfit a single batch (~0 loss)."""
-from __future__ import annotations
+"""Phase 3 — DOC-RT training sanity: the model can overfit a single rel-f1 batch, and gradients reach
+the documentation FiLM, the RT name token, and the head (so the docs pathway is actually trained).
 
-import warnings
+Runs on CUDA when available (the dev node has a GPU), else CPU. Guarded by the cached rel-f1 dataset.
+"""
+from __future__ import annotations
 
 import torch
 
-from tests.conftest import rel_f1_available
+from gloss.train.loop import DOCRTLitModule
+from gloss.train.losses import masked_bce
+from gloss.utils.seeding import seed_everything
 
-D_TEXT, D_MODEL = 32, 32
+from ._relf1 import groundings, sample_cell_batch
+from .conftest import rel_f1_available
+
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _module_and_batch():
-    from relbench.tasks import get_task
-
-    from gloss.data.graph import build_gloss_graph, make_loader
-    from gloss.train.finetune import docs_for_regime
-    from gloss.train.loop import HALOSLitModule
-
-    warnings.filterwarnings("ignore")
-    torch.manual_seed(0)
-    bundle = build_gloss_graph("rel-f1")
-    task = get_task("rel-f1", "driver-dnf", download=False)
-    g, doc_mp = docs_for_regime(bundle, "rel-f1", "full", encoder="hash", d_text=D_TEXT)
-    module = HALOSLitModule(
-        bundle, g, doc_mp, task.entity_table,
-        model_kwargs=dict(d_model=D_MODEL, n_heads=4, n_layers=2, d_text=D_TEXT, n_freq=8),
+def _small_module(bundle, grounding, entity_table) -> DOCRTLitModule:
+    seed_everything(0)
+    module = DOCRTLitModule(
+        bundle, grounding, entity_table,
+        model_kwargs=dict(d_model=64, d_text=grounding.d_text, n_blocks=2,
+                          n_heads=4, d_ff=128, enc_channels=64),
+        lr=5e-3, seq_len=256, max_fk=5,
     )
-    loader = make_loader(bundle, task, "train", num_neighbors=[8, 8], batch_size=128, shuffle=False)
-    raw = next(iter(loader))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    module = module.to(device)
-    gb = module.transfer_batch_to_device(raw, device)
-    return module, gb
+    return module.to(_DEVICE)
 
 
 @rel_f1_available
 def test_overfits_single_batch():
-    from gloss.train.losses import masked_bce
+    """Repeatedly fitting one batch must drive the masked BCE far below its random-init value."""
+    bundle, task, cb = sample_cell_batch(seq_len=256, batch_size=16)
+    cb = cb.to(_DEVICE)
+    g_full, _g_null, _g_name = groundings()
+    module = _small_module(bundle, g_full, task.entity_table)
+    assert int(cb.has_target.sum()) > 0, "batch carries no labels to fit"
 
-    module, gb = _module_and_batch()
-    module.train()
-    opt = torch.optim.AdamW(module.parameters(), lr=1e-2)
-    losses = []
-    for _ in range(150):
+    opt = torch.optim.AdamW(module.parameters(), lr=5e-3, weight_decay=0.0)
+    with torch.no_grad():
+        init = masked_bce(module(cb), cb.target, cb.has_target).item()
+    final = init
+    for _ in range(200):
         opt.zero_grad()
-        loss = masked_bce(module(gb), gb.target, gb.has_target)
+        loss = masked_bce(module(cb), cb.target, cb.has_target)
         loss.backward()
         opt.step()
-        losses.append(loss.item())
-    assert losses[-1] < losses[0], "loss did not decrease"
-    assert losses[-1] < 0.1, f"failed to overfit (final loss {losses[-1]:.3f})"
+        final = loss.item()
+
+    assert final < 0.5 * init, f"loss did not drop enough: init={init:.4f} final={final:.4f}"
+    assert final < 0.3, f"did not overfit single batch: final={final:.4f}"
 
 
 @rel_f1_available
-def test_val_metrics_finite():
-    from gloss.eval.metrics import binary_metrics
+def test_gradients_reach_docs_and_head():
+    """One backward pass must deliver finite, non-zero gradients to the FiLM(γ), the RT name token, and
+    the head — i.e. the documentation-conditioning pathway is differentiable end to end."""
+    bundle, task, cb = sample_cell_batch(seq_len=256, batch_size=8)
+    cb = cb.to(_DEVICE)
+    g_full, _g_null, _g_name = groundings()
+    module = _small_module(bundle, g_full, task.entity_table)
 
-    module, gb = _module_and_batch()
-    module.eval()
-    with torch.no_grad():
-        logits = module(gb)
-    m = binary_metrics(logits[gb.has_target], gb.target[gb.has_target])
-    assert torch.isfinite(torch.tensor(m["logloss"]))
-    assert 0.0 <= m["auroc"] <= 1.0
+    loss = masked_bce(module(cb), cb.target, cb.has_target)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    enc = module.model.encoder
+    grads = {
+        "film_gamma": enc.gamma.weight.grad,
+        "name_token": enc.name_proj.weight.grad,
+        "head": next(module.model.head.parameters()).grad,
+    }
+    for name, g in grads.items():
+        assert g is not None, f"no gradient reached {name}"
+        assert torch.isfinite(g).all(), f"non-finite gradient at {name}"
+        assert g.abs().sum() > 0, f"zero gradient at {name}"

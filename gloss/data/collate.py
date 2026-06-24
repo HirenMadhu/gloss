@@ -1,22 +1,23 @@
-"""Phase 0 collate: a per-seed-disjoint sampled HeteroData minibatch -> a dense ``GlossBatch``.
+"""Phase 0 collate (DOC-RT): a per-seed-disjoint sampled ``HeteroData`` minibatch -> a dense, padded
+**cell-token** batch (RT substrate).
 
-The model attends over node pairs within each seed's sampled subgraph. We therefore turn the merged
-(but disjoint) PyG batch into **dense, padded, per-seed** tensors:
+RT (Relational Transformer, arXiv 2510.06377) tokenizes every *cell* (row x feature-column) and attends
+over a flat ``[B, S]`` sequence with relational masks. We replicate that contract on top of relbench's
+PyG temporal sampler:
 
-  node-level   ``[B, N_max]``           : node_type_id, seg/pad mask, row_time, is_timed, is_seed, n_id
-  pairwise     ``[B, N_max, N_max]``    : attend_mask, dt, tau, temporal_valid, metapath_id, fk_role_id
-  per-seed     ``[B]``                  : seed_time, T_ctx
+  per-cell  ``[B, S]``           : node_idxs (local row), col_idxs (table,column), table_idxs,
+                                   is_padding, is_seed_cell, row_time, is_timed, n_id
+  per-cell  ``[B, S, max_fk]``   : f2p_nbr_idxs — local row indices this cell's row references via FK
+  per-seed  ``[B]``              : seed_time, target, has_target
+  encoding  (per node type)      : tf_dict (TensorFrame) + cell_placement (scatter map) so Phase-2's
+                                   cell encoder can place per-cell value vectors into the [B, S, d] grid.
 
-Cell *features* are not encoded here — Phase 2's column encoder consumes ``tf_dict`` (the per-type
-``TensorFrame``s) and scatters the resulting node vectors into the ``[B, N_max, d]`` grid using
-``placement``.
+The four RT relational masks (same-column / same-row + forward-FK / reverse-FK / global) are derived
+from these index tensors inside the model (``rt_substrate.py``), recomputed each forward.
 
-Dimensionless time (the scale-equivariance carrier): ``tau_uw = log(dt_uw / T_ctx)`` for pairs where
-both endpoints are timestamped (``temporal_valid``); ``T_ctx`` = median nonzero gap in that seed's
-subgraph. Everything else (timeless node, zero gap, >1-hop, padding) is left to the structural-bias
-bucket downstream — here we just set ``temporal_valid=False`` and ``tau=0`` for those pairs.
-
-Time math is done in ``float64`` so the global time-rescale invariance test passes at 1e-5.
+``seq_len`` is a **fixed** cap (pad/truncate) — RT's Rust sampler does the same; a fixed S keeps the
+attention masks (and any FlexAttention block masks) a single compiled shape. Cells of the seed root row
+are emitted first so a readout head always sees them and they survive truncation.
 """
 from __future__ import annotations
 
@@ -25,91 +26,125 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .graph import FK_NONE, MP_MULTIHOP, MP_PAD, MP_SELF, GraphBundle, is_forward_relation
+from .graph import GraphBundle, is_forward_relation
+
+PAD = -1
+
+
+def feature_col_names(tf) -> list[str]:
+    """Canonical, deterministic feature-column order for a TensorFrame: sorted across all stypes.
+
+    Both the collate (which assigns each cell a column slot) and the cell encoder (which reorders the
+    pytorch-frame output) use this, so a cell's ``col_idx`` agrees on both sides without the collate
+    having to know pytorch-frame's internal concatenation order.
+    """
+    names: list[str] = []
+    for cols in tf.col_names_dict.values():
+        names.extend(cols)
+    return sorted(names)
+
+
+def column_vocab(bundle: GraphBundle) -> dict[tuple[str, str], int]:
+    """Global ``(node_type, column) -> id`` map (stable sorted). ``col_idxs`` use it so two cells share
+    a column id iff they are the *same column of the same table* — exactly RT's ``same_col_table``."""
+    cached = getattr(bundle, "_column_vocab", None)
+    if cached is not None:
+        return cached
+    pairs: list[tuple[str, str]] = []
+    for nt in bundle.node_types:
+        tf = bundle.data[nt].tf
+        for c in feature_col_names(tf):
+            pairs.append((nt, c))
+    vocab = {p: i for i, p in enumerate(sorted(pairs))}
+    try:
+        bundle._column_vocab = vocab  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return vocab
 
 
 @dataclass
-class GlossBatch:
+class CellBatch:
     num_seeds: int                 # B
-    n_max: int
-    # node-level [B, N_max]
-    node_type_id: Tensor           # long; pad = -1
-    pad_mask: Tensor               # bool; True = real node
-    is_seed: Tensor                # bool
+    seq_len: int                   # S
+    max_fk: int
+    # per-cell [B, S]
+    node_idxs: Tensor              # long; local row index within the seed subgraph (pad = -1)
+    col_idxs: Tensor               # long; global (table, column) id (pad = -1)
+    table_idxs: Tensor             # long; node-type id (pad = -1)
+    is_padding: Tensor             # bool; True = pad slot
+    is_seed_cell: Tensor           # bool; cell belongs to the seed root row
+    row_time: Tensor               # float64; 0 where untimed/pad (gate with is_timed)
     is_timed: Tensor               # bool
-    row_time: Tensor               # float64; 0 where untimed/pad (use is_timed to gate)
-    n_id: Tensor                   # long; global node id in the full graph (pad = -1)
+    n_id: Tensor                   # long; global node id (pad = -1) — debugging/leakage
+    # per-cell [B, S, max_fk]
+    f2p_nbr_idxs: Tensor           # long; local row idxs referenced via FK (pad = -1)
     # per-seed [B]
     seed_time: Tensor              # float64
-    t_ctx: Tensor                  # float64; median nonzero gap per subgraph (>=1)
-    target: Tensor                 # [B] float; label per seed (0 where absent)
-    has_target: Tensor             # [B] bool; True where a label was attached
-    # pairwise [B, N_max, N_max]
-    attend_mask: Tensor            # bool; True = j may attend to i (<=2-hop or self, same subgraph)
-    metapath_id: Tensor            # long; {PAD,SELF,MULTIHOP} + per-relation
-    fk_role_id: Tensor             # long; relation fk-role for 1-hop pairs, else FK_NONE
-    dt: Tensor                     # float64; |row_time_i - row_time_j|, 0 where not temporal_valid
-    tau: Tensor                    # float64; log(dt / T_ctx), 0 where not temporal_valid
-    temporal_valid: Tensor         # bool; both endpoints timestamped AND attend
-    # carried for Phase 2 encoding: per node-type TensorFrame + grid placement
-    tf_dict: dict                  # node_type -> torch_frame.TensorFrame (rows in store order)
-    placement: dict                # node_type -> (seg LongTensor[n_t], localpos LongTensor[n_t])
+    target: Tensor                 # float32
+    has_target: Tensor             # bool
+    # for value encoding (scatter): per node type
+    tf_dict: dict                  # node_type -> torch_frame.TensorFrame
+    cell_placement: dict           # node_type -> (b_idx, s_idx, row_idx, col_idx) LongTensors
 
-    def to(self, device) -> "GlossBatch":
+    def to(self, device) -> "CellBatch":
         def mv(x):
             return x.to(device) if torch.is_tensor(x) else x
 
-        return GlossBatch(
-            num_seeds=self.num_seeds, n_max=self.n_max,
-            node_type_id=mv(self.node_type_id), pad_mask=mv(self.pad_mask), is_seed=mv(self.is_seed),
-            is_timed=mv(self.is_timed), row_time=mv(self.row_time), n_id=mv(self.n_id),
-            seed_time=mv(self.seed_time), t_ctx=mv(self.t_ctx),
-            target=mv(self.target), has_target=mv(self.has_target),
-            attend_mask=mv(self.attend_mask), metapath_id=mv(self.metapath_id),
-            fk_role_id=mv(self.fk_role_id), dt=mv(self.dt), tau=mv(self.tau),
-            temporal_valid=mv(self.temporal_valid),
+        return CellBatch(
+            num_seeds=self.num_seeds, seq_len=self.seq_len, max_fk=self.max_fk,
+            node_idxs=mv(self.node_idxs), col_idxs=mv(self.col_idxs), table_idxs=mv(self.table_idxs),
+            is_padding=mv(self.is_padding), is_seed_cell=mv(self.is_seed_cell),
+            row_time=mv(self.row_time), is_timed=mv(self.is_timed), n_id=mv(self.n_id),
+            f2p_nbr_idxs=mv(self.f2p_nbr_idxs),
+            seed_time=mv(self.seed_time), target=mv(self.target), has_target=mv(self.has_target),
             tf_dict={k: v.to(device) for k, v in self.tf_dict.items()},
-            placement={k: (s.to(device), p.to(device)) for k, (s, p) in self.placement.items()},
+            cell_placement={k: tuple(t.to(device) for t in v) for k, v in self.cell_placement.items()},
         )
 
     def pretty_shapes(self) -> str:
-        lines = [f"GlossBatch: B={self.num_seeds} N_max={self.n_max}"]
-        for name in ("node_type_id", "pad_mask", "is_seed", "is_timed", "row_time", "n_id"):
-            lines.append(f"  {name:14s} {tuple(getattr(self, name).shape)} {getattr(self, name).dtype}")
-        for name in ("seed_time", "t_ctx"):
-            lines.append(f"  {name:14s} {tuple(getattr(self, name).shape)} {getattr(self, name).dtype}")
-        for name in ("attend_mask", "metapath_id", "fk_role_id", "dt", "tau", "temporal_valid"):
-            lines.append(f"  {name:14s} {tuple(getattr(self, name).shape)} {getattr(self, name).dtype}")
-        n_real = int(self.pad_mask.sum())
-        n_attend = int(self.attend_mask.sum())
-        n_tv = int(self.temporal_valid.sum())
-        lines.append(f"  real nodes={n_real}  attend pairs={n_attend}  temporal_valid pairs={n_tv}")
+        lines = [f"CellBatch: B={self.num_seeds} S={self.seq_len} max_fk={self.max_fk}"]
+        for name in ("node_idxs", "col_idxs", "table_idxs", "is_padding", "is_seed_cell",
+                     "row_time", "is_timed", "f2p_nbr_idxs"):
+            t = getattr(self, name)
+            lines.append(f"  {name:14s} {tuple(t.shape)} {t.dtype}")
+        n_real = int((~self.is_padding).sum())
+        lines.append(f"  real cells={n_real}  seed cells={int(self.is_seed_cell.sum())}  "
+                     f"targets={int(self.has_target.sum())}")
         lines.append(f"  tf_dict types: {sorted(self.tf_dict)}")
         return "\n".join(lines)
 
 
 def _seed_time_per_segment(entity_store, num_segments: int) -> Tensor:
-    """Map segment index -> seed time (float64). Handles seed_time sized to all-ent-nodes or to-seeds."""
     seed_time = entity_store.seed_time.to(torch.float64)
     batch = entity_store.batch
     out = torch.full((num_segments,), float("nan"), dtype=torch.float64)
     if seed_time.numel() == batch.numel():
         out[batch] = seed_time
-    else:  # seeds are the first `num_segments` entity nodes in disjoint order
-        out[batch[:seed_time.numel()]] = seed_time
+    else:
+        out[batch[: seed_time.numel()]] = seed_time
     assert not torch.isnan(out).any(), "could not recover seed_time for every segment"
     return out
 
 
-def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: int = 4096) -> GlossBatch:
-    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`GlossBatch`."""
+def to_cell_batch(
+    batch,
+    bundle: GraphBundle,
+    entity_table: str,
+    *,
+    seq_len: int = 1024,
+    max_fk: int = 5,
+) -> CellBatch:
+    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`CellBatch`."""
+    vocab = column_vocab(bundle)
     node_types = [nt for nt in bundle.node_types if nt in batch.node_types and batch[nt].num_nodes > 0]
 
-    # ---- flatten nodes across types (stable order) ----
-    seg_list, ntype_list, rowt_list, timed_list, seed_list, nid_list = [], [], [], [], [], []
+    # ---- flatten nodes across types (stable order); track per-node (type, in-type row) ----
     type_slice: dict[str, slice] = {}
+    seg_list, ntype_list, rowt_list, timed_list, seed_list, nid_list = [], [], [], [], [], []
+    intype_list, typeidx_list = [], []
     offset = 0
-    for nt in node_types:
+    for ti, nt in enumerate(node_types):
         st = batch[nt]
         n = st.num_nodes
         type_slice[nt] = slice(offset, offset + n)
@@ -124,23 +159,35 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
             timed_list.append(torch.zeros(n, dtype=torch.bool))
         is_seed = torch.zeros(n, dtype=torch.bool)
         if nt == entity_table and "seed_time" in st:
-            # seeds carry seed_time; in disjoint mode entity store == the B seeds (deduped per segment)
             is_seed[: st.seed_time.numel()] = True
         seed_list.append(is_seed)
         nid_list.append(st.n_id.to(torch.long) if "n_id" in st else torch.arange(n))
+        intype_list.append(torch.arange(n, dtype=torch.long))
+        typeidx_list.append(torch.full((n,), ti, dtype=torch.long))
 
     seg = torch.cat(seg_list)
     ntype = torch.cat(ntype_list)
     rowt = torch.cat(rowt_list)
     timed = torch.cat(timed_list)
-    is_seed_flat = torch.cat(seed_list)
+    is_seed_node = torch.cat(seed_list)
     nid = torch.cat(nid_list)
+    intype = torch.cat(intype_list)
+    typeidx = torch.cat(typeidx_list)
     total = seg.numel()
 
     B = int(seg.max().item()) + 1
     seed_time = _seed_time_per_segment(batch[entity_table], B)
 
-    # labels (attached by AttachTargetTransform to the entity store as `y`); absent in --dry-run
+    # per-seed local node index (0..R_b-1), stable
+    local_node = torch.empty(total, dtype=torch.long)
+    order = torch.argsort(seg, stable=True)
+    seen = torch.zeros(B, dtype=torch.long)
+    for gi in order.tolist():
+        s = int(seg[gi])
+        local_node[gi] = int(seen[s])
+        seen[s] += 1
+
+    # labels (attached by AttachTargetTransform to the entity store as `y`)
     ent = batch[entity_table]
     target = torch.zeros(B, dtype=torch.float32)
     has_target = torch.zeros(B, dtype=torch.bool)
@@ -150,60 +197,13 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
         target[yb] = y
         has_target[yb] = True
 
-    # local index within each segment (0..n_b-1) and per-segment counts
-    local_pos = torch.empty(total, dtype=torch.long)
-    counts = torch.zeros(B, dtype=torch.long)
-    # stable per-segment enumeration
-    order = torch.argsort(seg, stable=True)
-    seen = torch.zeros(B, dtype=torch.long)
-    for gi in order.tolist():
-        s = int(seg[gi])
-        local_pos[gi] = seen[s]
-        seen[s] += 1
-    counts = seen
-    n_max = int(counts.max().item())
-    if n_max > max_nodes:
-        n_max = max_nodes  # truncation guard (rare; logged by caller if hit)
-
-    # global flat idx -> (segment, local) ; record placement per type for Phase-2 scatter
-    placement: dict[str, tuple[Tensor, Tensor]] = {}
-    for nt in node_types:
-        sl = type_slice[nt]
-        placement[nt] = (seg[sl].clone(), local_pos[sl].clone())
-
-    # ---- dense node-level tensors ----
-    def grid_long(fill):
-        return torch.full((B, n_max), fill, dtype=torch.long)
-
-    node_type_id = grid_long(-1)
-    pad_mask = torch.zeros(B, n_max, dtype=torch.bool)
-    is_seed_g = torch.zeros(B, n_max, dtype=torch.bool)
-    is_timed_g = torch.zeros(B, n_max, dtype=torch.bool)
-    row_time_g = torch.zeros(B, n_max, dtype=torch.float64)
-    n_id_g = grid_long(-1)
-
-    keep = local_pos < n_max
-    bb = seg[keep]
-    ll = local_pos[keep]
-    node_type_id[bb, ll] = ntype[keep]
-    pad_mask[bb, ll] = True
-    is_seed_g[bb, ll] = is_seed_flat[keep]
-    is_timed_g[bb, ll] = timed[keep]
-    row_time_g[bb, ll] = rowt[keep]
-    n_id_g[bb, ll] = nid[keep]
-
-    # ---- 1-hop relation matrix (per segment, dense) from edges ----
-    # rel_mat[b, i, j] = metapath id of a *directed* 1-hop edge i<-j (j attends to i); 0 if none.
-    rel_mat = torch.zeros(B, n_max, n_max, dtype=torch.long)      # stores per-relation metapath id
-    fk_mat = torch.zeros(B, n_max, n_max, dtype=torch.long)
-    adj = torch.zeros(B, n_max, n_max, dtype=torch.bool)
+    # ---- f2p neighbors: per global node, the local-node idxs it references via forward FK edges ----
+    f2p: list[list[int]] = [[] for _ in range(total)]
 
     def flat_index(nt: str, local_in_store: Tensor) -> Tensor:
         return local_in_store + type_slice[nt].start
 
     for (src, rel, dst) in bundle.edge_types:
-        # process only forward relations; we add both attention directions ourselves, and the
-        # canonical FK role is direction-independent (so rev_* would just double-write).
         if not is_forward_relation(rel):
             continue
         if (src, rel, dst) not in batch.edge_types:
@@ -211,76 +211,73 @@ def to_gloss_batch(batch, bundle: GraphBundle, entity_table: str, *, max_nodes: 
         ei = batch[(src, rel, dst)].edge_index
         if ei.numel() == 0:
             continue
-        # edge_index row 0 = src local, row 1 = dst local (PyG convention: src -> dst)
-        gsrc = flat_index(src, ei[0])
-        gdst = flat_index(dst, ei[1])
-        bsrc, bdst = seg[gsrc], seg[gdst]
-        # disjoint => bsrc == bdst; guard anyway
-        same = bsrc == bdst
-        gsrc, gdst, bs = gsrc[same], gdst[same], bsrc[same]
-        ls, ld = local_pos[gsrc], local_pos[gdst]
-        ok = (ls < n_max) & (ld < n_max)
-        bs, ls, ld = bs[ok], ls[ok], ld[ok]
-        mp = bundle.relation_metapath(rel)
-        fk = bundle.relation_fk_role(rel)
-        # make attention symmetric (either endpoint may attend to the other)
-        for (a, b_) in ((ls, ld), (ld, ls)):
-            adj[bs, a, b_] = True
-            rel_mat[bs, a, b_] = mp
-            fk_mat[bs, a, b_] = fk
+        # f2p_<col>: src = table holding the FK (child), dst = referenced pkey table (parent).
+        gchild = flat_index(src, ei[0])
+        gparent = flat_index(dst, ei[1])
+        for c, p in zip(gchild.tolist(), gparent.tolist()):
+            if int(seg[c]) == int(seg[p]) and len(f2p[c]) < max_fk:
+                f2p[c].append(int(local_node[p]))
 
-    # ---- reachability (<=2 hop) + self ----
-    eye = torch.eye(n_max, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)
-    adj_f = adj.float()
-    two_hop = (torch.bmm(adj_f, adj_f) > 0)
-    valid_pair = pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)   # both real
-    reach = (adj | two_hop | eye) & valid_pair
-    attend_mask = reach
+    # ---- enumerate cells; seed-row cells first so they survive truncation ----
+    feat_cols = {nt: feature_col_names(batch[nt].tf) for nt in node_types}
+    s_counter = [0] * B
+    place: dict[str, list[list[int]]] = {nt: [[], [], [], []] for nt in node_types}  # b,s,row,col
+    node_idxs = torch.full((B, seq_len), PAD, dtype=torch.long)
+    col_idxs = torch.full((B, seq_len), PAD, dtype=torch.long)
+    table_idxs = torch.full((B, seq_len), PAD, dtype=torch.long)
+    is_padding = torch.ones(B, seq_len, dtype=torch.bool)
+    is_seed_cell = torch.zeros(B, seq_len, dtype=torch.bool)
+    row_time = torch.zeros(B, seq_len, dtype=torch.float64)
+    is_timed = torch.zeros(B, seq_len, dtype=torch.bool)
+    n_id_g = torch.full((B, seq_len), PAD, dtype=torch.long)
+    f2p_g = torch.full((B, seq_len, max_fk), PAD, dtype=torch.long)
 
-    metapath_id = torch.full((B, n_max, n_max), MP_PAD, dtype=torch.long)
-    metapath_id[two_hop & valid_pair] = MP_MULTIHOP        # 2-hop default
-    onehop = adj & valid_pair
-    metapath_id[onehop] = rel_mat[onehop]                  # 1-hop overrides with its relation
-    diag = eye & valid_pair
-    metapath_id[diag] = MP_SELF                            # self overrides
-    metapath_id[~attend_mask] = MP_PAD
+    # node visiting order: per seed, seed-root nodes first, then by local_node
+    visit = sorted(
+        range(total),
+        key=lambda g: (int(seg[g]), 0 if bool(is_seed_node[g]) else 1, int(local_node[g])),
+    )
+    for g in visit:
+        b = int(seg[g])
+        nt = node_types[int(typeidx[g])]
+        cols = feat_cols[nt]
+        if not cols:
+            continue
+        row_in_type = int(intype[g])
+        ln = int(local_node[g])
+        nbrs = f2p[g]
+        for col_pos, _cname in enumerate(cols):
+            s = s_counter[b]
+            if s >= seq_len:
+                break
+            s_counter[b] = s + 1
+            node_idxs[b, s] = ln
+            col_idxs[b, s] = vocab[(nt, _cname)]
+            table_idxs[b, s] = bundle.node_type_id[nt]
+            is_padding[b, s] = False
+            is_seed_cell[b, s] = bool(is_seed_node[g])
+            row_time[b, s] = float(rowt[g])
+            is_timed[b, s] = bool(timed[g])
+            n_id_g[b, s] = int(nid[g])
+            for k, nb in enumerate(nbrs):
+                f2p_g[b, s, k] = nb
+            place[nt][0].append(b)
+            place[nt][1].append(s)
+            place[nt][2].append(row_in_type)
+            place[nt][3].append(col_pos)
 
-    fk_role_id = torch.zeros(B, n_max, n_max, dtype=torch.long)
-    fk_role_id[onehop] = fk_mat[onehop]
-
-    # ---- dimensionless time on attendable, both-timed pairs ----
-    rt_i = row_time_g.unsqueeze(2)         # [B, N, 1]
-    rt_j = row_time_g.unsqueeze(1)         # [B, 1, N]
-    both_timed = is_timed_g.unsqueeze(2) & is_timed_g.unsqueeze(1)
-    temporal_valid = both_timed & attend_mask & ~diag
-    dt = torch.zeros(B, n_max, n_max, dtype=torch.float64)
-    dt[temporal_valid] = (rt_i - rt_j).abs()[temporal_valid]
-
-    t_ctx = torch.ones(B, dtype=torch.float64)
-    tau = torch.zeros(B, n_max, n_max, dtype=torch.float64)
-    for b in range(B):
-        pair_gaps = dt[b][temporal_valid[b] & (dt[b] > 0)]
-        # also fold in node recencies (seed_time - row_time): this keeps T_ctx a REAL timescale (so it
-        # scales with a global clock rescale) even for subgraphs with no valid pairwise gap — otherwise
-        # the fallback T_ctx=1.0 would make the node-time term log((seed-row)/1) non-invariant.
-        rec = (seed_time[b] - row_time_g[b])[is_timed_g[b]]
-        rec = rec[rec > 0]
-        all_gaps = torch.cat([pair_gaps, rec])
-        if all_gaps.numel() > 0:
-            t_ctx[b] = torch.median(all_gaps)
-        tv = temporal_valid[b] & (dt[b] > 0)
-        tau[b][tv] = torch.log(dt[b][tv] / t_ctx[b])
-    # pairs with dt==0 but both timed are not "temporal" (same instant) -> structural bucket
-    temporal_valid = temporal_valid & (dt > 0)
-
+    cell_placement = {
+        nt: (torch.tensor(p[0], dtype=torch.long), torch.tensor(p[1], dtype=torch.long),
+             torch.tensor(p[2], dtype=torch.long), torch.tensor(p[3], dtype=torch.long))
+        for nt, p in place.items() if p[0]
+    }
     tf_dict = {nt: batch[nt].tf for nt in node_types}
 
-    return GlossBatch(
-        num_seeds=B, n_max=n_max,
-        node_type_id=node_type_id, pad_mask=pad_mask, is_seed=is_seed_g, is_timed=is_timed_g,
-        row_time=row_time_g, n_id=n_id_g, seed_time=seed_time, t_ctx=t_ctx,
-        target=target, has_target=has_target,
-        attend_mask=attend_mask, metapath_id=metapath_id, fk_role_id=fk_role_id,
-        dt=dt, tau=tau, temporal_valid=temporal_valid,
-        tf_dict=tf_dict, placement=placement,
+    return CellBatch(
+        num_seeds=B, seq_len=seq_len, max_fk=max_fk,
+        node_idxs=node_idxs, col_idxs=col_idxs, table_idxs=table_idxs,
+        is_padding=is_padding, is_seed_cell=is_seed_cell, row_time=row_time, is_timed=is_timed,
+        n_id=n_id_g, f2p_nbr_idxs=f2p_g,
+        seed_time=seed_time, target=target, has_target=has_target,
+        tf_dict=tf_dict, cell_placement=cell_placement,
     )

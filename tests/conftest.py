@@ -1,10 +1,14 @@
-"""Shared hermetic fixtures — tiny synthetic graphs so the unit/invariance tests need no network.
+"""Shared hermetic fixtures — tiny synthetic relational graphs so the unit tests need no network.
 
-The headline fixture is a **dual-FK** graph: an ``event`` table with two foreign keys into ``user``
-(``buyer`` and ``seller``), which rel-f1 lacks. It powers both the collate/shape tests and the Phase-3
-``test_fk_role`` (distinct compiled geometry per FK role).
+The synthetic graph is a **dual-FK** schema: an ``event`` table with two foreign keys into ``user``
+(``buyer`` and ``seller``). It exercises the cell-token collate (placement, f2p neighbors, relational
+masks) and the leakage rule. Minimal ``TensorFrame``s carry only ``col_names_dict`` (the collate reads
+column identities, not values), so no pytorch-frame stats are needed. Encoder/FiLM tests that need real
+dtype stats are guarded by the cached real rel-f1.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 import torch
@@ -19,13 +23,34 @@ EDGE_TYPES = [
     ("event", "f2p_seller", "user"),
     ("user", "rev_f2p_seller", "event"),
 ]
+USER_COLS = ["u_attr"]
+EVENT_COLS = ["e_x", "e_y"]
 
 
-def _bundle() -> GraphBundle:
+def _tf(n: int, cols: list[str]):
+    import torch_frame
+
+    return torch_frame.TensorFrame(
+        feat_dict={torch_frame.numerical: torch.zeros(n, len(cols))},
+        col_names_dict={torch_frame.numerical: list(cols)},
+    )
+
+
+def _schema_graph():
+    """The 'full graph' the bundle points at (only its TensorFrame col names are read, for the vocab)."""
+    from torch_geometric.data import HeteroData
+
+    d = HeteroData()
+    d["user"].tf = _tf(2, USER_COLS)
+    d["event"].tf = _tf(4, EVENT_COLS)
+    return d
+
+
+def synthetic_bundle() -> GraphBundle:
     node_type_id, fk_role_id, metapath_id = _build_vocabs(NODE_TYPES, EDGE_TYPES)
     return GraphBundle(
         dataset_name="synthetic-dualfk",
-        data=None,
+        data=_schema_graph(),
         col_stats_dict={},
         node_types=NODE_TYPES,
         edge_types=EDGE_TYPES,
@@ -35,9 +60,9 @@ def _bundle() -> GraphBundle:
     )
 
 
-def make_dualfk_batch(seed_time: float = 100.0, event_times=(10.0, 20.0, 30.0, 40.0)):
-    """A 2-seed disjoint batch. Each segment: 1 timeless ``user`` seed + 2 timed ``event`` nodes,
-    one linked via ``buyer`` and one via ``seller``. All event times <= seed_time (leak-free)."""
+def make_synth_batch(seed_time: float = 100.0, event_times=(10.0, 20.0, 30.0, 40.0)):
+    """A 2-seed disjoint batch. Each segment: 1 untimed ``user`` seed + 2 timed ``event`` rows, one via
+    ``buyer`` and one via ``seller``. All event times <= seed_time (leak-free)."""
     from torch_geometric.data import HeteroData
 
     et = torch.tensor(event_times, dtype=torch.float64)
@@ -46,15 +71,15 @@ def make_dualfk_batch(seed_time: float = 100.0, event_times=(10.0, 20.0, 30.0, 4
     d["user"].batch = torch.tensor([0, 1])
     d["user"].seed_time = torch.tensor([seed_time, seed_time], dtype=torch.float64)
     d["user"].n_id = torch.tensor([0, 1])
-    d["user"].tf = torch.zeros(2, 1)
+    d["user"].tf = _tf(2, USER_COLS)
 
     d["event"].num_nodes = 4
     d["event"].batch = torch.tensor([0, 0, 1, 1])
     d["event"].time = et
     d["event"].n_id = torch.tensor([10, 11, 12, 13])
-    d["event"].tf = torch.zeros(4, 1)
+    d["event"].tf = _tf(4, EVENT_COLS)
 
-    # segment 0: events 0(buyer),1(seller) -> user 0 ; segment 1: events 2(buyer),3(seller) -> user 1
+    # f2p (child=event -> parent=user). seg 0: events 0,1 -> user 0 ; seg 1: events 2,3 -> user 1
     d["event", "f2p_buyer", "user"].edge_index = torch.tensor([[0, 2], [0, 1]])
     d["event", "f2p_seller", "user"].edge_index = torch.tensor([[1, 3], [0, 1]])
     d["user", "rev_f2p_buyer", "event"].edge_index = torch.tensor([[0, 1], [0, 2]])
@@ -63,13 +88,13 @@ def make_dualfk_batch(seed_time: float = 100.0, event_times=(10.0, 20.0, 30.0, 4
 
 
 @pytest.fixture
-def dualfk_bundle() -> GraphBundle:
-    return _bundle()
+def synth_bundle() -> GraphBundle:
+    return synthetic_bundle()
 
 
 @pytest.fixture
-def dualfk_batch():
-    return make_dualfk_batch()
+def synth_batch():
+    return make_synth_batch()
 
 
 @pytest.fixture
@@ -79,8 +104,6 @@ def entity_table() -> str:
 
 # ---- optional integration fixture on the cached real rel-f1 (offline; skip if absent) ----
 def _rel_f1_cached() -> bool:
-    from pathlib import Path
-
     try:
         from relbench.datasets import get_relbench_cache_dir
     except Exception:

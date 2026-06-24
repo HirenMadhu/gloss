@@ -1,18 +1,19 @@
-"""Phase 3 — task heads. A seed-node readout for entity tasks (binary/regression).
+"""Phase 3 — task heads. A seed-row readout for entity tasks (binary/regression).
 
-The masked-attribute / temporal-autocomplete pretraining heads belong to Phase 4; only the supervised
-entity head is needed for the Phase-3 forward DoD.
+DOC-RT v1 reads out the seed entity row by mean-pooling its (now context-aware, after the RT substrate's
+global attention) cells, then projects to logits. The masked-cell prediction head used by RT for
+pretraining belongs to a later phase; only the supervised readout head is needed for the Phase-3 DoD.
 """
 from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
 
-from ..data.collate import GlossBatch
+from ..data.collate import CellBatch
 
 
 class EntityHead(nn.Module):
-    """Read out the seed node of each subgraph and project to ``out_dim`` logits."""
+    """Mean-pool the seed root row's cells and project to ``out_dim`` logits."""
 
     def __init__(self, d_model: int, out_dim: int = 1):
         super().__init__()
@@ -23,12 +24,9 @@ class EntityHead(nn.Module):
             nn.Linear(d_model, out_dim),
         )
 
-    def forward(self, node_states: Tensor, gb: GlossBatch) -> Tensor:
-        """node_states ``[B, N, d]`` -> logits ``[B, out_dim]`` taken at each seed node."""
-        B, N, d = node_states.shape
-        seed = gb.is_seed.to(node_states.device)
-        # exactly one seed per segment; if (defensively) more, average them
-        w = seed.float()
+    def forward(self, cell_states: Tensor, cb: CellBatch) -> Tensor:
+        """cell_states ``[B, S, d]`` -> logits ``[B, out_dim]`` from the seed row's cells."""
+        w = cb.is_seed_cell.to(cell_states.dtype)
         w = w / w.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pooled = (node_states * w.unsqueeze(-1)).sum(dim=1)      # [B, d]
+        pooled = (cell_states * w.unsqueeze(-1)).sum(dim=1)       # [B, d]
         return self.mlp(pooled)

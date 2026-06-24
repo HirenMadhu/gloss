@@ -1,52 +1,21 @@
-"""Phase 0 — dense batch shape/dtype contracts."""
+"""End-to-end DOC-RT forward shapes (rel-f1 guarded)."""
 from __future__ import annotations
 
 import torch
 
-from gloss.data.collate import to_gloss_batch
-from tests.conftest import rel_f1_available
+from gloss.model.docrt import DOCRT
 
-
-def test_dense_shapes_and_dtypes(dualfk_batch, dualfk_bundle):
-    gb = to_gloss_batch(dualfk_batch, dualfk_bundle, "user", max_nodes=64)
-    B, N = gb.num_seeds, gb.n_max
-    # node-level [B, N]
-    for t in (gb.node_type_id, gb.pad_mask, gb.is_seed, gb.is_timed, gb.row_time, gb.n_id):
-        assert t.shape == (B, N)
-    # pairwise [B, N, N]
-    for t in (gb.attend_mask, gb.metapath_id, gb.fk_role_id, gb.dt, gb.tau, gb.temporal_valid):
-        assert t.shape == (B, N, N)
-    # per-seed [B]
-    assert gb.seed_time.shape == (B,) and gb.t_ctx.shape == (B,)
-    # dtypes: time math is float64 (exact scale-equivariance), ids long, masks bool
-    assert gb.row_time.dtype == torch.float64 and gb.tau.dtype == torch.float64
-    assert gb.dt.dtype == torch.float64 and gb.seed_time.dtype == torch.float64
-    assert gb.node_type_id.dtype == torch.long and gb.metapath_id.dtype == torch.long
-    assert gb.attend_mask.dtype == torch.bool and gb.temporal_valid.dtype == torch.bool
-
-
-def test_placement_covers_all_real_nodes(dualfk_batch, dualfk_bundle):
-    gb = to_gloss_batch(dualfk_batch, dualfk_bundle, "user", max_nodes=64)
-    # placement maps every node-type row to a (seg, localpos) inside the grid; together they tile pad_mask
-    grid = torch.zeros(gb.num_seeds, gb.n_max, dtype=torch.long)
-    for nt, (seg, pos) in gb.placement.items():
-        grid[seg, pos] += 1
-    assert torch.equal(grid.bool(), gb.pad_mask)
-    assert grid.max().item() == 1  # no double placement
+from ._relf1 import groundings, sample_cell_batch
+from .conftest import rel_f1_available
 
 
 @rel_f1_available
-def test_real_rel_f1_shapes():
-    from relbench.tasks import get_task
-
-    from gloss.data.graph import build_gloss_graph, make_loader
-
-    bundle = build_gloss_graph("rel-f1")
-    task = get_task("rel-f1", "driver-dnf", download=False)
-    loader = make_loader(bundle, task, "train", num_neighbors=[8, 8], batch_size=8, shuffle=False)
-    gb = to_gloss_batch(next(iter(loader)), bundle, task.entity_table, max_nodes=4096)
-    B, N = gb.num_seeds, gb.n_max
-    assert B == 8 and N >= 1
-    assert gb.attend_mask.shape == (B, N, N)
-    # at least the seeds are present and flagged
-    assert gb.is_seed.sum().item() == B
+def test_docrt_forward_shapes():
+    bundle, _task, cb = sample_cell_batch(seq_len=384, batch_size=8)
+    g_full, _g_null, _g_name = groundings()
+    model = DOCRT(bundle, d_model=64, d_text=g_full.d_text, n_blocks=2, n_heads=4,
+                  d_ff=128, enc_channels=64)
+    with torch.no_grad():
+        logits = model(cb, g_full)
+    assert logits.shape == (cb.num_seeds, 1)
+    assert torch.isfinite(logits).all()

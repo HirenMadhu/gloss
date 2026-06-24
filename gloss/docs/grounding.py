@@ -1,20 +1,24 @@
-"""Phase 1 — grounding: map each schema element to a pooled documentation embedding.
+"""Phase 1 — grounding: map each schema element to (a) its column-**name** embedding and (b) a pooled
+**documentation** embedding, for the four DOC-RT regimes.
 
-For element ``e`` with descriptor query ``q_e`` and corpus spans ``s_k``:
-  sims      = cos(encode(q_e, 'query'), encode(s_k, 'document'))
-  d_e       = softmax(top-K(sims)/temp) · s_topk      if max sims >= threshold
-            = 0 (ungrounded -> the model substitutes a learned d_null)   otherwise
-  rel_e     = max_k sims                               (kept as a relevance feature)
+For element ``e`` with descriptor/name query ``q_e`` and corpus spans ``s_k``:
+  name_e    = encode(q_e, 'query')                       # the column-name embedding (RT name token);
+                                                          # ALWAYS real, regime-independent.
+  sims      = cos(name_e, encode(s_k, 'document'))
+  d_e       = softmax(top-K(sims)/temp) · s_topk         if max sims >= threshold   (grounded)
+            = 0  (-> the cell encoder substitutes a learned d_null)                 otherwise
 
-Regimes:
-  full            — as above.
-  null            — every element ungrounded (name-only / RT-like floor).
-  shuffled_spans  — PLACEBO: retrieval runs normally, then the per-element results are permuted across
-                    elements (each element gets *another* element's pooled doc). Length/-distribution
-                    matched and same coverage stats, but the meaning routed to each element is wrong —
-                    the audit's negative control. (Permuting the span matrix itself is a no-op, since
-                    cosine is recomputed against the same vectors; the correspondence must be broken at
-                    the element level.)
+The cell encoder FiLM-conditions on ``emb`` (= d_e) and adds an RT name token from ``name_emb``. The
+regime decides what goes into ``emb``:
+  full       — grounded documentation d_e (the method).
+  null       — every element ungrounded (FiLM falls back to d_null): RT names-only baseline (docs OFF).
+  shuffled   — PLACEBO: the element->doc assignment is permuted (derangement) so each element receives
+               another element's pooled doc — coverage/length matched, meaning decorrelated.
+  name_only  — FiLM-condition on the column-name embedding itself (RELATE-style control: docs must beat
+               *names*, not just beat nothing).
+
+``name_emb`` (the RT name token) is held identical across all four regimes, so it never confounds the
+docs comparison (same role as the self-labels).
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from torch import Tensor
 
 from .corpus import SchemaElement
 
-REGIMES = ("full", "null", "shuffled_spans")
+REGIMES = ("full", "null", "shuffled", "name_only")
 
 
 @dataclass
@@ -41,37 +45,30 @@ class GroundingResult:
     d_text: int
     regime: str
     keys: list[str]                 # element order
-    emb: Tensor                     # [E, d_text]  (zeros where ungrounded)
+    emb: Tensor                     # [E, d_text]  FiLM conditioning (d_e; regime-dependent)
+    name_emb: Tensor                # [E, d_text]  column-name embedding (RT name token; regime-indep.)
     rel: Tensor                     # [E]          (max cosine; 0 where ungrounded)
-    grounded: Tensor                # [E] bool
+    grounded: Tensor                # [E] bool     (True => use emb; False => cell encoder uses d_null)
     key_to_row: dict                # key -> row index
-    span_emb: Tensor | None = None  # [M, d_text] raw doc-span memory (for the text tower / cross-attn);
-                                    # empty [0, d_text] under the `null` regime (docs off)
-
-    def span_memory(self) -> Tensor:
-        """The document span memory the text tower consumes. ``[M, d_text]`` ([0, d_text] if no docs)."""
-        if self.span_emb is None:
-            return torch.zeros(0, self.d_text)
-        return self.span_emb
 
     def grounded_by_key(self) -> dict[str, bool]:
         return {k: bool(self.grounded[i]) for k, i in self.key_to_row.items()}
 
-    def gather(self, keys: list[str]) -> tuple[Tensor, Tensor, Tensor]:
-        """Gather (emb, rel, grounded) for ``keys`` (unknown keys -> ungrounded zeros)."""
-        rows, miss = [], []
-        for k in keys:
-            rows.append(self.key_to_row.get(k, -1))
+    def gather(self, keys: list[str]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Gather (emb, name_emb, rel, grounded) for ``keys`` (unknown keys -> ungrounded zeros)."""
+        rows = [self.key_to_row.get(k, -1) for k in keys]
         idx = torch.tensor(rows)
         ok = idx >= 0
         emb = torch.zeros(len(keys), self.d_text)
+        name = torch.zeros(len(keys), self.d_text)
         rel = torch.zeros(len(keys))
         grd = torch.zeros(len(keys), dtype=torch.bool)
         if ok.any():
             emb[ok] = self.emb[idx[ok]]
+            name[ok] = self.name_emb[idx[ok]]
             rel[ok] = self.rel[idx[ok]]
             grd[ok] = self.grounded[idx[ok]]
-        return emb, rel, grd
+        return emb, name, rel, grd
 
 
 def ground(
@@ -88,46 +85,44 @@ def ground(
     cfg = cfg or GroundingConfig()
     keys = [e.key for e in elements]
     key_to_row = {k: i for i, k in enumerate(keys)}
-
-    span_emb = encode(spans, kind="document") if spans else torch.zeros(0, 0)
-    d_text = span_emb.shape[1] if span_emb.numel() else int(getattr(encode, "dim", 0))
     E = len(elements)
 
-    if regime == "null" or span_emb.numel() == 0:
-        # null => docs OFF everywhere: empty span memory so the text tower / cross-attn contribute nothing.
-        return GroundingResult(
-            d_text=d_text, regime=regime, keys=keys,
-            emb=torch.zeros(E, d_text), rel=torch.zeros(E),
-            grounded=torch.zeros(E, dtype=torch.bool), key_to_row=key_to_row,
-            span_emb=torch.zeros(0, d_text),
-        )
+    # column-name embeddings: ALWAYS real (the RT name token + the name_only control).
+    name_emb = encode([e.query for e in elements], kind="query")          # [E, d]
+    d_text = name_emb.shape[1]
 
-    q_emb = encode([e.query for e in elements], kind="query")          # [E, d]
-    sims = q_emb @ span_emb.T                                          # [E, S] (rows are unit-norm)
-    k = min(cfg.top_k, span_emb.shape[0])
-    top_sims, top_idx = sims.topk(k, dim=1)                           # [E, k]
-    rel = top_sims[:, 0]
-    grounded = rel >= cfg.sim_threshold
+    # pooled documentation d_e (full/shuffled). null/name_only never use the doc pooling.
+    doc = torch.zeros(E, d_text)
+    rel = torch.zeros(E)
+    grounded = torch.zeros(E, dtype=torch.bool)
+    if spans and regime in ("full", "shuffled"):
+        span_emb = encode(spans, kind="document")                         # [M, d]
+        sims = name_emb @ span_emb.T                                      # [E, M] (unit-norm rows)
+        k = min(cfg.top_k, span_emb.shape[0])
+        top_sims, top_idx = sims.topk(k, dim=1)
+        rel = top_sims[:, 0]
+        grounded = rel >= cfg.sim_threshold
+        weights = torch.softmax(top_sims / cfg.temp, dim=1).unsqueeze(-1)  # [E, k, 1]
+        pooled = (weights * span_emb[top_idx]).sum(dim=1)                 # [E, d]
+        doc = torch.where(grounded.unsqueeze(-1), pooled, torch.zeros_like(pooled))
+        rel = torch.where(grounded, rel, torch.zeros_like(rel))
 
-    weights = torch.softmax(top_sims / cfg.temp, dim=1).unsqueeze(-1)  # [E, k, 1]
-    pooled = (weights * span_emb[top_idx]).sum(dim=1)                  # [E, d]
-    emb = torch.where(grounded.unsqueeze(-1), pooled, torch.zeros_like(pooled))
-    rel = torch.where(grounded, rel, torch.zeros_like(rel))
-
-    if regime == "shuffled_spans":
-        # PLACEBO: permute the element->doc assignment (a derangement when E>1) so each element
-        # receives another element's pooled doc. Same multiset of docs (coverage/length matched),
-        # decorrelated from the element's own meaning.
+    if regime == "full":
+        emb = doc
+    elif regime == "null":
+        emb = torch.zeros(E, d_text)
+        grounded = torch.zeros(E, dtype=torch.bool)
+    elif regime == "shuffled":
         perm = _derangement(E, seed)
-        emb, rel, grounded = emb[perm], rel[perm], grounded[perm]
+        emb, rel, grounded = doc[perm], rel[perm], grounded[perm]
+    else:  # name_only
+        emb = name_emb.clone()
+        grounded = torch.ones(E, dtype=torch.bool)
+        rel = torch.ones(E)
 
-    # span memory for the text tower = the real spans. NOTE: the pooled-d_e placebo (element->doc
-    # derangement, above) does NOT decorrelate a SET-consuming text tower (a set is permutation-
-    # invariant). A proper cross-attn placebo (random / other-DB span content) is future work; for the
-    # new cross-attn path the meaningful H1 contrast is full vs null (empty memory).
     return GroundingResult(
-        d_text=d_text, regime=regime, keys=keys, emb=emb, rel=rel,
-        grounded=grounded, key_to_row=key_to_row, span_emb=span_emb,
+        d_text=d_text, regime=regime, keys=keys, emb=emb, name_emb=name_emb,
+        rel=rel, grounded=grounded, key_to_row=key_to_row,
     )
 
 

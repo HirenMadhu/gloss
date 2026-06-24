@@ -1,2 +1,2 @@
-"""gloss.model — doc-conditioned node encoder, dimensionless time, the doc-generated bias generator
-(core operator), attention, encoder stack, heads."""
+"""gloss.model — documentation-conditioned cell encoder (FiLM), RT relational-attention substrate,
+task heads, and the DOC-RT model assembly."""

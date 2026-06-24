@@ -1,1 +1,1 @@
-"""gloss.eval — geometry report (the readable-geometry exhibit) and (later) metrics/transfer."""
+"""gloss.eval — metrics, the LightGBM floor baseline, and the four-regime headline runner."""

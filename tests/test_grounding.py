@@ -1,4 +1,4 @@
-"""Phase 1 — grounding: retrieval correctness, null fallback, placebo decorrelation, cache determinism."""
+"""Phase 1 — grounding: retrieval, regimes (full/null/shuffled/name_only), name tokens, cache."""
 from __future__ import annotations
 
 import torch
@@ -40,60 +40,66 @@ def _enc():
 def test_full_retrieves_matching_span():
     r = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(top_k=2, sim_threshold=0.3))
     assert r.grounded.all()
-    # each element's pooled embedding should be closest to its matching span
-    enc = _enc()
-    span_emb = enc(SPANS)
+    span_emb = _enc()(SPANS)
     for i in range(3):
-        sims = r.emb[i] @ span_emb.T
-        assert int(sims.argmax()) == i
+        assert int((r.emb[i] @ span_emb.T).argmax()) == i
 
 
-def test_null_regime_all_ungrounded():
+def test_name_emb_is_regime_independent():
+    queries = _enc()([e.query for e in ELEMENTS], kind="query")
+    for regime in ("full", "null", "shuffled", "name_only"):
+        r = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=0.0), regime=regime)
+        assert torch.allclose(r.name_emb, queries)        # RT name token never changes across regimes
+
+
+def test_null_regime_all_ungrounded_but_keeps_names():
     r = ground(ELEMENTS, SPANS, _enc(), regime="null")
     assert not r.grounded.any()
-    assert torch.count_nonzero(r.emb) == 0
-    assert r.d_text == _enc().dim
+    assert torch.count_nonzero(r.emb) == 0                # FiLM falls back to d_null
+    assert torch.count_nonzero(r.name_emb) > 0            # but names survive (RT baseline)
+
+
+def test_name_only_conditions_on_names():
+    r = ground(ELEMENTS, SPANS, _enc(), regime="name_only")
+    assert r.grounded.all()
+    assert torch.allclose(r.emb, r.name_emb)              # FiLM conditioning == the name embedding
 
 
 def test_high_threshold_falls_back_to_ungrounded():
     r = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=1.01))
     assert not r.grounded.any()
-    assert torch.count_nonzero(r.emb) == 0       # model would substitute learned d_null
+    assert torch.count_nonzero(r.emb) == 0
 
 
 def test_placebo_is_decorrelated_but_same_shape():
     full = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=0.0), regime="full")
-    plac = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=0.0),
-                  regime="shuffled_spans", seed=1)
+    plac = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=0.0), regime="shuffled", seed=1)
     assert plac.emb.shape == full.emb.shape
-    assert not torch.allclose(plac.emb, full.emb)   # spans permuted -> different pooling
+    assert not torch.allclose(plac.emb, full.emb)         # element->doc assignment permuted
 
 
 def test_grounding_is_deterministic():
-    a = ground(ELEMENTS, SPANS, _enc(), regime="shuffled_spans", seed=7)
-    b = ground(ELEMENTS, SPANS, _enc(), regime="shuffled_spans", seed=7)
+    a = ground(ELEMENTS, SPANS, _enc(), regime="shuffled", seed=7)
+    b = ground(ELEMENTS, SPANS, _enc(), regime="shuffled", seed=7)
     assert torch.equal(a.emb, b.emb) and torch.equal(a.grounded, b.grounded)
 
 
 def test_gather_unknown_key_returns_zeros():
     r = ground(ELEMENTS, SPANS, _enc(), GroundingConfig(sim_threshold=0.0))
-    emb, rel, grd = r.gather(["e0", "does-not-exist"])
-    assert emb.shape == (2, r.d_text)
+    emb, name, rel, grd = r.gather(["e0", "does-not-exist"])
+    assert emb.shape == (2, r.d_text) and name.shape == (2, r.d_text)
     assert torch.count_nonzero(emb[1]) == 0 and not bool(grd[1])
     assert bool(grd[0])
 
 
 def test_embedding_cache_is_idempotent(tmp_path):
     path = tmp_path / "cache.pt"
-    enc = HashEncoder(dim=32)
-    c1 = EmbeddingCache(enc, path)
+    c1 = EmbeddingCache(HashEncoder(dim=32), path)
     out1 = c1(["table races", "table drivers"], kind="document")
     assert path.exists()
-    # fresh cache loads from disk and returns identical vectors without re-encoding
     c2 = EmbeddingCache(HashEncoder(dim=32), path)
     out2 = c2(["table races", "table drivers"], kind="document")
     assert torch.equal(out1, out2)
-    # query vs document of the same text differ (instruction-aware)
     q = c2(["table races"], kind="query")
     d = c2(["table races"], kind="document")
     assert not torch.allclose(q, d)

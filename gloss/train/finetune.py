@@ -1,26 +1,23 @@
-"""Phase 4 — supervised fine-tuning entry point + the regime->(grounding, doc_per_metapath) plumbing
-reused by the H1 gate (Phase 5).
+"""Phase 3 — supervised fine-tuning entry point + the regime -> grounding plumbing reused by the
+four-regime headline runner (``eval/ablation.py``).
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytorch_lightning as pl
-import torch
 
 from ..data.graph import build_gloss_graph
 from ..docs.cache import EmbeddingCache, HashEncoder, QwenEncoder
 from ..docs.corpus import DocCorpus, schema_elements_from_db
 from ..docs.grounding import GroundingConfig, GroundingResult, ground
-from ..model.halos import build_doc_per_metapath
-from .datamodule import HALOSDataModule
-from .loop import HALOSLitModule
+from .datamodule import DOCRTDataModule
+from .loop import DOCRTLitModule
 
 REPO = Path(__file__).resolve().parents[2]
 
 
 def make_grounding(
-    bundle,
     dataset: str,
     *,
     regime: str = "full",
@@ -30,6 +27,7 @@ def make_grounding(
     chunk_sentences: int = 3,
     top_k: int = 4,
 ) -> GroundingResult:
+    """Build a GroundingResult for ``regime`` from the authored doc corpus + the cached text encoder."""
     from relbench.datasets import get_dataset
 
     corpus = DocCorpus.load(REPO / "doc_corpus", dataset)
@@ -45,41 +43,22 @@ def make_grounding(
     return ground(elements, spans, enc, cfg, regime=regime)
 
 
-def null_grounding(dataset: str, d_text: int = 2560) -> GroundingResult:
-    """An all-ungrounded GroundingResult built straight from the DB schema (NO doc corpus needed).
-    Lets us run the architecture (null regime) on any RelBench DB without authoring docs."""
-    import torch
-    from relbench.datasets import get_dataset
-
-    db = get_dataset(dataset, download=False).get_db(upto_test_timestamp=False)
-    keys = [e.key for e in schema_elements_from_db(db)]
-    E = len(keys)
-    return GroundingResult(
-        d_text=d_text, regime="null", keys=keys,
-        emb=torch.zeros(E, d_text), rel=torch.zeros(E),
-        grounded=torch.zeros(E, dtype=torch.bool), key_to_row={k: i for i, k in enumerate(keys)},
-        span_emb=torch.zeros(0, d_text),
-    )
-
-
-def docs_for_regime(bundle, dataset: str, regime: str, *, encoder: str = "qwen", d_text: int = 64, **kw):
-    """-> (grounding, doc_per_metapath). null => empty grounding (no corpus needed), doc_mp=None.
-    full/shuffled => grounding from the authored doc corpus + the FK-doc geometry table."""
-    if regime == "null":
-        return null_grounding(dataset, d_text), None
-    g = make_grounding(bundle, dataset, regime=regime, encoder=encoder, d_text=d_text, **kw)
-    return g, build_doc_per_metapath(bundle, g)
+def docs_for_regime(dataset: str, regime: str, *, encoder: str = "qwen", d_text: int = 64, **kw):
+    """-> GroundingResult for ``regime``. ``null`` keeps the (regime-independent) RT name tokens but
+    turns the FiLM doc conditioning off (d_null everywhere)."""
+    return make_grounding(dataset, regime=regime, encoder=encoder, d_text=d_text, **kw)
 
 
 def train_prebuilt(
     bundle,
     task,
     grounding,
-    doc_per_metapath,
     *,
     model_kwargs: dict | None = None,
     num_neighbors: list[int] | None = None,
     batch_size: int = 64,
+    seq_len: int = 1024,
+    max_fk: int = 5,
     lr: float = 3e-4,
     weight_decay: float = 0.01,
     max_epochs: int = 5,
@@ -90,15 +69,16 @@ def train_prebuilt(
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
 ):
-    """Train one HALOS run on a PREBUILT bundle + grounding (the H1 gate reuses these across configs)."""
+    """Train one DOC-RT run on a PREBUILT bundle + grounding (the headline runner reuses these across
+    regimes so the graph is built once)."""
     from ..utils.seeding import seed_everything
 
     seed_everything(seed)
-    module = HALOSLitModule(
-        bundle, grounding, doc_per_metapath, task.entity_table,
-        model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
+    module = DOCRTLitModule(
+        bundle, grounding, task.entity_table,
+        model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
     )
-    dm = HALOSDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
+    dm = DOCRTDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
                          num_workers=num_workers)
     trainer = pl.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices=1,
@@ -118,12 +98,13 @@ def train(
     regime: str = "full",
     encoder: str = "qwen",
     model_kwargs: dict | None = None,
+    sim_threshold: float = 0.60,
     **kw,
 ):
     from relbench.tasks import get_task
 
     bundle = build_gloss_graph(dataset)
     task = get_task(dataset, task_name, download=False)
-    g, doc_mp = docs_for_regime(bundle, dataset, regime, encoder=encoder,
-                                d_text=(model_kwargs or {}).get("d_text", 64))
-    return train_prebuilt(bundle, task, g, doc_mp, model_kwargs=model_kwargs, **kw)
+    g = docs_for_regime(dataset, regime, encoder=encoder,
+                        d_text=(model_kwargs or {}).get("d_text", 64), sim_threshold=sim_threshold)
+    return train_prebuilt(bundle, task, g, model_kwargs=model_kwargs, **kw)
