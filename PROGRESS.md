@@ -77,5 +77,17 @@ MoE gating/dense-combine/ortho, routing-invariance, MoRE forward over all 6 arms
 signature); `--dry-run` signature arm aux≈0.69; a capped signature `--train` runs the MoE path through
 Lightning.
 
-**Next — Phase C (training + regression).** Regression loss + target standardization, metric dispatch by
-`task.task_type`, fix `predict_split`'s hardcoded sigmoid, rename `DOCRTLitModule → MoRELitModule`.
+**Phase C — training + regression [done].** `train/losses.py` gains `masked_mse` + a `task_loss` dispatch;
+`eval/metrics.py` gains `regression_metrics` (mae/rmse/r2). `train/loop.py` → **`MoRELitModule`**: handles
+both task types, **z-scores regression targets** with TRAIN-split stats (`finetune.target_stats`) for
+training, de-standardizes for val metrics (mae/rmse/r2) and predictions; `finetune.task_kind` reads
+`task.task_type`. `eval/test_eval.py` `predict_split` is now task-type-aware (the hardcoded sigmoid is gone —
+binary → probability, regression → de-standardized value), so `task.evaluate` gets original-unit predictions.
+`train/datamodule.py` → `MoREDataModule`. `run_train.py` gains `--num-experts/-k/--d-sig/--lambda-ortho/
+--moe-placement/--dataset/--task/--test`. DoD: `pytest` **55 passed, 1 skipped** (new: masked-MSE/`task_loss`/
+regression-metrics hermetic + a regression single-batch overfit); a capped `driver-position` (regression)
+`--train --test` run reports val mae/rmse/r2 and a leaderboard-style test MAE via `task.evaluate`.
+
+**Next — Phase D (multi-DB ablation).** `entity_tasks()` (binary+regression only), the routing-signal
+`ablation.py` (signature/hidden/value/identity/dense/dense_wide × dataset × task × seed) + `run_ablation.{py,sh}`,
+`diagnostics.py` (expert usage + specialization), `build_schema_cache.{py,sh}`.

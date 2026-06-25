@@ -30,3 +30,15 @@ def binary_metrics_prob(prob, y) -> dict[str, float]:
         out["auroc"] = float(roc_auc_score(y, prob))
     out["logloss"] = float(log_loss(y, np.clip(prob, 1e-7, 1 - 1e-7), labels=[0, 1]))
     return out
+
+
+def regression_metrics(pred, target) -> dict[str, float]:
+    """pred/target `[N]` (original units; torch or array) -> {mae, rmse, r2}."""
+    p = pred.detach().float().cpu().numpy().ravel() if torch.is_tensor(pred) else np.asarray(pred, float).ravel()
+    y = target.detach().float().cpu().numpy().ravel() if torch.is_tensor(target) else np.asarray(target, float).ravel()
+    diff = p - y
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    var = float(np.var(y))
+    r2 = float(1.0 - np.mean(diff ** 2) / var) if var > 0 else float("nan")
+    return {"mae": mae, "rmse": rmse, "r2": r2}

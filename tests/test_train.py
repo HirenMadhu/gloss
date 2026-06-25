@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from gloss.train.loop import DOCRTLitModule
-from gloss.train.losses import masked_bce
+from gloss.train.loop import MoRELitModule
+from gloss.train.losses import masked_bce, masked_mse
 from gloss.utils.seeding import seed_everything
 
 from ._relf1 import name_table, sample_cell_batch
@@ -17,10 +17,10 @@ from .conftest import rel_f1_available
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _small_module(bundle, name_emb, entity_table) -> DOCRTLitModule:
+def _small_module(bundle, name_emb, entity_table, *, task_type="binary") -> MoRELitModule:
     seed_everything(0)
-    module = DOCRTLitModule(
-        bundle, name_emb, entity_table,
+    module = MoRELitModule(
+        bundle, name_emb, entity_table, task_type=task_type,
         model_kwargs=dict(d_model=64, n_blocks=2, n_heads=4, d_ff=128, enc_channels=64),
         lr=5e-3, seq_len=256, max_fk=5,
     )
@@ -74,3 +74,26 @@ def test_gradients_reach_encoder_and_head():
         assert g is not None, f"no gradient reached {name}"
         assert torch.isfinite(g).all(), f"non-finite gradient at {name}"
         assert g.abs().sum() > 0, f"zero gradient at {name}"
+
+
+@rel_f1_available
+def test_regression_overfits_single_batch():
+    """The regression path (continuous target via masked MSE) can memorize one batch."""
+    bundle, task, cb = sample_cell_batch(seq_len=256, batch_size=16)
+    cb = cb.to(_DEVICE)
+    name_emb = name_table()
+    module = _small_module(bundle, name_emb, task.entity_table, task_type="regression")
+    torch.manual_seed(0)
+    y = torch.randn(int(cb.num_seeds), device=_DEVICE)         # synthetic continuous target
+    has = torch.ones_like(cb.has_target)
+    opt = torch.optim.AdamW(module.parameters(), lr=5e-3, weight_decay=0.0)
+    with torch.no_grad():
+        init = masked_mse(module(cb), y, has).item()
+    final = init
+    for _ in range(200):
+        opt.zero_grad()
+        loss = masked_mse(module(cb), y, has)
+        loss.backward()
+        opt.step()
+        final = loss.item()
+    assert final < 0.3 * init, f"regression did not overfit: init={init:.4f} final={final:.4f}"

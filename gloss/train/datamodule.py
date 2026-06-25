@@ -11,7 +11,7 @@ import pytorch_lightning as pl
 from ..data.graph import GraphBundle, make_loader
 
 
-class DOCRTDataModule(pl.LightningDataModule):
+class MoREDataModule(pl.LightningDataModule):
     def __init__(
         self,
         bundle: GraphBundle,

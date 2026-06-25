@@ -32,8 +32,9 @@ def predict_split(
     num_workers: int = 0,
     device=None,
 ) -> np.ndarray:
-    """Run ``module(cb) -> logits[B]`` over every seed of ``split``; return probabilities ``[n]``
-    aligned to the split table's row order (via the entity store's ``input_id``)."""
+    """Run ``module(cb)`` over every seed of ``split``; return per-row predictions ``[n]`` aligned to the
+    split table's row order via the entity store's ``input_id`` (probability for binary, de-standardized
+    value for regression)."""
     device = device or next(module.parameters()).device
     was_training = module.training
     module.eval()
@@ -45,11 +46,15 @@ def predict_split(
     pred = np.full(n, np.nan, dtype=np.float64)
     for raw in loader:
         cb = to_cell_batch(raw, bundle, task.entity_table, seq_len=seq_len, max_fk=max_fk).to(device)
-        prob = torch.sigmoid(module(cb).float()).cpu()        # [B] in segment order
+        out = module(cb).float().cpu()                        # [B] raw output in segment order
+        if getattr(module, "task_type", "binary") == "regression":
+            pred_b = out * module.target_std + module.target_mean   # de-standardize to original units
+        else:
+            pred_b = torch.sigmoid(out)                       # probability
         store = raw[task.entity_table]
         seg = store.batch.cpu()                               # segment per entity node
         gid = store.input_id.cpu().numpy()                    # row index per entity node (seed row)
-        pred[gid] = prob[seg].numpy()
+        pred[gid] = pred_b[seg].numpy()
     if was_training:
         module.train()
     assert not np.isnan(pred).any(), f"{split}: {int(np.isnan(pred).sum())} seeds got no prediction"

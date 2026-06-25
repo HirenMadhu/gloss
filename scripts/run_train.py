@@ -23,12 +23,14 @@ from gloss.utils.seeding import seed_everything  # noqa: E402
 log = get_logger("gloss.run_train")
 
 
-def _model_kwargs(cfg) -> dict:
+def _model_kwargs(cfg, args) -> dict:
     m = cfg.model
     return dict(
         d_model=int(m.d_model), n_blocks=int(m.n_blocks),
         n_heads=int(m.n_heads), d_ff=int(m.get("d_ff", 4 * int(m.d_model))),
         enc_channels=int(m.get("enc_channels", int(m.d_model))),
+        d_sig=int(args.d_sig), num_experts=int(args.num_experts), k=int(args.k),
+        moe_placement=args.moe_placement,
     )
 
 
@@ -42,6 +44,14 @@ def main() -> int:
     ap.add_argument("--route-on", default="dense",
                     choices=["signature", "hidden", "value", "identity", "dense", "dense_wide"],
                     help="MoE routing arm (dense = plain RT)")
+    ap.add_argument("--dataset", default=None, help="override config data.dataset")
+    ap.add_argument("--task", default=None, help="override config data.task")
+    ap.add_argument("--num-experts", type=int, default=4)
+    ap.add_argument("--k", type=int, default=2)
+    ap.add_argument("--d-sig", type=int, default=128)
+    ap.add_argument("--lambda-ortho", type=float, default=0.5)
+    ap.add_argument("--moe-placement", default="all", choices=["all", "upper_half"])
+    ap.add_argument("--test", action="store_true", help="also score the held-out RelBench test split")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--limit-train-batches", type=int, default=None)
@@ -54,8 +64,8 @@ def main() -> int:
 
     cfg = load_config(args.config)
     seed_everything(int(cfg.seed))
-    dataset = str(cfg.data.dataset)
-    task_name = str(cfg.data.task)
+    dataset = str(args.dataset or cfg.data.dataset)
+    task_name = str(args.task or cfg.data.task)
     num_neighbors = list(cfg.data.sampler.num_neighbors)
     seq_len = int(args.seq_len or cfg.data.collate.seq_len)
     max_fk = int(cfg.data.collate.max_fk)
@@ -111,18 +121,27 @@ def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int
     bundle = build_gloss_graph(dataset)
     task = get_task(dataset, task_name, download=False)
     name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=d_text)
-    mk = _model_kwargs(cfg)
-    _, metrics = train_prebuilt(
-        bundle, task, name_emb, model_kwargs=mk, route_on=args.route_on,
+    mk = _model_kwargs(cfg, args)
+    batch_size = args.batch_size or int(cfg.train.batch_size)
+    num_workers = args.num_workers if args.num_workers is not None else int(cfg.train.num_workers)
+    module, metrics = train_prebuilt(
+        bundle, task, name_emb, model_kwargs=mk, route_on=args.route_on, lambda_ortho=args.lambda_ortho,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk,
-        batch_size=args.batch_size or int(cfg.train.batch_size),
+        batch_size=batch_size,
         lr=float(cfg.train.lr), weight_decay=float(cfg.train.weight_decay),
         max_epochs=args.epochs or int(cfg.train.max_epochs), seed=int(cfg.seed),
-        num_workers=args.num_workers if args.num_workers is not None else int(cfg.train.num_workers),
+        num_workers=num_workers,
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
     )
-    print("[train] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "val" in k))
+    print(f"[{args.route_on}] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "val" in k))
+
+    if args.test:
+        from gloss.eval.test_eval import evaluate_split
+
+        tm = evaluate_split(module, bundle, task, "test", num_neighbors=num_neighbors,
+                            seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers)
+        print("[test] " + "  ".join(f"{k}={v:.4f}" for k, v in tm.items()))
 
     if args.baseline:
         from gloss.eval.baselines import run_lightgbm_baseline
