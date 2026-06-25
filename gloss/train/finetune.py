@@ -101,6 +101,9 @@ def train_prebuilt(
         max_epochs=max_epochs, accelerator=accelerator, devices=1,
         logger=logger, enable_checkpointing=False, enable_model_summary=False,
         enable_progress_bar=False, log_every_n_steps=20,
+        # we never early-stop or checkpoint on val, so validate only at the final epoch — the per-epoch
+        # full-val neighbor-sampling pass is the dominant cost. Final val + held-out TEST are unaffected.
+        check_val_every_n_epoch=max(int(max_epochs), 1),
         limit_train_batches=limit_train_batches or 1.0,
         limit_val_batches=limit_val_batches or 1.0,
     )

@@ -3,7 +3,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpu
-#SBATCH --gpus=a40:1
+#SBATCH --gpus=h100:1
 #SBATCH --nodes=1
 #SBATCH --mem=128G
 #SBATCH --output=./logs/slurm/%x_%A.out

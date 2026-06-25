@@ -50,8 +50,9 @@ class is `MoRE` (`gloss/model/more.py`). Retired stacks: DOC-RT under `archive/d
 `.venv` (uv, py3.12): **torch 2.8.0+cu128**, torch_geometric 2.8.0, torch_frame 0.3.0, relbench,
 sentence-transformers, transformers, lightgbm, pytorch-lightning, hydra, wandb. Use `.venv/bin/python`. The dev
 node has an **A40 (46 GB)**; bigger jobs go to SLURM (`gpu`/`priority_gpu`: h100:4 / a40:4; the ablation gate is
-`scripts/run_ablation.sh`, a SLURM job array). **flash-attn is not built** (its only consumer would be the
-frozen Qwen encoder — MoRE's own attention uses **SDPA**).
+`scripts/run_ablation.sh`, a SLURM job array on **h100**). **flash-attn is installed (2.8.3) but unused** — MoRE's
+relational attention uses **SDPA**, and its four boolean masks force the math backend (flash kernels don't take
+arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, which runs offline.
 
 ## Working agreement (these govern how you work here)
 
