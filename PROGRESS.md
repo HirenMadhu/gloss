@@ -88,6 +88,22 @@ binary → probability, regression → de-standardized value), so `task.evaluate
 regression-metrics hermetic + a regression single-batch overfit); a capped `driver-position` (regression)
 `--train --test` run reports val mae/rmse/r2 and a leaderboard-style test MAE via `task.evaluate`.
 
-**Next — Phase D (multi-DB ablation).** `entity_tasks()` (binary+regression only), the routing-signal
-`ablation.py` (signature/hidden/value/identity/dense/dense_wide × dataset × task × seed) + `run_ablation.{py,sh}`,
-`diagnostics.py` (expert usage + specialization), `build_schema_cache.{py,sh}`.
+**Phase D — multi-DB routing-signal ablation [done].** `eval/ablation.py` rewritten around routing
+**signals** (not doc regimes): `entity_tasks()` filters RelBench `get_task_names` to binary+regression via
+`task.task_type` (rel-f1 → 5 entity tasks: driver-dnf/top3 + driver/qualifying/results-position; link tasks
+excluded); `build_grid` enumerates `(dataset, task, signal, seed)`; `run_config(index)` trains one arm and
+writes one JSON with val + **held-out test** metrics (`task.evaluate`); `aggregate` groups by
+`(dataset, task, signal)` with 95% CI; `format_table` prints per-`(dataset, task)` the primary metric
+(AUROC↑ / MAE↓) and each arm's **Δ vs dense**. `scripts/run_ablation.{py,sh}` (SLURM array) +
+`scripts/build_schema_cache.{py,sh}` (precompute Qwen column-name embeddings once — the array does no LM
+forward) + `eval/diagnostics.py` (expert-usage entropy + the cross-table specialization probe). DoD:
+`pytest` **56 passed, 1 skipped** (grid enumeration, CI aggregation, binary/regression lift tables);
+`run_ablation.py --list` = 30 for rel-f1×1-seed; a 2-arm local smoke (signature, dense) wrote JSON and
+`--aggregate` printed the table with the signature-vs-dense lift.
+
+**Honesty / framing.** Dense-combine MVP ⇒ MoE arms cost ~M× FFN FLOPs (not k×); we report vanilla `dense`
+**and** param-matched `dense_wide`, and do not claim active-FLOP parity (sparse dispatch is deferred). The
+full headline = signature vs {value, dense, identity} across all entity tasks of rel-f1/rel-stack/rel-trial,
+reported on TEST — runs on SLURM once rel-stack is downloaded and the schema cache is built.
+
+**Remaining.** Phase E doc-sync: `CLAUDE.md` still describes DOC-RT and should be rewritten to MoRE.
