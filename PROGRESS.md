@@ -62,7 +62,20 @@ the router will route on). Stripped FiLM/grounding from `CellEncoder` / `DOCRT` 
 removed; configs lost the `docs.*` block. DoD: `pytest` **40 passed, 1 skipped**; `run_train.py --dry-run`
 forwards rel-f1 (B=8, 527 real cells, leakage=0, finite logits); a capped `--train` arm reports val metrics.
 
-**Next — Phase B (MoRE core).** `model/signature.py` (RelationalSignature: name-emb + modality + fixed-edge
-recency bins), `model/moe.py` (MoEFFN + ortho loss), wire MoE into `rt_substrate.py` (router dim set by
-route_on), `model/more.py` (forward → (logits, aux)); tests: signature value-free, MoE gating/ortho, routing
-invariance.
+**Phase B — MoRE core [done].** `model/moe.py` (`SwiGLU` + `MoEFFN`: pool of SwiGLU experts, top-k router,
+dense combine, router-orthogonality `ortho_loss`); `model/signature.py` (`RelationalSignature`: frozen
+column-name embedding + learned modality (pytorch-frame stype) + **fixed-edge, context-independent** recency
+buckets, bin 0 = untimed; computed once, value-free); `text/schema.py` gains `build_column_modality_ids`.
+Wired MoE into `model/rt_substrate.py` — `RelationalBlock` takes a `moe` flag and `RTSubstrate` takes
+`route_on` (router input dim set by the arm: `d_sig` for signature/identity, `d_model` for hidden/value),
+threads `z`/value/id and returns `(states, aux)`. `model/more.py` (`MoRE`, `forward → (logits, aux)`,
+`ROUTE_ONS = signature/hidden/value/identity/dense/dense_wide`; dense_wide = param-matched control).
+`CellEncoder.forward(cb, return_value)` now also returns the value component (for the `value` arm). The
+Lightning loop builds `MoRE`, adds `λ·aux` to the loss; `train_prebuilt`/`run_train` gained `--route-on`.
+`model/docrt.py` removed. DoD: `pytest` **50 passed, 1 skipped** (new: signature value-free + recency,
+MoE gating/dense-combine/ortho, routing-invariance, MoRE forward over all 6 arms + grad-flow to router &
+signature); `--dry-run` signature arm aux≈0.69; a capped signature `--train` runs the MoE path through
+Lightning.
+
+**Next — Phase C (training + regression).** Regression loss + target standardization, metric dispatch by
+`task.task_type`, fix `predict_split`'s hardcoded sigmoid, rename `DOCRTLitModule → MoRELitModule`.

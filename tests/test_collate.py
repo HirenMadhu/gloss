@@ -80,8 +80,9 @@ def test_substrate_forward_finite_and_pad_zero():
     x = torch.randn(cb.num_seeds, cb.seq_len, 16)
     sub = RTSubstrate(d_model=16, n_blocks=2, n_heads=4, d_ff=32)
     with torch.no_grad():
-        y = sub(x, cb)
+        y, aux = sub(x, cb)
     assert y.shape == x.shape
+    assert float(aux) == 0.0          # dense substrate has no router
     assert torch.isfinite(y).all()
     # padded positions are zeroed out
     assert torch.allclose(y[cb.is_padding], torch.zeros_like(y[cb.is_padding]))

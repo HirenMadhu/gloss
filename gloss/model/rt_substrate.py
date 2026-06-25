@@ -4,8 +4,9 @@ Faithful port of the attention core of the Relational Transformer (RT, Ranjan et
 arXiv:2510.06377; reference code snap-stanford/relational-transformer, CC-BY-4.0). We reimplement it
 in-stack (PyTorch + SDPA) rather than adopting RT's Rust sampler / pixi pipeline.
 
-A ``RelationalBlock`` runs four masked attentions over the flat ``[B, S]`` cell sequence, then a SwiGLU
-FFN, all pre-norm (RMSNorm):
+A ``RelationalBlock`` runs four masked attentions over the flat ``[B, S]`` cell sequence, then an FFN
+(a ``SwiGLU``, or a Mixture-of-Experts FFN routed on the relational signature — MoRE's only new
+mechanism), all pre-norm (RMSNorm):
   * ``col``  — same column of the same table (across rows).
   * ``feat`` — same row, or a row this cell's row references via a foreign key (forward FK).
   * ``nbr``  — a row that references this cell's row (reverse FK).
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..data.collate import CellBatch
+from .moe import MoEFFN, SwiGLU
 
 REL_ORDER = ("col", "feat", "nbr", "full")
 
@@ -77,43 +79,100 @@ class MaskedAttention(nn.Module):
         return self.wo(out)
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, d_model: int, d_ff: int):
-        super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff, bias=False)
-        self.w2 = nn.Linear(d_ff, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, d_ff, bias=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-
 class RelationalBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int):
+    """col→feat→nbr→full masked attention + an FFN (SwiGLU, or a MoE FFN when ``moe``).
+
+    A MoE block returns the router-orthogonality loss as its second output; a dense block returns 0.
+    ``route_on`` selects what the router reads: ``signature`` (``z``), ``hidden`` (the block's own
+    normed hidden), ``value`` (the cell's value component), or ``identity`` (a learned per-column id).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        *,
+        moe: bool = False,
+        d_route: int | None = None,
+        num_experts: int = 4,
+        k: int = 2,
+        route_on: str = "dense",
+    ):
         super().__init__()
         self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model) for l in (*REL_ORDER, "ffn")})
         self.attns = nn.ModuleDict({l: MaskedAttention(d_model, num_heads) for l in REL_ORDER})
-        self.ffn = SwiGLU(d_model, d_ff)
+        self.moe = moe
+        self.route_on = route_on
+        if moe:
+            self.ffn = MoEFFN(d_model, d_ff, int(d_route), num_experts=num_experts, k=k)
+        else:
+            self.ffn = SwiGLU(d_model, d_ff)
 
-    def forward(self, x: Tensor, masks: dict[str, Tensor]) -> Tensor:
+    def _route_feat(self, h, z, value_feat, id_emb):
+        return {"signature": z, "hidden": h, "value": value_feat, "identity": id_emb}[self.route_on]
+
+    def forward(self, x, masks, *, z=None, value_feat=None, id_emb=None):
         for l in REL_ORDER:
             x = x + self.attns[l](self.norms[l](x), masks[l])
-        x = x + self.ffn(self.norms["ffn"](x))
-        return x
+        h = self.norms["ffn"](x)
+        if self.moe:
+            y, _gates = self.ffn(h, self._route_feat(h, z, value_feat, id_emb))
+            return x + y, self.ffn.ortho_loss()
+        return x + self.ffn(h), x.new_zeros(())
 
 
 class RTSubstrate(nn.Module):
-    """Stack of :class:`RelationalBlock`s over the flat cell sequence."""
+    """Stack of :class:`RelationalBlock`s over the flat cell sequence.
 
-    def __init__(self, *, d_model: int = 256, n_blocks: int = 8, n_heads: int = 8, d_ff: int | None = None):
+    ``route_on`` configures the whole stack. ``dense`` / ``dense_wide`` are pure RT (no router;
+    ``dense_wide`` widens the FFN by ``k`` as a param-matched control). The MoE arms (signature /
+    hidden / value / identity) put a :class:`MoEFFN` in the placed blocks; ``forward`` threads the
+    routing tensors and returns ``(states, aux)`` where ``aux`` is the summed router-orthogonality loss.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int = 256,
+        n_blocks: int = 8,
+        n_heads: int = 8,
+        d_ff: int | None = None,
+        route_on: str = "dense",
+        d_sig: int = 128,
+        num_experts: int = 4,
+        k: int = 2,
+        moe_placement: str = "all",
+    ):
         super().__init__()
         d_ff = d_ff or 4 * d_model
-        self.blocks = nn.ModuleList(RelationalBlock(d_model, n_heads, d_ff) for _ in range(n_blocks))
+        is_moe_arm = route_on not in ("dense", "dense_wide")
+        d_route = d_sig if route_on in ("signature", "identity") else d_model
+        moe_idx = self._placement(n_blocks, moe_placement) if is_moe_arm else set()
+        blocks = []
+        for i in range(n_blocks):
+            block_is_moe = i in moe_idx
+            block_d_ff = d_ff * k if route_on == "dense_wide" else d_ff
+            blocks.append(RelationalBlock(
+                d_model, n_heads, d_ff if block_is_moe else block_d_ff,
+                moe=block_is_moe, d_route=d_route, num_experts=num_experts, k=k,
+                route_on=route_on if block_is_moe else "dense",
+            ))
+        self.blocks = nn.ModuleList(blocks)
         self.norm_out = nn.RMSNorm(d_model)
+        self.route_on = route_on
 
-    def forward(self, x: Tensor, cb: CellBatch) -> Tensor:
+    @staticmethod
+    def _placement(n_blocks: int, placement: str) -> set[int]:
+        if placement == "upper_half":
+            return set(range(n_blocks // 2, n_blocks))
+        return set(range(n_blocks))                              # "all"
+
+    def forward(self, x: Tensor, cb: CellBatch, *, z=None, value_feat=None, id_emb=None):
         masks = build_relational_masks(cb)
+        aux = x.new_zeros(())
         for block in self.blocks:
-            x = block(x, masks)
+            x, a = block(x, masks, z=z, value_feat=value_feat, id_emb=id_emb)
+            aux = aux + a
         x = self.norm_out(x)
-        return x * (~cb.is_padding).unsqueeze(-1)
+        return x * (~cb.is_padding).unsqueeze(-1), aux

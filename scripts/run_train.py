@@ -39,6 +39,9 @@ def main() -> int:
     ap.add_argument("--train", action="store_true", help="train one arm + report val metrics")
     ap.add_argument("--encoder", default="hash", choices=["qwen", "hash"],
                     help="frozen encoder for the column-name table (hash=dev, qwen=real)")
+    ap.add_argument("--route-on", default="dense",
+                    choices=["signature", "hidden", "value", "identity", "dense", "dense_wide"],
+                    help="MoE routing arm (dense = plain RT)")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--limit-train-batches", type=int, default=None)
@@ -70,7 +73,7 @@ def _dry_run(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> i
 
     from gloss.data.collate import to_cell_batch
     from gloss.data.graph import build_gloss_graph, make_loader
-    from gloss.model.docrt import DOCRT
+    from gloss.model.more import MoRE
     from gloss.train.finetune import name_embeddings
     from relbench.tasks import get_task
 
@@ -90,10 +93,12 @@ def _dry_run(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> i
     print(f"leakage check (row_time > seed_time): {bad}")
 
     name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=64)
-    model = DOCRT(bundle, name_emb, d_model=128, n_blocks=2, n_heads=4, d_ff=256, enc_channels=128)
+    model = MoRE(bundle, name_emb, d_model=128, d_sig=64, n_blocks=2, n_heads=4, d_ff=256,
+                 enc_channels=128, route_on="signature")
     with torch.no_grad():
-        logits = model(cb)
-    print(f"forward OK: logits {tuple(logits.shape)}  finite={bool(torch.isfinite(logits).all())}")
+        logits, aux = model(cb)
+    print(f"forward OK: logits {tuple(logits.shape)}  finite={bool(torch.isfinite(logits).all())}  "
+          f"aux={float(aux):.4f}")
     return 0
 
 
@@ -108,7 +113,7 @@ def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int
     name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=d_text)
     mk = _model_kwargs(cfg)
     _, metrics = train_prebuilt(
-        bundle, task, name_emb, model_kwargs=mk,
+        bundle, task, name_emb, model_kwargs=mk, route_on=args.route_on,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk,
         batch_size=args.batch_size or int(cfg.train.batch_size),
         lr=float(cfg.train.lr), weight_decay=float(cfg.train.weight_decay),

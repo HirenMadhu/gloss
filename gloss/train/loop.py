@@ -12,7 +12,7 @@ import torch
 from ..data.collate import to_cell_batch
 from ..data.graph import GraphBundle
 from ..eval.metrics import binary_metrics
-from ..model.docrt import DOCRT
+from ..model.more import MoRE
 from .losses import masked_bce
 
 
@@ -24,6 +24,8 @@ class DOCRTLitModule(pl.LightningModule):
         entity_table: str,
         *,
         model_kwargs: dict | None = None,
+        route_on: str = "dense",
+        lambda_ortho: float = 0.5,
         lr: float = 3e-4,
         weight_decay: float = 0.01,
         seq_len: int = 1024,
@@ -36,21 +38,23 @@ class DOCRTLitModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.seq_len = seq_len
         self.max_fk = max_fk
+        self.lambda_ortho = lambda_ortho
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
-        self.model = DOCRT(bundle, name_emb, **mk)
+        self.model = MoRE(bundle, name_emb, route_on=route_on, **mk)
         self._val: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def forward(self, cb):
-        return self.model(cb).squeeze(-1)   # [B]
+        logits, _aux = self.model(cb)
+        return logits.squeeze(-1)            # [B]
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int = 0):
         cb = to_cell_batch(batch, self.bundle, self.entity_table, seq_len=self.seq_len, max_fk=self.max_fk)
         return cb.to(device)
 
     def training_step(self, cb, _idx):
-        logits = self(cb)
-        loss = masked_bce(logits, cb.target, cb.has_target)
+        logits, aux = self.model(cb)
+        loss = masked_bce(logits.squeeze(-1), cb.target, cb.has_target) + self.lambda_ortho * aux
         self.log("train/loss", loss, prog_bar=True, batch_size=int(cb.num_seeds))
         return loss
 

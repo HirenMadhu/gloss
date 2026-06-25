@@ -46,6 +46,8 @@ def train_prebuilt(
     name_emb,
     *,
     model_kwargs: dict | None = None,
+    route_on: str = "dense",
+    lambda_ortho: float = 0.5,
     num_neighbors: list[int] | None = None,
     batch_size: int = 64,
     seq_len: int = 1024,
@@ -67,7 +69,8 @@ def train_prebuilt(
     seed_everything(seed)
     module = DOCRTLitModule(
         bundle, name_emb, task.entity_table,
-        model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
+        model_kwargs=model_kwargs, route_on=route_on, lambda_ortho=lambda_ortho,
+        lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
     )
     dm = DOCRTDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
                          num_workers=num_workers)

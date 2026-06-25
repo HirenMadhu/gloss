@@ -45,3 +45,27 @@ def build_column_name_embeddings(bundle: GraphBundle, encode, *, kind: str = "do
     if not torch.is_tensor(emb):
         emb = torch.as_tensor(emb)
     return emb.detach().to(torch.float32).cpu()
+
+
+def build_column_modality_ids(bundle: GraphBundle) -> tuple[Tensor, int]:
+    """Per-column **modality** id (the pytorch-frame stype) + the number of distinct stypes.
+
+    Returns ``(modality_id [C] long, n_stypes)`` indexed by the global column vocabulary, where each id
+    is the column's stype (numerical / categorical / multicategorical / embedding / timestamp). The id
+    space is the set of stypes actually present in this bundle (sorted by name for determinism), not a
+    fixed enum — so ``stype_emb`` is sized to the dataset. The router routes on this as the modality
+    axis of the signature.
+    """
+    vocab = column_vocab(bundle)
+    stypes = sorted(
+        {st for nt in bundle.node_types for st in bundle.data[nt].tf.col_names_dict},
+        key=str,
+    )
+    stype_id = {st: i for i, st in enumerate(stypes)}
+    modality = torch.zeros(len(vocab), dtype=torch.long)
+    for nt in bundle.node_types:
+        for st, cols in bundle.data[nt].tf.col_names_dict.items():
+            for c in cols:
+                if (nt, c) in vocab:
+                    modality[vocab[(nt, c)]] = stype_id[st]
+    return modality, len(stypes)
