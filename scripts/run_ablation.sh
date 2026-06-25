@@ -5,7 +5,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gpus=a40:1
 #SBATCH --nodes=1
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --output=./logs/slurm/%x_%A_%a.out
 #SBATCH --error=./logs/slurm/%x_%A_%a.err
 #SBATCH --mail-user=hiren.madhu@yale.edu
@@ -26,5 +26,5 @@ source .venv/bin/activate
 date; hostname; echo "array task ${SLURM_ARRAY_TASK_ID}"
 
 python scripts/run_ablation.py --index "${SLURM_ARRAY_TASK_ID}" \
-    --encoder qwen --epochs 10 --batch-size 64 --num-workers 8 "$@"
+    --encoder qwen --epochs 10 --batch-size 32 --num-workers 8 "$@"
 echo "ABLATION_TASK_${SLURM_ARRAY_TASK_ID}_DONE"

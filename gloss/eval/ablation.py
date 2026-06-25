@@ -102,8 +102,13 @@ def run_config(
     from ..data.graph import build_gloss_graph
     from ..train.finetune import name_embeddings, task_kind, train_prebuilt
 
-    c = build_grid(dataset_tasks(datasets), seeds, signals)[index]
-    bundle = build_gloss_graph(c["dataset"])
+    grid = build_grid(dataset_tasks(datasets), seeds, signals)
+    if index >= len(grid):
+        print(f"index {index} >= grid size {len(grid)}; nothing to do")
+        return {}
+    c = grid[index]
+    graph_cache = str(RESULTS_ROOT.parent / "data" / "graph_cache" / c["dataset"])
+    bundle = build_gloss_graph(c["dataset"], cache_dir=graph_cache)
     task = get_task(c["dataset"], c["task"], download=False)
     name_emb = name_embeddings(bundle, c["dataset"], encoder=encoder, d_text=d_text)
     mk = dict(model_kwargs or {})
