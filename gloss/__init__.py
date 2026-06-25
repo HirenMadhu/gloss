@@ -1,15 +1,16 @@
-"""gloss — DOC-RT: RT's cell-token relational-transformer substrate + documentation-conditioned
-cell encoding (FiLM). A value is read in light of what its column's documentation *means*, not just
-what it is *named*.
+"""gloss — MoRE: RT's cell-token relational-transformer substrate + a Mixture-of-Experts FFN routed on
+each cell's value-free relational signature (column-name embedding + modality + recency). Route on
+semantics, transform the content.
 
 Package layout:
   data/   relational graph substrate + leakage-safe temporal sampler + cell-token collate
-  docs/   prose doc corpus loader + grounding (chunk/embed/retrieve/pool) + frozen embedding cache
-  model/  documentation-conditioned cell encoder (FiLM), RT relational-attention substrate, heads
-  eval/   metrics, LightGBM floor, the four-regime headline runner
+  text/   frozen text encoders + cache + the per-column schema-name embedding table (router input)
+  model/  RT cell encoder, relational-attention substrate (+ MoE FFN), signature, heads
+  train/  Lightning loop, datamodule, losses
+  eval/   metrics, LightGBM floor, the routing-signal ablation runner
   utils/  seeding, config, logging
 
-The retired HALOS design (doc-generated temporal geometry, tau kernels) lives under archive/halos/.
+The retired DOC-RT (doc FiLM) and HALOS (doc-generated temporal geometry) designs live under archive/.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

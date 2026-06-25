@@ -1,193 +1,323 @@
-# DOC-RT — Implementation Spec for Claude Code (v1)
+# MoRE on RT — Implementation Plan
 
-Build **RT's cell-token substrate + documentation-conditioned cell encoding (FiLM)**. No temporal
-kernel, no geometry generator, no τ. The method, the rationale, and the honest-status caveats are in
-`METHOD_DESIGN.md`; the doc-authoring protocol is in `DOC_AUTHORING.md`. Place this at repo root;
-reference from `CLAUDE.md`. Build phase by phase; do not skip a phase's tests or Definition of Done.
-
-**The one rule that overrides convenience:** the first training result (Phase 4) is **docs-on vs
-docs-off in this codebase**, reported side by side, before any other experiment. This is two flags on
-one run, costs one extra (unsupervised) training pass, and is the only comparison that isolates
-documentation. Everything else waits behind it.
+*Build guide for the design in `idea.md`. Targets the real [`snap-stanford/relational-transformer`](https://github.com/snap-stanford/relational-transformer) repo (ICLR 2026). All injection points reference actual classes in `rt/model.py`.*
 
 ---
 
-## 0. Working agreement
-- **Build on RT, don't reinvent it.** If a released RT implementation is usable, wrap it and inject
-  documentation at the cell encoder. If not, implement RT's cell-token + relational-mask substrate
-  faithfully (same-column / same-row / parent-FK / child-FK masks, no PE, names-as-strings,
-  self-labels). RT/RelGT/GNN/LightGBM are **baselines only**.
-- **One signal, one mechanism.** Documentation enters at exactly one point by default: FiLM on the
-  cell encoder (`γ(d_c), β(d_c)`). The optional same-column attention-bias injection is a flag,
-  **default OFF**.
-- **Frozen text encoder, cached.** All span/query embeddings offline
-  (`sentence-transformers/all-MiniLM-L6-v2` default, swappable). No LM forward passes in training.
-- **Docs grounding has three regimes**: `full` | `null` (docs off — every `d_c = d_null`) |
-  `shuffled` (placebo). `null` is the docs-off baseline and must be a single config flag.
-- **Self-labels stay, in every arm**, so they never confound the docs comparison.
-- **Leakage is a hard test-matrix item.** ≤ ~30M params; global seeds; log every config. Append
-  `PROGRESS.md` after each phase; commit `feat(phaseN): …`. `relbench` / `pytorch-frame` APIs may
-  drift — §3 contracts are normative, exact call signatures are not.
-- **RelBench only, always.** Start rel-f1.
+## 0. The change in one paragraph
+
+Replace RT's `FFN` (a SwiGLU MLP) inside each `RelationalBlock` with a **`MoEFFN`**: a pool of $M$ identical SwiGLU experts plus a top-$k$ router. The router reads a **per-cell relational signature** $z$ built once in the trunk from fields that **already exist in the batch** — `col_name_values` (frozen-LM schema embedding) and `sem_types` (modality) — plus an optional recency bin. Balance experts with a router-orthogonality loss (not a uniform aux loss), summed across blocks and added to RT's masked-cell loss. Everything else in RT is untouched.
 
 ---
 
-## 1. Dependencies
-Python ≥ 3.10, one 24–48 GB GPU.
-```toml
-dependencies = [
-  "torch>=2.4", "torch_geometric>=2.5", "pytorch-frame>=0.2", "relbench>=1.0",
-  "sentence-transformers>=3.0",
-  "numpy", "pandas", "scikit-learn", "pyyaml", "tqdm", "lightgbm>=4.0",  # lightgbm = baseline only
-]
-[project.optional-dependencies]
-dev = ["pytest", "wandb", "matplotlib"]
+## 1. Environment & data
+
+Follow the RT README, then preprocess the **three smallest RelBench datasets** (by rows): `rel-f1` (74K, 9 tables), `rel-stack` (4.2M, 7 tables), `rel-trial` (5.4M, 15 tables, 140 cols).
+
+```bash
+git clone https://github.com/snap-stanford/relational-transformer
+cd relational-transformer
+pixi install
+cd rustler && pixi run maturin develop --uv --release && cd ..
+
+# download tasks/datasets
+pixi run python scripts/download_relbench.py
+mkdir -p ~/scratch && ln -s ~/.cache/relbench ~/scratch/relbench
+
+# preprocess + embed the three smallest (rust sampler then text embeddings)
+for db in rel-f1 rel-stack rel-trial; do
+  (cd rustler && pixi run cargo run --release -- pre $db)
+  pixi run python -m rt.embed $db
+done
 ```
 
-## 2. Repository layout
-```
-docrt/
-  CLAUDE.md  IMPLEMENTATION.md  METHOD_DESIGN.md  DOC_AUTHORING.md  PROGRESS.md  pyproject.toml
-  doc_corpus/
-    rel-f1/docs.md             # authored by the doc agent (DOC_AUTHORING.md); Ergast-derived
-    rel-f1/meta.yaml           # tier, author=agent, blind: true, coverage stats
-    <db>/docs.md               # add more DBs here later — drop-in
-  configs/{default,rel-f1}.yaml
-  docrt/
-    data/
-      graph.py                 # RelBench DB -> hetero temporal graph; leakage-safe sampler; self-label cells
-      collate.py               # subgraph -> RT batch (cell tokens, relational masks, segment ids)
-    docs/
-      corpus.py                # load/validate doc_corpus; coverage report
-      grounding.py             # chunk -> embed -> retrieve -> pool; d_c, rel_c, d_null; full/null/shuffled regimes
-      cache.py                 # offline embedding cache (idempotent)
-    model/
-      column_encoder.py        # *** CORE ***  dtype encoders + FiLM(d_c) -> cell vectors
-      rt_substrate.py          # RT cell-token transformer + relational masks (wrap released RT if available)
-      docrt.py  heads.py       # encoder stack; task heads (+ masked-cell head for later pretraining)
-    train/{loop,losses}.py
-    eval/
-      metrics.py
-      ablation.py              # *** the headline runner: full vs null vs shuffled vs name-only, one call ***
-      coverage_curve.py        # performance vs doc coverage
-  scripts/
-    build_doc_cache.py         # author-independent: embeds whatever docs.md exists, all regimes
-    run_train.py               # trains ONE arm; --doc_regime {full,null,shuffled,name_only}
-    run_headline.py            # *** trains full AND null (AND shuffled, name_only) and prints the table ***
-  tests/
-    test_leakage.py  test_shapes.py
-    test_grounding.py          # null fallback; placebo decorrelation; cache determinism
-    test_film_responds.py      # switching regime full<->null changes cell vectors (mechanism is wired)
-    test_selflabels_constant.py# self-label nodes identical across doc regimes (no confound)
-```
+> Start everything on `rel-f1` — it is ~57× smaller than the next dataset, so the full smoke test + ablations run in minutes, not hours, and on a single GPU. Bring in `rel-stack`/`rel-trial` only for the transfer phase. (If you are on RelBench v2, `rel-arxiv` ≈ 222K papers is a viable lighter substitute for one of the larger two.)
 
-## 3. Data contracts (normative)
+**RT base config** (from the paper / `rt/main.py`): `num_blocks=12, d_model=256, num_heads=8, d_ff=1024, d_text=384`, bf16, `flex_attention`, `torch.compile`. Pretraining is masked-cell prediction; the held-out-database protocol and per-task checkpoints already exist in `scripts/`.
 
-**3.1 Doc corpus.** One `docs.md` per DB, free prose, senior-dev style (`DOC_AUTHORING.md`).
-`meta.yaml`: `{tier, author, blind: bool, coverage_target: ~0.6-0.8}`. No per-column templates.
+---
 
-**3.2 Grounding outputs** (offline, cached):
-```
-spans     : chunk(docs.md, 2–4 sentences);  s_k = E_text(span_k)
-queries   : q_c = E_text("table <t>, column <c>")            # + FK-role descriptors
-d_c       : softmax-topK(cos(q_c, s_k)/T) · s_k    if max cos > thresh   else d_null (learned)
-rel_c     : max_k cos(q_c, s_k)                               # relevance scalar, kept as feature
-regimes   : full | null (ALL d_c := d_null) | shuffled (spans permuted across cols/DBs, length-matched)
-```
-Emit a per-DB coverage report. **`null` regime = docs off**, the baseline.
+## 2. Where the MoE goes — `rt/model.py` anatomy
 
-**3.3 Graph & batch.** Cells = tokens (RT style); rows carry node type = table; relational masks =
-same-column / same-row / parent-FK / child-FK; self-label cells from past task rows. Sampler: per seed
-`(entity, seed_time)` return only rows with `row_time ≤ seed_time` (**hard rule**).
+The relevant classes, as they exist today:
 
-## 4. Key equations (implement exactly)
+```python
+class FFN(nn.Module):                  # <-- REPLACE this inside the block
+    def __init__(self, d_model, d_ff):
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)
+        self.w2 = nn.Linear(d_ff, d_model, bias=False)
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))   # SwiGLU
 
-**Documentation-conditioned cell encoding** (`column_encoder.py`) — the only new mechanism:
-```
-e_{u,c}  = W_v Enc_dtype(v_{u,c})                            # RT-style dtype cell embedding
-x_{u,c}  = γ(d_c) ⊙ e_{u,c} + β(d_c)                         # FiLM by grounded column doc
-           # null regime: d_c = d_null  =>  recovers a names-only RT cell (the baseline)
-```
-`γ, β`: shared MLPs `dim(d) → d_model`. Cells `{x_{u,c}}` → `rt_substrate.py` (masks unchanged) →
-row/seed representation → `heads.py`.
+class RelationalBlock(nn.Module):
+    def forward(self, x, block_masks):
+        for l in ["col","feat","nbr","full"]:
+            x = x + self.attns[l](self.norms[l](x), block_mask=block_masks[l])
+        x = x + self.ffn(self.norms["ffn"](x))            # <-- MoE hooks here
+        return x
 
-**Optional (flag, default false)** same-column attention-bias injection:
-```
-bias_samecol(c, c') += MLP([d_c ; d_{c'}])                  # only when --docbias=true ; labeled ablation
+class RelationalTransformer(nn.Module):
+    # enc_dict["col_name"]: Linear(d_text, d_model)  -> the schema component s_i
+    # batch["col_name_values"]: (B,S,d_text) frozen-LM column embedding
+    # batch["sem_types"]: (B,S) ints in {0:number,1:text,2:datetime,3:boolean}  -> modality
+    def forward(self, batch):
+        ...
+        x = x + self.norm_dict["col_name"](self.enc_dict["col_name"](batch["col_name_values"])) * (~is_padding)[...,None]
+        ...                                               # type-value + mask embeddings
+        for block in self.blocks:
+            x = block(x, block_masks)                     # <-- thread z + collect aux here
+        ...
+        return loss_out, yhat_out
 ```
 
-## 5. Phases
+Three edits: (a) add a `RelationalSignature` module and a `MoEFFN`; (b) compute `z` once in `RelationalTransformer.forward` and pass it to each block; (c) thread the orthogonality loss back out and add it to `loss_out`.
 
-**Phase 0 — Substrate.** `data/graph.py`, leakage-safe sampler, `collate.py`, `rt_substrate.py`
-(wrap released RT if available, else implement masks). *Tests:* `test_leakage.py`, `test_shapes.py`.
-*DoD:* `run_train.py --dry-run` prints an RT batch on rel-f1 and a forward pass runs.
+---
 
-**Phase 1 — Doc corpus + grounding.** Ensure `doc_corpus/rel-f1/docs.md` exists (the doc agent
-produces it per `DOC_AUTHORING.md`; if absent, Phase 1 still builds the pipeline and runs in `null`).
-Build `docs/{corpus,grounding,cache}.py` + `build_doc_cache.py` with all three regimes. *Tests:*
-`test_grounding.py`. *DoD:* coverage report for rel-f1; cached `d_c`, `rel_c` load instantly; `null`
-and `shuffled` regimes produce the expected degenerate/permuted embeddings.
+## 3. Code
 
-**Phase 2 — Cell encoder (core).** `column_encoder.py` (FiLM), wire into `docrt.py`. *Tests:*
-`test_film_responds.py` (full vs null **changes** cell vectors — mechanism wired),
-`test_selflabels_constant.py` (self-label cells **identical** across regimes — no confound). *DoD:*
-finite `[N_cells, d_model]` from a real rel-f1 batch in all three regimes.
+Drop these into `rt/model.py` (or a new `rt/moe.py` and import).
 
-**Phase 3 — Training.** `train/*`, `heads.py`, `eval/metrics.py`. Supervised on rel-f1 entity tasks.
-Baselines wired: LightGBM-flattened; RT numbers from paper/released code; **names-only = our `null`
-regime** (so the strongest baseline is in-codebase and identically trained). *Tests:* overfit 256
-seeds to ~0 loss. *DoD:* validation metrics in a sane range.
+### 3.1 Relational signature (router input)
 
-**Phase 4 — THE HEADLINE RESULT (do this before anything else).** `run_headline.py` trains the
-**same architecture** under `full`, `null`, `shuffled`, and `name_only`, identical seeds/hparams/
-self-labels, and prints one table: metric per regime with seed CIs, plus a **per-task breakdown**
-(esp. tasks touching `statusId` / `grid`). Read it:
-- `full > null` (with CIs) → documentation feeds signal. Proceed.
-- `full > shuffled` → it's meaning, not any-text.
-- `full > name_only` → it beats **names** (the real bar; this is the claim).
-- gain **concentrated** on coded/sentinel tasks, ~flat elsewhere → consistent with the mechanism.
-  *Uniform* gain → suspect a confound; investigate before believing the docs story.
-- `full ≈ null` → **STOP.** No documentation paper on rel-f1. Record in `PROGRESS.md`; fall back to
-  the hierarchy/operator axes (`METHOD_DESIGN.md` §6). Do not proceed to Phase 5+.
-*DoD:* the four-regime table + per-task breakdown committed to `PROGRESS.md`. **This is the gate.**
+```python
+class RelationalSignature(nn.Module):
+    """Value-free per-cell routing signature z, computed ONCE in the trunk.
+       z = RMSNorm( W_s * col_name_emb  +  stype_emb  +  recency_emb )."""
+    def __init__(self, d_text, d_sig, n_stypes=4, use_recency=False, n_recency_bins=16):
+        super().__init__()
+        self.schema_proj = nn.Linear(d_text, d_sig, bias=False)   # s_i (schema/semantic)
+        self.stype_emb   = nn.Embedding(n_stypes, d_sig)          # psi(sigma_i) (modality)
+        self.use_recency = use_recency
+        if use_recency:
+            # bin 0 reserved for "no timestamp / unknown"
+            self.recency_emb = nn.Embedding(n_recency_bins + 1, d_sig)
+        self.norm = nn.RMSNorm(d_sig)
 
-**Phase 5 — Locality & coverage (only if Phase 4 passes).** `coverage_curve.py`: performance vs
-documentation coverage; column-ablation showing the gain tracks coded/unit columns (H2). *DoD:*
-coverage curve + per-column attribution.
+    def forward(self, col_name_values, sem_types, recency_bins=None):
+        z = self.schema_proj(col_name_values) + self.stype_emb(sem_types)
+        if self.use_recency and recency_bins is not None:
+            z = z + self.recency_emb(recency_bins)
+        return self.norm(z)                                       # (B, S, d_sig)
+```
 
-**Phase 6 — More DBs (only if Phase 4 passes).** Author docs for rel-trial / rel-stack
-(`DOC_AUTHORING.md`), rerun the four-regime headline per DB, report which DBs show the effect and how
-it tracks coverage. *DoD:* headline table per DB.
+### 3.2 MoE FFN (drop-in for `FFN`)
 
-**Phase 7 — (deferred) operator axis.** Only after documentation is settled: add the cardinality-
-conditioned aggregator as a **separate, isolated** contribution (`METHOD_DESIGN.md` §6). Not now.
+```python
+class MoEFFN(nn.Module):
+    """Pool of SwiGLU experts; sparse top-k gate on the signature.
+       Router sees route_feat (z by default); experts transform x.
+       Dense expert combine = simple & correct (optimize with dispatch at scale)."""
+    def __init__(self, d_model, d_ff, d_route, num_experts=8, k=2):
+        super().__init__()
+        self.num_experts, self.k = num_experts, k
+        self.experts = nn.ModuleList([FFN(d_model, d_ff) for _ in range(num_experts)])
+        self.router  = nn.Linear(d_route, num_experts, bias=False)
 
-**Phase 8 — (deferred) transfer.** Leave-one-DB-out + masked-cell pretraining across the DBs that have
-docs. Only meaningful with ≥3 documented DBs.
+    def _gate(self, r):                                # r: (B,S,d_route)
+        logits = self.router(r)                        # (B,S,E)
+        topv, topi = logits.topk(self.k, dim=-1)
+        g = torch.full_like(logits, float("-inf"))
+        g.scatter_(-1, topi, topv)
+        return F.softmax(g, dim=-1)                     # (B,S,E), zero off-support
 
-## 6. Test matrix (always green)
-| Test | Asserts |
-|---|---|
-| `test_leakage.py` | no context row with `row_time > seed_time` |
-| `test_shapes.py` | end-to-end shapes through RT substrate |
-| `test_grounding.py` | null fallback works; placebo decorrelated; cache deterministic |
-| `test_film_responds.py` | full vs null changes cell vectors (mechanism wired) |
-| `test_selflabels_constant.py` | self-label cells identical across doc regimes (no confound) |
+    def forward(self, x, route_feat):
+        g = self._gate(route_feat)
+        y = x.new_zeros(x.shape)
+        for e, expert in enumerate(self.experts):       # dense combine (MVP)
+            y = y + g[..., e:e+1] * expert(x)
+        return y, g                                     # return gates for diagnostics
 
-## 7. Risks & fallbacks
-1. **`full ≈ null`** (docs add nothing — the prior says likely). The Phase-4 gate is designed to surface
-   exactly this in run 2. Output = honest negative result; pivot to operator/hierarchy axes. Not a
-   failure of the build — the point of the build.
-2. **`full ≈ name_only`** (docs don't beat names). Same gate (H1c). The claim needs docs > names, or
-   it collapses to RELATE. Surface it early.
-3. **Grounding noise** → relevance gating + `d_null`; placebo (`shuffled`) catches "any vector helps."
-4. **Uniform gain** → confound suspected; per-task breakdown (Phase 4) and column attribution
-   (Phase 5) adjudicate before any claim.
-5. **Library drift** → §3 contracts normative; adapt calls.
+    def ortho_loss(self):
+        W  = F.normalize(self.router.weight, dim=-1)     # (E, d_route)
+        G  = W @ W.t()                                   # (E,E)
+        I  = torch.eye(self.num_experts, device=W.device)
+        return ((G - I) ** 2).sum()
+```
 
-## 8. Definition of done (project, v1)
-Green test matrix; **Phase-4 four-regime headline table with per-task breakdown and seed CIs recorded
-in `PROGRESS.md`** (this is the deliverable that decides whether there is a paper); coverage curve if
-Phase 4 passes; doc corpus published with tier + coverage. SOTA accuracy not required — the claim is
-the *finding* (docs-on > docs-off > placebo, and docs-on > names-only), localized to where
-documentation carries meaning names don't.
+### 3.3 Block + trunk diffs
+
+```python
+class RelationalBlock(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff,
+                 moe=False, d_route=None, num_experts=8, k=2, route_on="signature"):
+        super().__init__()
+        self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model)
+                                    for l in ["feat","nbr","col","full","ffn"]})
+        self.attns = nn.ModuleDict({l: MaskedAttention(d_model, num_heads)
+                                    for l in ["feat","nbr","col","full"]})
+        self.moe, self.route_on = moe, route_on
+        self.ffn = (MoEFFN(d_model, d_ff, d_route, num_experts, k) if moe
+                    else FFN(d_model, d_ff))
+
+    def forward(self, x, block_masks, z=None):
+        for l in ["col","feat","nbr","full"]:
+            x = x + self.attns[l](self.norms[l](x), block_mask=block_masks[l])
+        h = self.norms["ffn"](x)
+        if self.moe:
+            route_feat = z if self.route_on == "signature" else h   # see §5 for value/id
+            y, _ = self.ffn(h, route_feat)
+            return x + y, self.ffn.ortho_loss()
+        return x + self.ffn(h), x.new_zeros(())
+```
+
+In `RelationalTransformer.__init__`, build the signature, pass MoE flags to blocks, store $\lambda$:
+
+```python
+self.signature = RelationalSignature(d_text, d_sig, use_recency=use_recency)
+self.blocks = nn.ModuleList([
+    RelationalBlock(d_model, num_heads, d_ff,
+                    moe=True, d_route=d_sig, num_experts=num_experts, k=k,
+                    route_on=route_on)
+    for _ in range(num_blocks)
+])
+self.lambda_ortho = lambda_ortho
+```
+
+In `RelationalTransformer.forward`, compute `z` once (right after the token `x` is assembled) and thread it; accumulate the aux loss and fold it in just before `return`:
+
+```python
+z = self.signature(batch["col_name_values"], batch["sem_types"],
+                   recency_bins=batch.get("recency_bins"))
+aux = x.new_zeros(())
+for block in self.blocks:
+    x, ortho = block(x, block_masks, z=z)
+    aux = aux + ortho
+# ... existing norm_out + decode + masked loss producing loss_out ...
+loss_out = loss_out + self.lambda_ortho * aux / len(self.blocks)
+return loss_out, yhat_out
+```
+
+Finally, expose the new kwargs (`d_sig, num_experts, k, route_on, lambda_ortho, use_recency`) wherever `rt/main.py` constructs `RelationalTransformer`, and add them to the CLI/config so they can be swept.
+
+---
+
+## 4. Config / hyperparameters
+
+| Knob | Start | Notes |
+|---|---|---|
+| `num_experts` $M$ | **4** (smoke) → 8 | $M \ll \#$columns (tens–140 here). Start 4 on `rel-f1` for speed/memory. |
+| `k` (top-k) | **2** | $k{=}1$ is cheaper but flips experts at semantic boundaries; $k{=}2$ smooths. |
+| `d_sig` | **128** | Router signature width. |
+| `lambda_ortho` $\lambda$ | **0.5** | From HOPE; sweep $\{0.1, 0.5, 1.0\}$. |
+| `route_on` | **"signature"** | Ablation switch — see §5. |
+| `use_recency` | **False** → True | True needs the §10 data-pipeline addition. |
+| MoE placement | **every block** → top-6 | If memory-bound, put MoE only in the upper half. |
+
+**Parameter & FLOP accounting.** Replacing 1 FFN with $M$ multiplies FFN params ≈ $M\times$ (22M → ~90M at $M{=}8$), but only $k$ experts fire, so active FFN FLOPs are ≈ $k\times$ dense. Report **two controls**: (i) headline vs. **dense RT** at matched *active*-FLOPs; (ii) a **param-matched** dense RT with `d_ff` scaled by ~$k$, to show gains aren't just parameters.
+
+---
+
+## 5. Routing-signal ablation (the core scientific test)
+
+This is the experiment that rules the RGCN null result in or out. Swap only the router's input:
+
+| `route_on` | `route_feat` fed to `MoEFFN` | Extra ingredient | Transfers? |
+|---|---|---|---|
+| **signature** (ours) | `z` | — | ✅ |
+| **hidden** | normed hidden `h` | — (still leak-free: RT context is causal) | ✅ (weaker) |
+| **value** | value component only | trunk must expose the type-value sum as a tensor | ✅ |
+| **identity** (baseline) | `id_emb(col_global_id)` | an `nn.Embedding` over a global column vocab + `col_global_id` in batch | ❌ by construction |
+| **dense** (control) | n/a (`moe=False`) | — | n/a |
+
+`signature` and `hidden` are one-line switches in the code above. `value` and `identity` each need the one listed ingredient. **The headline claim is: `signature` ≥ `value`/`dense` in-distribution, and `signature` ≫ `identity` on held-out schemas.** If `signature` ≈ `dense`, the method adds nothing — stop and reconsider (see `idea.md` §7).
+
+---
+
+## 6. Experiment plan
+
+### Phase 1 — `rel-f1` only (smoke test + all core ablations)
+Tiny and fast. Pretrain RT-MoE (masked-cell) on `rel-f1`, then evaluate on **all three `rel-f1` tasks**: `driver-dnf` (binary, AUROC), `driver-top3` (binary, AUROC), `driver-position` (regression, MAE). Run here:
+1. **Routing-signal ablation** (§5) — signature / value / identity / dense.
+2. **Balancing ablation** — ortho+tail vs. Switch-uniform aux vs. expert-choice.
+3. **$M$ and $k$ sweeps** — {4, 8} × {1, 2}.
+4. **Temporal axis** — `use_recency` off vs. on (after §10).
+
+*Gate to Phase 2:* MoE (signature) matches or beats dense RT on ≥2 of 3 `rel-f1` tasks at matched active-FLOPs, **and** expert-usage is non-degenerate (entropy not collapsed, §8).
+
+### Phase 2 — three smallest, leave-one-database-out transfer (the real story)
+Pretrain on two of {`rel-f1`, `rel-stack`, `rel-trial`}, evaluate **zero-shot** on the held-out third (RT's protocol; optionally `contd-pretrain` on the held-out DB with the eval task held out). Three folds. Compare **signature vs. identity** routing — identity *cannot* transfer, so this should be a clean qualitative win and is the headline transfer result.
+
+> Enumerate each dataset's tasks programmatically rather than hard-coding — RelBench task names beyond `rel-f1` are easy to get wrong. `rel-stack` and `rel-trial` each expose entity-classification, entity-regression, and recommendation tasks; pull them via the RelBench API (`get_task_names(db)`) / `rt/tasks.py`. Start with the entity (node-level) tasks; recommendation stresses the head differently and can come later.
+
+---
+
+## 7. Commands
+
+The README's example scripts are hard-coded to `rel-amazon/user-churn`. Copy and edit them (or wire the new args through their config):
+
+```bash
+# Phase 1: pretrain RT-MoE on rel-f1 (single GPU is fine for rel-f1)
+cp scripts/example_pretrain.py scripts/moe_pretrain.py
+# edit moe_pretrain.py: dataset=rel-f1; pass moe=True, num_experts=4, k=2,
+#   d_sig=128, route_on="signature", lambda_ortho=0.5
+pixi run torchrun --standalone --nproc_per_node=1 scripts/moe_pretrain.py
+
+# Phase 1: evaluate on each rel-f1 task (reuse RT's finetune/eval path)
+cp scripts/example_finetune.py scripts/moe_finetune.py
+# edit: task in {driver-dnf, driver-top3, driver-position}; load the pretrained ckpt
+pixi run torchrun --standalone --nproc_per_node=1 scripts/moe_finetune.py
+
+# Phase 2: leave-one-DB-out (held-out = rel-trial shown; rotate over all three)
+# pretrain on rel-f1 + rel-stack, zero-shot eval on rel-trial tasks
+```
+
+Set up logging first: `pixi run wandb login` (or `wandb disabled`).
+
+---
+
+## 8. Metrics & diagnostics
+
+**Task metrics** come free from RT's existing eval (AUROC for binary, MAE for regression). Add three MoE-specific diagnostics:
+
+**(a) Expert-usage vs. relation frequency.** Collect gates `g` over a validation pass; per-expert usage $f_e = \text{mean}_{\text{tokens}} \mathbb{1}[g_{\cdot,e} > 0]$. Compute entropy $H(f)$ and compare $f$ against the empirical column/relation-frequency distribution. **Claim: usage should track the long tail, not flatten to uniform.**
+
+```python
+@torch.no_grad()
+def expert_usage(model, loader, n_experts, device):
+    import torch
+    tot = torch.zeros(n_experts, device=device)
+    for batch in loader:
+        _, _ = model(batch_to(batch, device))            # gates captured via a hook
+        # register a forward hook on each MoEFFN to accumulate (g>0).float().sum((0,1))
+    f = tot / tot.sum()
+    H = -(f.clamp_min(1e-9) * f.clamp_min(1e-9).log()).sum()
+    return f.cpu(), H.item()
+```
+
+**(b) Routing-invariance / leakage test (signature routing).** With `route_on="signature"`, a cell's gate is a pure function of its own $(c, \sigma, \Delta)$. Assert it is identical across two different sampled contexts for the same target row:
+
+```python
+def test_routing_invariance(model, row, ctx_a, ctx_b, tol=1e-6):
+    g_a = gate_for_target(model, row, ctx_a)   # gate vector at the target cell
+    g_b = gate_for_target(model, row, ctx_b)   # different BFS sample of neighbors
+    assert (g_a - g_b).abs().max() < tol, "router depends on context -> leakage risk"
+```
+
+This is a genuine selling point: it is a *unit-testable* guarantee that routing cannot leak future/neighbor information. (Under `route_on="hidden"` the test won't hold exactly — routing then depends on neighbors — but it is still leak-free because RT's neighbors are causal.)
+
+**(c) Specialization probe (the HER evidence, transplanted).** Cluster columns by their argmax expert. **Signature routing should group semantically-similar columns *across tables*** (e.g. all monetary-numeric columns together); identity routing should partition by table. This is the qualitative figure for the type-overfitting claim.
+
+---
+
+## 9. Milestones / go-no-go
+
+1. **Wiring** — RT-MoE trains on `rel-f1`, loss decreases, ortho loss is finite and non-zero. *(sanity)*
+2. **In-distribution parity** — signature-MoE ≥ dense RT on ≥2/3 `rel-f1` tasks at matched active-FLOPs. *(go/no-go for the whole idea — see `idea.md` §7)*
+3. **Non-degenerate routing** — usage entropy not collapsed; specialization probe shows cross-table semantic clusters.
+4. **Transfer** — signature ≫ identity on leave-one-DB-out (Phase 2). *(the headline result)*
+5. **Temporal lift** — recency axis helps horizon-sensitive tasks (after §10).
+
+If (2) fails, the most likely cause is the RGCN null result; pivot to the `value`-augmented signature or to attention-mask MoA routing before abandoning.
+
+---
+
+## 10. Caveats & known gaps
+
+- **Recency needs one data-pipeline addition.** $\Delta_i = T_{\text{seed}} - \tau(\text{row}_i)$ is a per-context quantity the model's `forward` doesn't currently receive. The rust sampler (`rustler`) already knows the seed time and each row's timestamp (it uses them to exclude future rows), so emit a per-cell `recency` and bin it, or compute it in `rt/data.py` from the timestamps already in hand; pass it as `batch["recency_bins"]` (bin 0 = no timestamp). **Until wired, run with `use_recency=False`** — schema + modality routing works out of the box and covers Phase 1's core ablations.
+- **Dense expert combine is notional sparsity.** The MVP computes every expert on every token (correct, simple). It does not realize the FLOP saving; for `rel-f1` this is irrelevant. At `rel-stack`/`rel-trial` scale, switch to a masked/gathered dispatch or grouped matmul (and only then is the "conditional compute" property real).
+- **Text cells aren't a masked-loss target in RT** (`"masking text not supported"`), so don't expect the MoE to specialize text *prediction*; it still routes and transforms text tokens for downstream tasks.
+- **`col_name_values` vs. "column of table".** The reference code routes on the column-name embedding; table identity enters separately (via the column-attention mask). If you want the paper's "of table" semantics in the signature, concatenate a frozen table-name embedding into $s_i$ the same way — but the minimal faithful choice is to route on `col_name_values` as-is.
+- **Task-name accuracy.** Only `rel-f1`'s three tasks are hard-coded here with confidence; enumerate `rel-stack`/`rel-trial` tasks via the API.
+- **Preprint maturity.** HER (2511.07603) was withdrawn pending revision and HOPE is a recent preprint; the *mechanisms* we borrow (type-collapse avoidance, router orthogonality) are sound, but cite them as working preprints, not settled results.

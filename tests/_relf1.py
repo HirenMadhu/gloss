@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import functools
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parents[1]
 
 
 @functools.lru_cache(maxsize=1)
@@ -19,26 +16,12 @@ def bundle_and_task():
 
 
 @functools.lru_cache(maxsize=1)
-def groundings(d_text: int = 64):
-    """(full, null, name_only) groundings from the rel-f1 corpus via a HashEncoder (no model download).
-    sim_threshold=0 so `full` grounds every column (the FiLM signal is exercised)."""
-    from relbench.datasets import get_dataset
+def name_table(d_text: int = 64):
+    """Frozen ``[C, d_text]`` column-name table for rel-f1 via a HashEncoder (no model download)."""
+    from gloss.train.finetune import name_embeddings
 
-    from gloss.docs.cache import HashEncoder
-    from gloss.docs.corpus import DocCorpus, schema_elements_from_db
-    from gloss.docs.grounding import GroundingConfig, ground
-
-    corpus = DocCorpus.load(REPO / "doc_corpus", "rel-f1")
-    db = get_dataset("rel-f1", download=False).get_db(upto_test_timestamp=False)
-    elements = schema_elements_from_db(db)
-    spans = corpus.spans(3)
-    enc = HashEncoder(dim=d_text)
-    cfg = GroundingConfig(sim_threshold=0.0)
-    return (
-        ground(elements, spans, enc, cfg, regime="full"),
-        ground(elements, spans, enc, cfg, regime="null"),
-        ground(elements, spans, enc, cfg, regime="name_only"),
-    )
+    bundle, _task = bundle_and_task()
+    return name_embeddings(bundle, "rel-f1", encoder="hash", d_text=d_text)
 
 
 def sample_cell_batch(seq_len: int = 384, batch_size: int = 8, num_neighbors=(6, 6)):

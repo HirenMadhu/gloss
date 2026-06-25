@@ -1,6 +1,7 @@
-# DOC-RT default config. Hydra-composable; standalone scripts read via OmegaConf.
-# DOC-RT = RT cell-token substrate + documentation-conditioned cell encoding (FiLM). No temporal
-# geometry, no tau, no scale-equivariance (those were the retired HALOS design; see archive/halos/).
+# MoRE default config. Hydra-composable; standalone scripts read via OmegaConf.
+# MoRE = RT cell-token substrate + a Mixture-of-Experts FFN routed on a value-free relational
+# signature (column-name embedding + modality + recency). The retired DOC-RT (doc FiLM) and HALOS
+# designs live under archive/.
 seed: 0
 
 data:
@@ -12,17 +13,7 @@ data:
     seq_len: 512               # fixed cell-token cap per seed; rel-f1 max≈353 cells/seed -> 0% truncation
     max_fk: 5                  # max foreign-key neighbors per row (RT f2p_nbr width)
 
-docs:
-  # full | null (docs OFF = RT names-only) | shuffled (placebo) | name_only (RELATE-style control)
-  regime: full
-  encoder: Qwen/Qwen3-Embedding-4B
-  d_text: 2560                 # VERIFY at first cache build; flows into FiLM + the RT name token
-  grounding:
-    chunk_sentences: 3         # ~2-4 sentence spans
-    top_k: 4                   # spans pooled per schema element
-    # below this max-cosine -> d_null fallback. CALIBRATED for Qwen3-Embedding-4B (sims ~0.52-0.85).
-    sim_threshold: 0.60
-    temp: 0.1                  # softmax temperature over cosine sims
+# (MoRE adds `moe:` and `signature:` config blocks in Phase B/D.)
 
 model:
   d_model: 256

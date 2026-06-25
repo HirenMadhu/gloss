@@ -16,3 +16,7 @@ wandb/
 .DS_Store
 .idea/
 .vscode/
+
+# archived DOC-RT artifacts and run outputs (kept on disk, out of git)
+archive/doc-rt/data_doc_cache/
+results/

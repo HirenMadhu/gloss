@@ -1,8 +1,8 @@
-"""Phase 3 — the supervised training LightningModule wrapping DOC-RT.
+"""The supervised training LightningModule wrapping the RT model.
 
-Holds the (frozen, cached) grounding; converts each raw sampled minibatch into a dense ``CellBatch`` in
-``transfer_batch_to_device``. Val metrics = AP/AUROC/log_loss (relbench masks test labels, so we only
-validate here; leaderboard TEST eval is a separate, later concern).
+Converts each raw sampled minibatch into a dense ``CellBatch`` in ``transfer_batch_to_device``. Val
+metrics = AP/AUROC/log_loss (relbench masks test labels, so we only validate here; leaderboard TEST
+eval is a separate concern in ``eval/test_eval.py``).
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import torch
 
 from ..data.collate import to_cell_batch
 from ..data.graph import GraphBundle
-from ..docs.grounding import GroundingResult
 from ..eval.metrics import binary_metrics
 from ..model.docrt import DOCRT
 from .losses import masked_bce
@@ -21,7 +20,7 @@ class DOCRTLitModule(pl.LightningModule):
     def __init__(
         self,
         bundle: GraphBundle,
-        grounding: GroundingResult,
+        name_emb,
         entity_table: str,
         *,
         model_kwargs: dict | None = None,
@@ -33,18 +32,17 @@ class DOCRTLitModule(pl.LightningModule):
         super().__init__()
         self.bundle = bundle
         self.entity_table = entity_table
-        self.grounding = grounding            # plain attribute (CPU tensors gathered per batch)
         self.lr = lr
         self.weight_decay = weight_decay
         self.seq_len = seq_len
         self.max_fk = max_fk
         mk = dict(model_kwargs or {})
-        mk.setdefault("d_text", grounding.d_text)
-        self.model = DOCRT(bundle, **mk)
+        mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
+        self.model = DOCRT(bundle, name_emb, **mk)
         self._val: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def forward(self, cb):
-        return self.model(cb, self.grounding).squeeze(-1)   # [B]
+        return self.model(cb).squeeze(-1)   # [B]
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int = 0):
         cb = to_cell_batch(batch, self.bundle, self.entity_table, seq_len=self.seq_len, max_fk=self.max_fk)

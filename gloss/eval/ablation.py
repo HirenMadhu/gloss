@@ -24,7 +24,18 @@ import statistics as stats
 from pathlib import Path
 
 REGIMES = ("full", "null", "shuffled", "name_only")
-RESULTS = Path(__file__).resolve().parents[2] / "results" / "headline"
+RESULTS_ROOT = Path(__file__).resolve().parents[2] / "results"
+RESULTS = RESULTS_ROOT / "headline"
+RESULTS_TEST = RESULTS_ROOT / "headline_test"
+
+
+def results_dir(encoder: str = "qwen", test: bool = False) -> Path:
+    """Per-encoder output dir so swapping the text encoder never mixes results. ``qwen`` keeps the
+    original ``headline`` / ``headline_test`` dirs (back-compat); any other encoder gets an
+    ``_<encoder>`` suffix (e.g. ``headline_test_harrier``)."""
+    base = "headline_test" if test else "headline"
+    suffix = "" if encoder == "qwen" else f"_{encoder.replace('/', '__')}"
+    return RESULTS_ROOT / f"{base}{suffix}"
 
 
 def enumerate_configs(seeds: int, regimes: tuple[str, ...] = REGIMES) -> list[dict]:
@@ -32,53 +43,15 @@ def enumerate_configs(seeds: int, regimes: tuple[str, ...] = REGIMES) -> list[di
     return [{"regime": r, "seed": s} for s in range(seeds) for r in regimes]
 
 
-def run_config(
-    index: int,
-    *,
-    dataset: str,
-    task_name: str,
-    seeds: int,
-    encoder: str = "qwen",
-    d_text: int = 2560,
-    model_kwargs: dict | None = None,
-    num_neighbors: list[int] | None = None,
-    seq_len: int = 1024,
-    max_fk: int = 5,
-    batch_size: int = 512,
-    lr: float = 3e-4,
-    weight_decay: float = 0.01,
-    max_epochs: int = 10,
-    num_workers: int = 8,
-    sim_threshold: float = 0.60,
-    out_dir: Path | None = None,
-) -> dict:
-    """Train the single ``(regime, seed)`` config at ``index`` and persist its val metrics as JSON."""
-    from relbench.tasks import get_task
-
-    from ..data.graph import build_gloss_graph
-    from ..train.finetune import docs_for_regime, train_prebuilt
-
-    c = enumerate_configs(seeds)[index]
-    bundle = build_gloss_graph(dataset)
-    task = get_task(dataset, task_name, download=False)
-    grounding = docs_for_regime(dataset, c["regime"], encoder=encoder, d_text=d_text,
-                                sim_threshold=sim_threshold)
-    mk = dict(model_kwargs or {})
-    mk.setdefault("d_text", grounding.d_text)
-    _module, metrics = train_prebuilt(
-        bundle, task, grounding, model_kwargs=mk, num_neighbors=num_neighbors,
-        seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, lr=lr, weight_decay=weight_decay,
-        max_epochs=max_epochs, seed=c["seed"], num_workers=num_workers,
+def run_config(*args, **kwargs):
+    """Per-config training runner — **rebuilt in Phase D** as the routing-signal ablation
+    (signature / hidden / value / identity / dense). Intentionally not implemented during the Phase-A
+    pivot; the pure enumeration/aggregation helpers below are what the current tests exercise, and the
+    DOC-RT four-regime runner is archived under ``archive/doc-rt/``."""
+    raise NotImplementedError(
+        "run_config is rebuilt in Phase D (routing-signal ablation); the DOC-RT regime runner is in "
+        "archive/doc-rt/."
     )
-    rec = {
-        **c, "dataset": dataset, "task": task_name,
-        "ap": metrics.get("val/ap"), "auroc": metrics.get("val/auroc"),
-        "logloss": metrics.get("val/logloss"),
-    }
-    out_dir = out_dir or RESULTS
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{index:03d}.json").write_text(json.dumps(rec))
-    return rec
 
 
 def _agg(rows: list[dict], key: str) -> tuple[float, float, float, int]:
@@ -93,11 +66,14 @@ def _agg(rows: list[dict], key: str) -> tuple[float, float, float, int]:
     return mean, sd, ci, len(xs)
 
 
-def aggregate(records: list[dict], regimes: tuple[str, ...] = REGIMES) -> dict[str, dict]:
-    """-> ``{regime: {metric: (mean, std, ci, n)}}`` for metric in (ap, auroc, logloss)."""
+def aggregate(
+    records: list[dict],
+    regimes: tuple[str, ...] = REGIMES,
+    keys: tuple[str, ...] = ("ap", "auroc", "logloss"),
+) -> dict[str, dict]:
+    """-> ``{regime: {metric: (mean, std, ci, n)}}`` for each metric in ``keys``."""
     return {
-        regime: {k: _agg([r for r in records if r.get("regime") == regime], k)
-                 for k in ("ap", "auroc", "logloss")}
+        regime: {k: _agg([r for r in records if r.get("regime") == regime], k) for k in keys}
         for regime in regimes
     }
 
@@ -107,27 +83,39 @@ def load_records(out_dir: Path | None = None) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(out_dir.glob("*.json"))]
 
 
-def format_table(records: list[dict], regimes: tuple[str, ...] = REGIMES) -> str:
-    agg = aggregate(records, regimes)
+def _format(records, regimes, ap_key, auroc_key, title) -> str:
+    agg = aggregate(records, regimes, keys=(ap_key, auroc_key))
     lines = [
         f"{len(records)} runs collected.",
         "",
-        "=== HEADLINE: documentation regime (same DOC-RT encoder) ===",
+        title,
         f"{'regime':12s} {'AP  mean±std (95%CI)':>26s} {'AUROC  mean±std (95%CI)':>28s} {'n':>3s}",
     ]
     for regime in regimes:
-        apm, aps, apci, n = agg[regime]["ap"]
-        aum, aus, auci, _ = agg[regime]["auroc"]
+        apm, aps, apci, n = agg[regime][ap_key]
+        aum, aus, auci, _ = agg[regime][auroc_key]
         lines.append(f"{regime:12s} {apm:7.4f}±{aps:.4f}({apci:.4f})   "
                      f"{aum:7.4f}±{aus:.4f}({auci:.4f}) {n:3d}")
 
-    nap = agg.get("null", {}).get("ap", (float("nan"),))[0]
-    nau = agg.get("null", {}).get("auroc", (float("nan"),))[0]
+    nap = agg.get("null", {}).get(ap_key, (float("nan"),))[0]
+    nau = agg.get("null", {}).get(auroc_key, (float("nan"),))[0]
     lines += ["", "Δ vs null (documentation lift):"]
     for regime in regimes:
         if regime == "null":
             continue
-        apm = agg[regime]["ap"][0]
-        aum = agg[regime]["auroc"][0]
+        apm = agg[regime][ap_key][0]
+        aum = agg[regime][auroc_key][0]
         lines.append(f"  {regime:12s} ΔAP={apm - nap:+.4f}  ΔAUROC={aum - nau:+.4f}")
     return "\n".join(lines)
+
+
+def format_table(records: list[dict], regimes: tuple[str, ...] = REGIMES) -> str:
+    """The headline (VALIDATION) table — same DOC-RT encoder across the four regimes."""
+    return _format(records, regimes, "ap", "auroc",
+                   "=== HEADLINE: documentation regime (same DOC-RT encoder) — VALIDATION ===")
+
+
+def format_test_table(records: list[dict], regimes: tuple[str, ...] = REGIMES) -> str:
+    """The held-out RelBench TEST table (leaderboard-comparable, via ``task.evaluate``)."""
+    return _format(records, regimes, "test_ap", "test_auroc",
+                   "=== HEADLINE: documentation regime (same DOC-RT encoder) — TEST ===")

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
-from gloss.docs.cache import EmbeddingCache, HashEncoder, QwenEncoder  # noqa: E402
+from gloss.docs.cache import EmbeddingCache, HashEncoder, QwenEncoder, make_text_encoder  # noqa: E402
 from gloss.docs.corpus import DocCorpus, coverage_report, schema_elements_from_db  # noqa: E402
 from gloss.docs.grounding import GroundingConfig, ground  # noqa: E402
 from gloss.utils.config import load_config  # noqa: E402
@@ -32,7 +32,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="rel-f1")
     ap.add_argument("--dataset", default=None, help="override cfg.data.dataset")
-    ap.add_argument("--encoder", choices=["qwen", "hash"], default="qwen")
+    ap.add_argument("--encoder", default="qwen",
+                    help="'qwen' | 'hash' | a registry label (e.g. 'harrier') | a raw HF model id")
     ap.add_argument("--regime", default="full")
     ap.add_argument("--cache-dir", default=None)
     args = ap.parse_args()
@@ -59,10 +60,12 @@ def main() -> int:
     log.info("dataset=%s | %d schema elements | %d spans | encoder=%s",
              dataset, len(elements), len(spans), args.encoder)
 
-    if args.encoder == "qwen":
+    if args.encoder == "hash":
+        encoder = HashEncoder(dim=int(cfg.docs.get("d_text", 64)))
+    elif args.encoder == "qwen":
         encoder = QwenEncoder(str(cfg.docs.encoder))
-    else:
-        encoder = HashEncoder(dim=int(cfg.docs.get("d_text", 64)) if args.encoder == "hash" else 64)
+    else:  # registry label (e.g. "harrier") or a raw HF model id -> bf16 factory
+        encoder = make_text_encoder(args.encoder)
     cache = EmbeddingCache(encoder, cache_dir / f"emb_cache_{args.encoder}.pt")
 
     result = ground(elements, spans, cache, gcfg, regime=args.regime)

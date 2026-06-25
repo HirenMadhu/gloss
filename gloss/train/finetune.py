@@ -1,5 +1,7 @@
-"""Phase 3 — supervised fine-tuning entry point + the regime -> grounding plumbing reused by the
-four-regime headline runner (``eval/ablation.py``).
+"""Supervised fine-tuning entry point + the per-column name-embedding plumbing.
+
+Builds the frozen schema-name table (``gloss.text.schema``) once and trains the RT model on a
+(dataset, task). The routing-signal ablation (``eval/ablation.py``, Phase D) reuses ``train_prebuilt``.
 """
 from __future__ import annotations
 
@@ -8,51 +10,40 @@ from pathlib import Path
 import pytorch_lightning as pl
 
 from ..data.graph import build_gloss_graph
-from ..docs.cache import EmbeddingCache, HashEncoder, QwenEncoder
-from ..docs.corpus import DocCorpus, schema_elements_from_db
-from ..docs.grounding import GroundingConfig, GroundingResult, ground
+from ..text.cache import EmbeddingCache, HashEncoder, QwenEncoder, make_text_encoder
+from ..text.schema import build_column_name_embeddings
 from .datamodule import DOCRTDataModule
 from .loop import DOCRTLitModule
 
 REPO = Path(__file__).resolve().parents[2]
 
 
-def make_grounding(
-    dataset: str,
-    *,
-    regime: str = "full",
-    encoder: str = "qwen",
-    d_text: int = 64,
-    sim_threshold: float = 0.60,
-    chunk_sentences: int = 3,
-    top_k: int = 4,
-) -> GroundingResult:
-    """Build a GroundingResult for ``regime`` from the authored doc corpus + the cached text encoder."""
-    from relbench.datasets import get_dataset
+def _name_encoder(dataset: str, *, encoder: str = "hash", d_text: int = 64):
+    """An ``encode(texts, kind) -> Tensor`` callable for the column-name table (cached for real models).
 
-    corpus = DocCorpus.load(REPO / "doc_corpus", dataset)
-    db = get_dataset(dataset, download=False).get_db(upto_test_timestamp=False)
-    elements = schema_elements_from_db(db)
-    spans = corpus.spans(chunk_sentences)
+    ``hash`` is the dependency-free dev/test encoder (``d_text`` sets its width). ``qwen`` / a registry
+    label / a raw HF id wrap the frozen model in an on-disk :class:`EmbeddingCache` so its single pass
+    is idempotent across runs.
+    """
+    if encoder == "hash":
+        return HashEncoder(dim=d_text)
+    safe = encoder.replace("/", "__")
+    cache_path = REPO / "data" / "schema_cache" / dataset / f"name_emb_{safe}.pt"
     if encoder == "qwen":
-        cache_path = REPO / "data" / "doc_cache" / dataset / "emb_cache_qwen.pt"
-        enc = EmbeddingCache(QwenEncoder("Qwen/Qwen3-Embedding-4B"), cache_path)
-    else:
-        enc = HashEncoder(dim=d_text)
-    cfg = GroundingConfig(chunk_sentences=chunk_sentences, top_k=top_k, sim_threshold=sim_threshold)
-    return ground(elements, spans, enc, cfg, regime=regime)
+        return EmbeddingCache(QwenEncoder("Qwen/Qwen3-Embedding-4B"), cache_path)
+    return EmbeddingCache(make_text_encoder(encoder), cache_path)
 
 
-def docs_for_regime(dataset: str, regime: str, *, encoder: str = "qwen", d_text: int = 64, **kw):
-    """-> GroundingResult for ``regime``. ``null`` keeps the (regime-independent) RT name tokens but
-    turns the FiLM doc conditioning off (d_null everywhere)."""
-    return make_grounding(dataset, regime=regime, encoder=encoder, d_text=d_text, **kw)
+def name_embeddings(bundle, dataset: str, *, encoder: str = "hash", d_text: int = 64):
+    """Frozen ``[C, d_text]`` column-name table for ``bundle`` (built once; cached for real encoders)."""
+    enc = _name_encoder(dataset, encoder=encoder, d_text=d_text)
+    return build_column_name_embeddings(bundle, enc)
 
 
 def train_prebuilt(
     bundle,
     task,
-    grounding,
+    name_emb,
     *,
     model_kwargs: dict | None = None,
     num_neighbors: list[int] | None = None,
@@ -69,13 +60,13 @@ def train_prebuilt(
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
 ):
-    """Train one DOC-RT run on a PREBUILT bundle + grounding (the headline runner reuses these across
-    regimes so the graph is built once)."""
+    """Train one run on a PREBUILT bundle + name table (the ablation reuses these across arms so the
+    graph and the frozen name embeddings are built once)."""
     from ..utils.seeding import seed_everything
 
     seed_everything(seed)
     module = DOCRTLitModule(
-        bundle, grounding, task.entity_table,
+        bundle, name_emb, task.entity_table,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
     )
     dm = DOCRTDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
@@ -95,16 +86,14 @@ def train(
     *,
     dataset: str = "rel-f1",
     task_name: str = "driver-dnf",
-    regime: str = "full",
-    encoder: str = "qwen",
+    encoder: str = "hash",
     model_kwargs: dict | None = None,
-    sim_threshold: float = 0.60,
     **kw,
 ):
     from relbench.tasks import get_task
 
     bundle = build_gloss_graph(dataset)
     task = get_task(dataset, task_name, download=False)
-    g = docs_for_regime(dataset, regime, encoder=encoder,
-                        d_text=(model_kwargs or {}).get("d_text", 64), sim_threshold=sim_threshold)
-    return train_prebuilt(bundle, task, g, model_kwargs=model_kwargs, **kw)
+    d_text = 2560 if encoder == "qwen" else int((model_kwargs or {}).get("d_text", 64))
+    name_emb = name_embeddings(bundle, dataset, encoder=encoder, d_text=d_text)
+    return train_prebuilt(bundle, task, name_emb, model_kwargs=model_kwargs, **kw)

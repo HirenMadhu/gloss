@@ -1,2 +1,2 @@
-"""gloss.model — documentation-conditioned cell encoder (FiLM), RT relational-attention substrate,
-task heads, and the DOC-RT model assembly."""
+"""gloss.model — RT cell encoder, relational-attention substrate (+ MoE FFN), relational signature,
+task heads, and the MoRE model assembly."""

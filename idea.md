@@ -1,200 +1,96 @@
-# DOC-RT — Method Design (v1: documentation-conditioned cell encoding)
+# Mixture of Relational Experts (MoRE) on the Relational Transformer
 
-**This is a method paper built on top of RT (Relational Transformer, 2510.06377).** We keep RT's
-cell-token substrate and relational attention masks unchanged, and add **one new signal**: per-column
-**documentation**, grounded from prose and injected by **FiLM** into the cell encoders, so the
-*interpretation of a value is conditioned on its column's documented meaning*. No temporal kernels, no
-geometry generator, no dimensionless-time coordinate — those belonged to the earlier (GelGT-based)
-design and are retired. One signal, one mechanism, one question.
-
-> **Naming note.** The old name (HALOS) referred to Gaussian-in-time "halo" kernels that no longer
-> exist here. Working handle is **DOC-RT** until we pick a real name; rename freely.
+*Design rationale. Pair with `implementation.md` for the build.*
 
 ---
 
 ## 1. Thesis
 
-> RT reduces a column's semantics to its **name string**. But a schema column carries meaning a name
-> cannot: what an opaque **code** means (`statusId = 4` → "mechanical retirement"), what a sentinel
-> value means (`grid = 0` → "pit-lane start, not pole"), what **unit** a number is in, whether a table
-> is a time-varying **fact** or a static **dimension**. This meaning lives in **documentation**, not in
-> the schema. DOC-RT grounds that documentation per column and uses it to **condition how each cell is
-> encoded** — so a value is read in light of what its column *means*, not just what it's *named*.
+We add a Mixture-of-Experts layer to the Relational Transformer (RT, [arXiv:2510.06377](https://arxiv.org/abs/2510.06377)) whose **router conditions only on a cell's relational metadata — its schema embedding, its modality, and its causal recency — while the experts transform the cell's evolving content.** This single asymmetry ("route on semantics, transform the content") gives us soft, data-dependent parameter sharing across relations that is *temporally leak-free by construction* and *transfers to unseen schemas for free* — neither of which the existing message-passing graph-MoE methods (GMoE, HER, HOPE) can do, because none of them sit on a substrate like RT.
 
-**Why this is the right place to inject text (and not a feature nudge).** Names + FK topology — which
-RT already has — tell the model the wiring and the lexical hint. Documentation earns its place only by
-supplying what those don't: **the meaning of opaque codes, sentinels, units, and entity-vs-event
-roles.** That information is genuinely absent from the schema, so conditioning the cell encoder on it
-is not re-deriving something RT has — it is adding a signal RT structurally cannot access.
-
-**Documentation is realistic, not curated.** A coding agent authors per-DB markdown that reads like a
-senior developer's README — partial coverage, mixed granularity, inline mentions of units and coded
-values, FK rationale, occasional staleness (authoring protocol: `DOC_AUTHORING.md`). This forces a
-**grounding** module (retrieve relevant spans per column) rather than a rigid template, and makes
-"works with documentation as a developer would write it" the claim. Uncovered columns fall back to a
-learned null embedding — i.e. **degrade gracefully to RT's name-only regime** rather than break.
+The contribution is **conjunctive and specific**, not "first MoE for relational data." The individual ingredients (top-$k$ gating, semantic routing, orthogonality-regularized balancing) exist in prior art. What does not exist is their composition on a **temporal, multi-modal, schema-agnostic relational transformer**, with a routing signal that is provably causal w.r.t. the RelBench seed time.
 
 ---
 
-## 2. The honest status of each claim (read before building)
+## 2. The one observation it's built on
 
-This conversation established a hard prior: in prior work, **schema-documentation prose gave no
-measurable improvement** once names were kept. DOC-RT is a bet that *routing* documentation into the
-cell encoder — where it can disambiguate codes/units/sentinels — beats names-only, even though
-documentation-as-a-plain-feature did not. **That bet is unproven and partially contradicted.** So the
-contribution is not "we added documentation"; it is a **finding**, and it stands or falls on one
-comparison:
+RT's input token for a cell $(v, c, t)$ = (value, column, table) is an **additive** decomposition (this is literally how `rt/model.py` builds it):
 
-> **docs-on vs docs-off, same codebase, same everything** (full grounded doc embedding vs the learned
-> null embedding for every column). This is the load-bearing experiment. It is baked into the first
-> training run (`IMPLEMENTATION.md`, Phase 4) as the **default result**, not a later ablation, because
-> "DOC-RT beats RT-from-the-paper" is *not* the same comparison — that delta could be our hierarchy
-> implementation, sampler, or hyperparameters rather than documentation. Only docs-on vs docs-off, in
-> one codebase, isolates the signal.
+$$x_i \;=\; \underbrace{W_d\, r_i}_{\text{value component }v_i} \;+\; \underbrace{W_{\text{col}}\, E_{\text{LM}}(c_i)}_{\text{schema component }s_i}$$
 
-If docs-on does not beat docs-off, there is no documentation paper; the honest output is a negative
-result (and the hierarchy/operator directions become the fallback). We find that out in the **second
-training run**, before writing a word.
+- $r_i$ is the datatype-specific normalized value encoding (numeric/boolean: $(v-\mu_c)/\sigma_c$; datetime: globally normalized; text: a frozen text-encoder embedding).
+- $E_{\text{LM}}(c_i)$ is a **frozen language-model embedding of the column name** ("price of product"), 384-dim (MiniLMv2). In the reference code this is `batch["col_name_values"]`, projected by `enc_dict["col_name"]`.
+
+So inside every RT token there is already a vector $s_i$ that says *what kind of cell this is*, living in a semantic space where "price of product" and "amount of transaction" land near each other **across databases**. RT also already carries a per-cell modality tag, `batch["sem_types"]` $\in \{\text{number}, \text{text}, \text{datetime}, \text{boolean}\}$.
+
+The method is just: **build the router's input from $s_i$ and the modality (and recency), never from the value and never from raw table/column identity.** That small choice dissolves three hard problems at once (§5).
 
 ---
 
-## 3. Architecture
+## 3. The method
 
-### 3.1 Substrate (RT, unchanged)
-- Cell-level tokens; relational attention masks (same-column / same-row / parent-FK / child-FK); no
-  positional encoding; names embedded as strings (kept — we *add* to RT, we don't remove its inputs).
-- Rows = graph nodes for sampling; per seed `(entity, seed_time)`, temporal sampling returns only rows
-  with `row_time ≤ seed_time` (**hard leakage rule**).
-- **Self-labels retained.** The seed entity's past task-table rows enter the subgraph as cells/rows.
-  RT showed this is the dominant transfer lever (zero-shot AUROC 70.1 → 53.8 without it); we must not
-  lose it. It is held in **every** arm so it never confounds the docs comparison.
+**Relational signature (per cell, value-free):**
 
-### 3.2 Grounding from prose (the text pipeline, offline + cached)
-Input: one `docs.md` per DB (authored by a coding agent; `DOC_AUTHORING.md`). Offline, cached:
-1. **Chunk** prose into spans (~2–4 sentences).
-2. **Embed** spans with a **frozen** sentence encoder; embed a minimal query per **column**:
-   `"table <t>, column <c>"` (and per FK-role: `"FK <c> of <t> referencing <t'>"`).
-3. **Retrieve & pool**: top-K spans by cosine, softmax-weight, pool → column-doc embedding `d_c`; keep
-   max cosine as a **relevance scalar** `rel_c`.
-4. **Null fallback**: if no span clears a threshold, `d_c ← d_null` (learned). This is exactly the
-   docs-off regime, applied per-column.
+$$z_i \;=\; \mathrm{RMSNorm}\Big(\, W_s\, E_{\text{LM}}(c_i) \;+\; \psi(\sigma_i) \;+\; \phi(\Delta_i) \,\Big)$$
 
-Output: `{d_c}` per column (+ `rel_c`, coverage stats). **Static per DB** — computed once, cached,
-gathered by id at train time. **No LM forward passes during training.**
+- $W_s E_{\text{LM}}(c_i)$ — projection of RT's frozen-LM column embedding ("what relation/column is this", semantic & schema-transferable).
+- $\psi(\sigma_i)$ — learned embedding of the modality $\sigma_i$ (the multi-modal axis).
+- $\phi(\Delta_i)$ — recency encoding, $\Delta_i = T_{\text{seed}} - \tau(\text{row}_i) \ge 0$ (the temporal axis). *Optional in v1 — needs one data-pipeline addition; see `implementation.md` §10.*
 
-Three regimes (for the ablation, all on the same trained encoder):
-`full` (grounded `d_c`) | `null` (every `d_c ← d_null` — the docs-off baseline) | `shuffled` (placebo:
-spans permuted across columns/DBs, length-matched — catches "any text vector helps" artifacts).
+**MoE layer (replaces RT's SwiGLU FFN inside each block).** A shared pool of $M$ FFN experts, each identical in form to RT's FFN, with a sparse top-$k$ gate driven by the signature:
 
-### 3.3 Documentation-conditioned cell encoding (the mechanism — FiLM)
-For row `u`, column `c`, value `v`, dtype encoder `Enc_dtype`:
-```
-x_{u,c} = γ(d_c) ⊙ W_v Enc_dtype(v)  +  β(d_c)          # FiLM: column-doc modulates the cell
-```
-- `γ, β` are small shared MLPs `R^{dim(d)} → R^{d_model}` (FiLM scale/shift).
-- A "3" in a severity column documented as coded-high is read differently from a "3" in a quantity
-  column — this is the entire point. Coded columns (`statusId`) and sentinels (`grid = 0`) are where
-  this should bite hardest.
+$$G_i \;=\; \mathrm{softmax}\big(\mathrm{TopK}(W_g\, z_i,\; k)\big), \quad k \in \{1,2\}, \qquad y_i \;=\; \sum_{j \in \mathrm{TopK}} G_{i,j}\, E_j\big(x_i^{(\ell)}\big)$$
 
-Cell tokens `{x_{u,c}}` then flow through RT's transformer with its relational masks, unchanged. Row
-representation is pooled from its cells as in RT. **Hierarchy = RT's cell→row structure; documentation
-conditions the bottom (cell) level.**
+The crucial asymmetry: **the router sees only $z_i$ (metadata); the experts $E_j$ transform the full evolving hidden state $x_i^{(\ell)}$.** Because $z_i$ is static per cell, it is computed once in the trunk and reused at every layer — routing is cheap, and the causality argument (§5) is trivial.
 
-**Optional second injection (flag, default OFF):** add `d_c` as an additive feature to the
-same-column attention bias, so cell↔cell attention can use documented meaning. Keep OFF by default so
-the mechanism stays single-point and ablatable; turn on only as a labeled ablation.
+**Balancing — tail-tolerant, not uniform.** Drop the Switch/GShard auxiliary loss (its minimizer is *uniform* expert usage, which actively fights the long-tailed relation frequencies of real databases). Instead let usage follow the tail and prevent expert collapse with an orthogonality regularizer on the router's expert directions (the HOPE mechanism, transplanted to the router matrix):
 
-### 3.4 What is deliberately NOT here
-- **No τ / no temporal kernel / no scale-equivariance.** Removed. Time enters only as whatever RT
-  already uses (it is not part of the documentation claim).
-- **No geometry generator / no Gaussian-in-time bias.** Removed.
-- **No counting/cardinality operator yet.** Explicitly deferred to a v2 axis (`§6`), to be added
-  *after* the documentation finding is settled — not entangled with it now.
+$$\mathcal{L} \;=\; \mathcal{L}_{\text{task}} \;+\; \lambda \,\big\lVert \hat{W}_g^{\top}\hat{W}_g - I \big\rVert_F^2, \qquad \hat{W}_g = \text{column-normalized } W_g$$
+
+Expert-Choice routing is the drop-in alternative when a hard compute cap is required (balance-by-construction, no aux loss).
+
+**That is the entire method:** *a mixture of FFN experts routed on each cell's (schema, modality, recency) signature, with orthogonality-regularized tail-following balance.*
 
 ---
 
-## 4. Positioning (what is and isn't new)
+## 4. Why this is the soft-basis story done right
 
-- **RT (2510.06377):** cell tokens, relational masks, names-as-strings, self-labels, masked-cell
-  pretraining. RT is the **base** here (we keep its substrate) *and* the **baseline** (names-only =
-  our `null` regime). The hierarchy is RT's — **not claimed as novel.**
-- **RELATE (2510.19954):** conditions shared *feature encoders* on column-metadata **text** — the
-  closest prior, and the one to separate from explicitly. RELATE conditions on **names/metadata**;
-  DOC-RT conditions on **grounded prose documentation beyond names** (coded-value/unit/sentinel/role
-  meaning), retrieved from realistic docs. Same *kind* of mechanism (text→encoder conditioning),
-  **different signal** (documentation, not metadata). This contrast is the paper's main novelty
-  boundary — state it sharply, and benchmark against a RELATE-style names-only conditioning arm.
-- **ConTextTab (2506.10707):** single-table header semantics; pre-empts "name semantics are huge"
-  (~1–2%). This is *why* DOC-RT targets documented meaning (codes/units), not header names — the
-  signal must come from what names *don't* carry, or there is no paper.
-- **RT's stated limitation — dual FKs into one table:** documentation gives each FK-role a distinct
-  `d`, hence distinct cell-encoding conditioning. **Audit whether any RelBench DB actually has
-  same-table dual FKs before claiming this** — rel-f1's driver vs constructor are *different tables*
-  (type-distinguished for free), so they are **not** an example of this case. If no RelBench DB has
-  it, drop the claim; it has no test bed.
+This is the input-conditioned generalization of RGCN's basis decomposition $W_r = \sum_b a_{rb} V_b$ — but the interpolation is governed by **semantic similarity** instead of relation identity. Two limits make it precise:
 
-**The candidate novel claim (singular, contingent):** *grounded prose documentation, injected into
-cell encoding, recovers signal that names cannot — measured as docs-on > docs-off on coded/unit-heavy
-RelBench tasks, with a shuffled-span placebo and a names-only (RELATE-style) control.* Everything else
-(hierarchy, masks, self-labels, masked pretraining) is RT, credited.
+- **Hard top-1, one expert per column, routing on identity** $\Rightarrow$ recovers per-relation weight matrices (the heterogeneous-GNN limit).
+- **Soft routing with $M \ll \#\text{columns}$ on the semantic embedding** $\Rightarrow$ soft sharing where semantically-similar columns share experts: exactly $a_{rb} \to G_b(z_i)$, except the sharing structure is grounded in the frozen-LM space and therefore **transfers across schemas**.
+
+That last clause is the thing RGCN's identity-indexed coefficients can never give you, and it is what makes the foundation-model claim coherent.
 
 ---
 
-## 5. Experimental plan & hypotheses (RelBench only, always)
+## 5. The properties, and exactly how we differ from prior art
 
-Start **single-DB on rel-f1** (it has genuine upstream docs via Ergast, and coded columns —
-`statusId` — plus sentinels — `grid = 0` — which is exactly where documentation should help). Add
-rel-trial / rel-stack once their docs are authored.
+**Heterogeneity without type-overfitting — solved without masking.** The known failure (HER): if the router sees type/identity, it learns a trivial type→expert partition and the MoE just re-derives a heterogeneous model. HER fixes this by *stochastically masking* the type embedding. We fix it differently and deterministically: the router **never sees identity** — only the semantic embedding — and the **expert bottleneck** $M \ll C$ makes type-partitioning impossible, forcing the router to merge columns. Routing on $s_i$ ensures the merges are semantically sensible (a monetary-numeric cluster, an id-categorical cluster, a free-text cluster). *Different mechanism from every heterograph-MoE paper.*
 
-Baselines/arms (all share substrate, self-labels, hyperparameters — only the doc signal changes):
-- **RT / names-only** = the `null` regime (docs off).
-- **DOC-RT** = the `full` regime (docs on).
-- **placebo** = `shuffled` regime.
-- **RELATE-style control** = condition on column *name* embedding instead of grounded doc.
+**Temporal correctness — by construction.** Every component of $z_i$ is measurable from cells with $\tau \le T_{\text{seed}}$: $s_i$ and $\psi$ are static, $\Delta_i$ uses only the cell's own past timestamp, and **no global structural statistic (degree, neighborhood density) ever enters the router.** This is the piece the entire graph-MoE literature ignores: GMoE/HER/HOPE-style structural router features are computed on the full graph and *leak future edges* in a seed-time setting. Note part of this safety is *inherited* — RT's context is already a causal BFS — but our explicit recency axis converts mere correctness into temporal *specialization* (recent-activity vs long-range-history experts). A concrete, checkable consequence: with signature routing, a cell's gate is a pure function of its own $(c, \sigma, \Delta)$ and is **identical regardless of which neighbors got sampled** — a unit-testable invariance (see `implementation.md` §8).
 
-- **H1 — docs feed signal (THE gate, first result):** `full` > `null` with seed CIs on rel-f1. If
-  `full ≈ null`, stop — documentation adds nothing here.
-- **H1b — it's meaning, not any-text:** `full` > `shuffled`. If `full ≈ shuffled`, the win is a text-
-  vector artifact, not documented meaning.
-- **H1c — beyond names:** `full` > **RELATE-style names-only**. This is the claim's real bar — docs
-  must beat *names*, not just beat *nothing*.
-- **H2 — coded-column locality:** the gain concentrates on tasks/columns where docs encode hidden
-  meaning (`statusId`, `grid`), and is ~flat elsewhere. A *uniform* gain is a red flag (it suggests a
-  generic effect, not documentation) — report the per-task breakdown, not just the average.
-- **H3 — coverage curve:** performance vs documentation coverage (fraction of columns grounded);
-  graceful degradation toward `null` as coverage drops.
-- **H4 (defer):** transfer / leave-one-DB-out — only meaningful once multiple DBs have docs; not in
-  the first build.
+**Schema transfer — free.** $z_i$ references no dataset-specific IDs, so $G(z_i)$ is defined on any unseen schema; an expert tuned to a semantic region fires on a new database's columns that embed there, no retraining. This matches RT's leave-one-database-out zero-shot protocol. Among surveyed methods only MoEMeta and HOPE gesture at schema-invariant routing, and neither uses a frozen-LM schema space.
 
-**Calibrated expectation (say it in the paper):** modest or no delta on well-named, code-free tasks;
-wins concentrate where columns are coded/unit-bearing/sentinel-laden. rel-f1's `statusId` is the
-flagship probe.
+**Multimodality** is the $\psi(\sigma_i)$ term; **sparsity / conditional compute** is the top-$k$; **soft relational sharing** is §4.
+
+**Deliberately deferred: structural / receptive-field routing.** The honest structural features (degree, neighborhood density) are exactly the ones that leak, and RT already does multi-hop via stacked neighbor-mask attention — so the basic method does not need to own receptive fields. The clean extension is MoA-style routing over RT's four attention masks (column / feature / neighbor / full), or routing on the hidden state (safe here because RT's context is causal). Both stay out of v1.
+
+**Compact contrast.** vs **Switch/GShard** — relational signature instead of a learned-from-scratch gate, tail-following instead of uniform balance. vs **GMoE** — FFN-on-cell-tokens routed on semantics, not per-node hop-GNN experts. vs **HER** — bottleneck + semantic routing instead of type masking, on RT tokens not HGT states, plus temporal and transfer. vs **HOPE** — borrows its orthogonalization but routes on transferable frozen-LM semantics (not learned intra-dataset prototypes) and is a full FFN-MoE, not a prediction head. vs **RGCN** — input-conditioned and schema-transferable, not fixed identity-indexed.
 
 ---
 
-## 6. Deferred axis — the operator (v2, do not build yet)
+## 6. Novelty positioning (for the meeting, one sentence)
 
-The cardinality-conditioned multiset aggregator (counting/sum — the provable representational edge RT
-lacks, since attention pooling is a convex combination and cannot recover counts) is a **separate**
-axis. Add it **after** the documentation finding is settled, as a second contribution, with its own
-isolated ablation. Do **not** entangle it with documentation now — two unproven axes built together
-produce an unablatable system and a "two incremental ideas stapled together" reject. One axis, proven,
-first.
+> *We route a shared pool of relational experts on each cell's frozen-LM schema embedding, modality, and causal recency — giving soft, semantically-grounded parameter sharing across relations that is temporally leak-free and transfers to unseen schemas by construction, none of which the existing message-passing graph-MoE methods can do.*
+
+The defensible differentiators, in decreasing order: (1) temporal-causal routing (absent from all prior graph-MoE, forced by RelBench); (2) the RT transformer substrate (MoE at the FFN / over relational attention masks — a structurally new injection surface vs. all message-passing graph-MoE); (3) column-multimodality routing; (4) schema-invariant zero-shot transfer.
 
 ---
 
-## 7. Risks
-1. **Docs add nothing beyond names** (the prior says this is likely). Caught in run 2 (H1/H1c). Output
-   = honest negative result; fall back to hierarchy/operator axes. This is *why* the ablation is the
-   default, not an afterthought.
-2. **Grounding noise** (retrieval mis-binds spans → garbage `d_c`). Relevance gating + null fallback;
-   H1b placebo catches "any vector helps."
-3. **Uniform gain** (docs help everywhere equally) → suspect a confound, not documentation; H2 per-
-   task breakdown adjudicates.
-4. **Dual-FK claim with no test bed** → audit RelBench for same-table dual FKs before claiming §4's
-   FK-role point.
-5. **Authoring leakage** (agent sees tasks/labels) → blind authoring protocol (`DOC_AUTHORING.md`):
-   the doc author sees schema + sample rows only, never tasks/labels/splits.
+## 7. What would falsify it (honest risks)
 
----
-*Companion:* `IMPLEMENTATION.md` (build plan), `DOC_AUTHORING.md` (coding-agent doc protocol).
+- **The RGCN null result.** RT's frozen-LM token may already let a *single* shared FFN absorb all columns, in which case a small semantically-routed expert pool just recovers dense RT. **This is the primary thing the first experiment must rule in or out** (the routing-signal ablation: signature vs. value vs. identity vs. dense).
+- **Value-free routing too coarse.** If the *value* genuinely should change processing, the signature is blind to it. Mitigation: append a learned low-rank slice of $v_i$ to $z_i$.
+- **Boundary flips.** Top-$k$ on a smooth semantic space can flip experts at cluster boundaries; $k{=}2$ smooths it, Soft-MoE-style convex routing is the stable-but-costlier fallback.
+- **Sparsity is notional under sampled contexts.** Per-token routing scatters experts across a minibatch, so the FLOP win is real only at scale or with capacity-based grouping; the MVP uses dense expert combination for correctness.

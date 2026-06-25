@@ -1,11 +1,11 @@
-"""run_train.py — Phase-0 DoD + single-arm trainer.
+"""run_train.py — dry-run substrate check + single-arm trainer (plain RT).
 
-    # P0 DoD: build rel-f1, sample a leakage-safe minibatch, build a CellBatch, print shapes, forward:
+    # build rel-f1, sample a leakage-safe minibatch, build a CellBatch, print shapes, forward:
     .venv/bin/python scripts/run_train.py --dry-run
 
-    # train one arm and report val metrics (Phase 3):
-    .venv/bin/python scripts/run_train.py --train --regime full  --encoder qwen
-    .venv/bin/python scripts/run_train.py --train --regime null  --encoder qwen --baseline
+    # train one arm and report val metrics:
+    .venv/bin/python scripts/run_train.py --train --encoder hash
+    .venv/bin/python scripts/run_train.py --train --encoder qwen --baseline
 """
 from __future__ import annotations
 
@@ -23,10 +23,10 @@ from gloss.utils.seeding import seed_everything  # noqa: E402
 log = get_logger("gloss.run_train")
 
 
-def _model_kwargs(cfg, d_text: int) -> dict:
+def _model_kwargs(cfg) -> dict:
     m = cfg.model
     return dict(
-        d_model=int(m.d_model), d_text=d_text, n_blocks=int(m.n_blocks),
+        d_model=int(m.d_model), n_blocks=int(m.n_blocks),
         n_heads=int(m.n_heads), d_ff=int(m.get("d_ff", 4 * int(m.d_model))),
         enc_channels=int(m.get("enc_channels", int(m.d_model))),
     )
@@ -37,8 +37,8 @@ def main() -> int:
     ap.add_argument("--config", default="rel-f1")
     ap.add_argument("--dry-run", action="store_true", help="sample one batch, print shapes, forward")
     ap.add_argument("--train", action="store_true", help="train one arm + report val metrics")
-    ap.add_argument("--regime", default="full", choices=["full", "null", "shuffled", "name_only"])
-    ap.add_argument("--encoder", default="qwen", choices=["qwen", "hash"])
+    ap.add_argument("--encoder", default="hash", choices=["qwen", "hash"],
+                    help="frozen encoder for the column-name table (hash=dev, qwen=real)")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--limit-train-batches", type=int, default=None)
@@ -71,7 +71,7 @@ def _dry_run(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> i
     from gloss.data.collate import to_cell_batch
     from gloss.data.graph import build_gloss_graph, make_loader
     from gloss.model.docrt import DOCRT
-    from gloss.train.finetune import docs_for_regime
+    from gloss.train.finetune import name_embeddings
     from relbench.tasks import get_task
 
     log.info(f"building {dataset} graph ...")
@@ -89,27 +89,26 @@ def _dry_run(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> i
     bad = int(((cb.row_time > st) & cb.is_timed & ~cb.is_padding).sum())
     print(f"leakage check (row_time > seed_time): {bad}")
 
-    g = docs_for_regime(dataset, args.regime, encoder="hash", d_text=64, sim_threshold=0.0)
-    model = DOCRT(bundle, d_model=128, d_text=g.d_text, n_blocks=2, n_heads=4, d_ff=256, enc_channels=128)
+    name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=64)
+    model = DOCRT(bundle, name_emb, d_model=128, n_blocks=2, n_heads=4, d_ff=256, enc_channels=128)
     with torch.no_grad():
-        logits = model(cb, g)
+        logits = model(cb)
     print(f"forward OK: logits {tuple(logits.shape)}  finite={bool(torch.isfinite(logits).all())}")
     return 0
 
 
 def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int:
-    from gloss.train.finetune import docs_for_regime, train_prebuilt
     from gloss.data.graph import build_gloss_graph
+    from gloss.train.finetune import name_embeddings, train_prebuilt
     from relbench.tasks import get_task
 
     d_text = 2560 if args.encoder == "qwen" else 64
     bundle = build_gloss_graph(dataset)
     task = get_task(dataset, task_name, download=False)
-    g = docs_for_regime(dataset, args.regime, encoder=args.encoder, d_text=d_text,
-                        sim_threshold=float(cfg.docs.grounding.sim_threshold))
-    mk = _model_kwargs(cfg, g.d_text)
+    name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=d_text)
+    mk = _model_kwargs(cfg)
     _, metrics = train_prebuilt(
-        bundle, task, g, model_kwargs=mk,
+        bundle, task, name_emb, model_kwargs=mk,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk,
         batch_size=args.batch_size or int(cfg.train.batch_size),
         lr=float(cfg.train.lr), weight_decay=float(cfg.train.weight_decay),
@@ -118,7 +117,7 @@ def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
     )
-    print(f"[{args.regime}] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "val" in k))
+    print("[train] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "val" in k))
 
     if args.baseline:
         from gloss.eval.baselines import run_lightgbm_baseline
