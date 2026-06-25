@@ -27,4 +27,6 @@ date; hostname; echo "array task ${SLURM_ARRAY_TASK_ID}"
 
 python scripts/run_ablation.py --index "${SLURM_ARRAY_TASK_ID}" \
     --encoder qwen --epochs 10 --batch-size 64 --num-workers 8 "$@"
-echo "ABLATION_TASK_${SLURM_ARRAY_TASK_ID}_DONE"
+rc=$?
+echo "ABLATION_TASK_${SLURM_ARRAY_TASK_ID}_DONE (rc=$rc)"
+exit $rc

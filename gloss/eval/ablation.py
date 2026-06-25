@@ -123,9 +123,12 @@ def run_config(
     if test:
         from .test_eval import evaluate_split
 
-        tm = evaluate_split(module, bundle, task, "test", num_neighbors=num_neighbors,
-                            seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers)
-        rec.update({f"test_{kk}": v for kk, v in tm.items()})
+        try:
+            tm = evaluate_split(module, bundle, task, "test", num_neighbors=num_neighbors,
+                                seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers)
+            rec.update({f"test_{kk}": v for kk, v in tm.items()})
+        except Exception as exc:  # never lose the (trained) val metrics to a test-eval failure
+            rec["test_error"] = repr(exc)
     out_dir = out_dir or RESULTS
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{index:04d}.json").write_text(json.dumps(rec))

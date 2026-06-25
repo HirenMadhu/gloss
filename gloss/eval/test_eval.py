@@ -46,15 +46,16 @@ def predict_split(
     pred = np.full(n, np.nan, dtype=np.float64)
     for raw in loader:
         cb = to_cell_batch(raw, bundle, task.entity_table, seq_len=seq_len, max_fk=max_fk).to(device)
-        out = module(cb).float().cpu()                        # [B] raw output in segment order
+        out = module(cb).float().cpu()                        # [B] one prediction per seed (segment order)
         if getattr(module, "task_type", "binary") == "regression":
             pred_b = out * module.target_std + module.target_mean   # de-standardize to original units
         else:
             pred_b = torch.sigmoid(out)                       # probability
-        store = raw[task.entity_table]
-        seg = store.batch.cpu()                               # segment per entity node
-        gid = store.input_id.cpu().numpy()                    # row index per entity node (seed row)
-        pred[gid] = pred_b[seg].numpy()
+        # The seeds are the loader's input nodes (segment j == input seed j). ``input_id`` is per-SEED
+        # (length B); ``store.batch`` spans seeds + sampled entity-type neighbors, so we must NOT index
+        # by it (that breaks whenever the entity type also appears as a neighbor, e.g. qualifying/results).
+        gid = raw[task.entity_table].input_id.cpu().numpy()   # [B] output-row index per seed
+        pred[gid] = pred_b.numpy()
     if was_training:
         module.train()
     assert not np.isnan(pred).any(), f"{split}: {int(np.isnan(pred).sum())} seeds got no prediction"
