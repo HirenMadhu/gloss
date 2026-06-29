@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from ..data.collate import to_cell_batch
-from ..data.graph import make_loader
+from ..data.graph import coerce_binary_target, make_loader
 
 
 @torch.no_grad()
@@ -82,5 +82,8 @@ def evaluate_split(
         module, bundle, task, split, num_neighbors=num_neighbors,
         seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers, device=device,
     )
-    target_table = None if split == "test" else task.get_table(split)
+    # Pass the (label-bearing) target table explicitly for every split — including test, where RelBench
+    # would otherwise fetch its own internal copy — so boolean-string targets are coerced before scoring
+    # (relbench's roc_auc uses pos_label=1, which rejects 't'/'f'). Row order matches predict_split's.
+    target_table = coerce_binary_target(task.get_table(split, mask_input_cols=False), task)
     return {k: float(v) for k, v in task.evaluate(pred, target_table).items()}

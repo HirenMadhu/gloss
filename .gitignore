@@ -4,8 +4,8 @@ __pycache__/
 venv/
 *.egg-info/
 
-# data & outputs
-data/
+# data & outputs (anchor to repo root so the gloss/data SOURCE package is NOT ignored)
+/data/
 ckpt/
 logs/
 outputs/
