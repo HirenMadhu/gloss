@@ -23,7 +23,7 @@ import torch
 from torch import Tensor
 
 QUERY_INSTRUCTION = (
-    "Given a database schema element (a table or column), retrieve text that describes its meaning."
+    "Given the name of a database table and column, represent its relational role and semantic meaning."
 )
 
 # Short labels -> HuggingFace model ids for the frozen sentence-embedding encoders we ground with.

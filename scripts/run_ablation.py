@@ -38,27 +38,44 @@ def main() -> int:
     ap.add_argument("--num-experts", type=int, default=4)
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--lambda-ortho", type=float, default=0.5)
+    ap.add_argument("--signals", nargs="+", default=list(ablation.ROUTING_SIGNALS),
+                    help="routing arms to run (default: all six); e.g. --signals signature")
+    ap.add_argument("--out-dir", default=None,
+                    help="where to write/read result JSONs (default results/ablation)")
+    ap.add_argument("--limit-train-batches", type=float, default=None,
+                    help="cap train batches/epoch (int count, or float fraction in (0,1]) for big tasks")
+    ap.add_argument("--limit-val-batches", type=float, default=None,
+                    help="cap val batches/epoch for best-val monitoring (int count or fraction); TEST eval stays full")
     ap.add_argument("--no-test", action="store_true", help="skip the held-out test eval")
     ap.add_argument("--split", default="test", choices=["test", "val"], help="which split to tabulate")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    signals = tuple(args.signals)
     if args.list:
-        print(len(ablation.enumerate_configs(args.datasets, args.seeds)))
+        print(len(ablation.enumerate_configs(args.datasets, args.seeds, signals)))
         return 0
     if args.aggregate:
-        print(ablation.format_table(ablation.load_records(), split=args.split))
+        print(ablation.format_table(ablation.load_records(out_dir), split=args.split))
         return 0
     if args.index is None:
         print("pass --index N (run one config), --list, or --aggregate")
         return 2
 
     d_text = 64 if args.encoder == "hash" else 2560
+    ltb = args.limit_train_batches
+    if ltb is not None and ltb >= 1:
+        ltb = int(ltb)
+    lvb = args.limit_val_batches
+    if lvb is not None and lvb >= 1:
+        lvb = int(lvb)
     rec = ablation.run_config(
-        args.index, datasets=tuple(args.datasets), seeds=args.seeds, signals=ablation.ROUTING_SIGNALS,
+        args.index, datasets=tuple(args.datasets), seeds=args.seeds, signals=signals,
         encoder=args.encoder, d_text=d_text, max_epochs=args.epochs, batch_size=args.batch_size,
         num_workers=args.num_workers, seq_len=args.seq_len, num_experts=args.num_experts,
         k=args.k, lambda_ortho=args.lambda_ortho, test=not args.no_test,
+        out_dir=out_dir, limit_train_batches=ltb, limit_val_batches=lvb,
     )
     print({kk: rec.get(kk) for kk in ("dataset", "task", "signal", "seed", "task_type")})
     return 0

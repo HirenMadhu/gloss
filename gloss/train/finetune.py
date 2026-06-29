@@ -35,9 +35,13 @@ def _name_encoder(dataset: str, *, encoder: str = "hash", d_text: int = 64):
 
 
 def name_embeddings(bundle, dataset: str, *, encoder: str = "hash", d_text: int = 64):
-    """Frozen ``[C, d_text]`` column-name table for ``bundle`` (built once; cached for real encoders)."""
+    """Frozen ``[C, d_text]`` column-name table for ``bundle`` (built once; cached for real encoders).
+
+    Column names are embedded as instruction **queries** (``cache.QUERY_INSTRUCTION``): instruction-tuned
+    encoders (qwen / harrier) are trained to take a one-sentence task instruction on the *query* side, so
+    routing on a value-free schema representation needs it here (documents get no instruction)."""
     enc = _name_encoder(dataset, encoder=encoder, d_text=d_text)
-    return build_column_name_embeddings(bundle, enc)
+    return build_column_name_embeddings(bundle, enc, kind="query")
 
 
 def task_kind(task) -> str:
@@ -58,6 +62,34 @@ def target_stats(task) -> tuple[float, float]:
     y = task.get_table("train").df[task.target_col].to_numpy(dtype="float64")
     y = y[~np.isnan(y)]
     return float(y.mean()), float(max(y.std(), 1e-6))
+
+
+class _BestValState(pl.Callback):
+    """Keep the best-val model weights (in memory, on CPU — no disk checkpoint) and the val metrics at
+    that epoch, so a run reports / evaluates its best-val model rather than the last epoch."""
+
+    def __init__(self, monitor: str, mode: str):
+        self.monitor = monitor
+        self.mode = mode
+        self.best_score: float | None = None
+        self.best_state: dict | None = None
+        self.best_metrics: dict = {}
+
+    def on_validation_end(self, trainer, pl_module) -> None:
+        score = trainer.callback_metrics.get(self.monitor)
+        if score is None:
+            return
+        score = float(score)
+        if score != score:                       # NaN guard (e.g. single-class val subsample)
+            return
+        better = self.best_score is None or (
+            score > self.best_score if self.mode == "max" else score < self.best_score
+        )
+        if better:
+            self.best_score = score
+            self.best_state = {k: v.detach().cpu().clone() for k, v in pl_module.state_dict().items()}
+            self.best_metrics = {k: float(v) for k, v in trainer.callback_metrics.items()
+                                 if k.startswith("val/")}
 
 
 def train_prebuilt(
@@ -81,6 +113,8 @@ def train_prebuilt(
     num_workers: int = 0,
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
+    early_stop: bool = True,
+    patience: int = 3,
 ):
     """Train one run on a PREBUILT bundle + name table (the ablation reuses these across arms so the
     graph and the frozen name embeddings are built once)."""
@@ -97,18 +131,30 @@ def train_prebuilt(
     )
     dm = MoREDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
                         num_workers=num_workers)
+    # Best-val model selection: validate every epoch, keep the best-val weights in memory, and (optionally)
+    # early-stop on the primary metric. The held-out TEST eval (eval/test_eval.py) then scores the best-val
+    # model. No disk checkpoint — MoRELitModule.__init__ takes the (unserializable) bundle + name table.
+    monitor, mode = ("val/auroc", "max") if kind == "binary" else ("val/mae", "min")
+    best = _BestValState(monitor, mode)
+    callbacks: list = [best]
+    if early_stop:
+        callbacks.append(pl.callbacks.EarlyStopping(monitor=monitor, mode=mode, patience=patience,
+                                                    strict=False))
     trainer = pl.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices=1,
         logger=logger, enable_checkpointing=False, enable_model_summary=False,
-        enable_progress_bar=False, log_every_n_steps=20,
-        # we never early-stop or checkpoint on val, so validate only at the final epoch — the per-epoch
-        # full-val neighbor-sampling pass is the dominant cost. Final val + held-out TEST are unaffected.
-        check_val_every_n_epoch=max(int(max_epochs), 1),
+        enable_progress_bar=False, log_every_n_steps=20, callbacks=callbacks,
+        num_sanity_val_steps=0,
+        check_val_every_n_epoch=1,                 # best-val selection + early stopping need per-epoch val
         limit_train_batches=limit_train_batches or 1.0,
         limit_val_batches=limit_val_batches or 1.0,
     )
     trainer.fit(module, dm)
-    return module, {k: float(v) for k, v in trainer.callback_metrics.items()}
+    metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
+    if best.best_state is not None:
+        module.load_state_dict(best.best_state)      # restore best-val weights for downstream TEST eval
+        metrics.update(best.best_metrics)            # report best-val (not last-epoch) val metrics
+    return module, metrics
 
 
 def train(

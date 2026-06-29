@@ -91,6 +91,8 @@ def run_config(
     k: int = 2,
     out_dir: Path | None = None,
     test: bool = True,
+    limit_train_batches: float | int | None = None,
+    limit_val_batches: float | int | None = None,
 ) -> dict:
     """Train the single ``(dataset, task, signal, seed)`` config at ``index`` and persist its metrics.
 
@@ -117,6 +119,7 @@ def run_config(
         bundle, task, name_emb, model_kwargs=mk, route_on=c["signal"], lambda_ortho=lambda_ortho,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk, batch_size=batch_size,
         lr=lr, weight_decay=weight_decay, max_epochs=max_epochs, seed=c["seed"], num_workers=num_workers,
+        limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
     )
     rec = {**c, "task_type": task_kind(task)}
     rec.update({f"val_{kk.split('/')[-1]}": v for kk, v in metrics.items() if kk.startswith("val/")})
