@@ -13,7 +13,25 @@ data:
     seq_len: 512               # fixed cell-token cap per seed; rel-f1 max≈353 cells/seed -> 0% truncation
     max_fk: 5                  # max foreign-key neighbors per row (RT f2p_nbr width)
 
-# (MoRE adds `moe:` and `signature:` config blocks in Phase B/D.)
+# MoE FFN. `route_on` picks the router input (the load-bearing ablation axis); the S/C/P/H additions
+# are OFF by default so the base arm == plain RT + top-k MoE. `run_train.py` / `run_ablation.py` flags
+# override these.
+moe:
+  route_on: signature          # signature | hybrid(=signature+hidden) | hidden | value | identity | dense | dense_wide
+  d_sig: 128                   # relational-signature width (router input dim for signature/identity)
+  num_experts: 4
+  k: 2                         # top-k experts per token
+  lambda_ortho: 0.5            # router-orthogonality (+ HMoE level-1 balance) loss weight
+  placement: all               # all | upper_half
+  # --- ablation additions (default off) ---
+  use_shared: false            # S: always-on shared expert
+  cosine: false                # C: cosine/normalized router over learnable keys
+  tau: 0.3                     #    cosine temperature
+  top_p: null                  # P: adaptive expert count (keep smallest set reaching cumulative mass P)
+  hmoe: false                  # H: hierarchical two-level gate (uses HMoEFFN)
+  n_groups: 4                  #    HMoE: level-1 group count
+  experts_per_group: 2         #    HMoE: experts per group
+  k2: 1                        #    HMoE: within-group top-k2
 
 model:
   d_model: 256

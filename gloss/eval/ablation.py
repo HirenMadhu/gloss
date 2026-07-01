@@ -24,9 +24,29 @@ import statistics as stats
 from pathlib import Path
 
 ROUTING_SIGNALS = ("signature", "hidden", "value", "identity", "dense", "dense_wide")
+# Display order for the tables — the six canonical arms plus hybrid (=signature+hidden). Architecture-
+# addition variants (e.g. ``signature+S``) sort after these, alphabetically.
+ROUTER_DISPLAY = ("dense", "dense_wide", "signature", "hybrid", "hidden", "value", "identity")
 DEFAULT_DATASETS = ("rel-f1", "rel-stack", "rel-trial")
 RESULTS_ROOT = Path(__file__).resolve().parents[2] / "results"
 RESULTS = RESULTS_ROOT / "ablation"
+
+
+def variant_label(route_on: str, *, use_shared=False, cosine=False, top_p=None, hmoe=False) -> str:
+    """A stable arm label that distinguishes architecture-addition runs sharing one ``route_on``.
+
+    Base arms keep their bare name (``signature``, ``dense``, …); additions append S/C/P/H tags
+    (``signature+S``, ``signature+SCPH``) so the ablation runner can put several addition configs of the
+    *same* router in one out-dir without them colliding under a single ``route_on`` in ``aggregate``.
+    """
+    tags = "".join(t for t, on in
+                   (("S", use_shared), ("C", cosine), ("P", top_p is not None), ("H", hmoe)) if on)
+    return f"{route_on}+{tags}" if tags else route_on
+
+
+def _variant_of(rec: dict) -> str:
+    """The grouping label for a record — its ``variant`` if present, else the bare ``signal`` (back-compat)."""
+    return rec.get("variant") or rec["signal"]
 
 # primary (headline) metric per task type and its direction (RelBench metric key names).
 PRIMARY = {"binary": "roc_auc", "regression": "mae"}
@@ -89,6 +109,14 @@ def run_config(
     lambda_ortho: float = 0.5,
     num_experts: int = 4,
     k: int = 2,
+    use_shared: bool = False,
+    cosine: bool = False,
+    tau: float = 0.3,
+    top_p: float | None = None,
+    hmoe: bool = False,
+    n_groups: int = 4,
+    experts_per_group: int = 2,
+    k2: int = 1,
     out_dir: Path | None = None,
     test: bool = True,
     limit_train_batches: float | int | None = None,
@@ -103,25 +131,30 @@ def run_config(
 
     from ..data.graph import build_gloss_graph
     from ..train.finetune import name_embeddings, task_kind, train_prebuilt
+    from ..utils.paths import graph_cache_dir
 
     grid = build_grid(dataset_tasks(datasets), seeds, signals)
     if index >= len(grid):
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}
     c = grid[index]
-    graph_cache = str(RESULTS_ROOT.parent / "data" / "graph_cache" / c["dataset"])
+    graph_cache = str(graph_cache_dir(c["dataset"]))
     bundle = build_gloss_graph(c["dataset"], cache_dir=graph_cache)
     task = get_task(c["dataset"], c["task"], download=False)
     name_emb = name_embeddings(bundle, c["dataset"], encoder=encoder, d_text=d_text)
     mk = dict(model_kwargs or {})
-    mk.update(num_experts=num_experts, k=k)
+    mk.update(num_experts=num_experts, k=k, use_shared=use_shared, cosine=cosine, tau=tau, top_p=top_p,
+              hmoe=hmoe, n_groups=n_groups, experts_per_group=experts_per_group, k2=k2)
     module, metrics = train_prebuilt(
         bundle, task, name_emb, model_kwargs=mk, route_on=c["signal"], lambda_ortho=lambda_ortho,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk, batch_size=batch_size,
         lr=lr, weight_decay=weight_decay, max_epochs=max_epochs, seed=c["seed"], num_workers=num_workers,
         limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
     )
-    rec = {**c, "task_type": task_kind(task)}
+    # variant = router arm + S/C/P/H tags, so several addition configs of one router don't collide in a
+    # shared out-dir (dense/dense_wide carry no additions -> variant == signal).
+    variant = variant_label(c["signal"], use_shared=use_shared, cosine=cosine, top_p=top_p, hmoe=hmoe)
+    rec = {**c, "variant": variant, "task_type": task_kind(task)}
     rec.update({f"val_{kk.split('/')[-1]}": v for kk, v in metrics.items() if kk.startswith("val/")})
     if test:
         from .test_eval import evaluate_split
@@ -134,7 +167,9 @@ def run_config(
             rec["test_error"] = repr(exc)
     out_dir = out_dir or RESULTS
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{index:04d}.json").write_text(json.dumps(rec))
+    # variant in the filename so several addition configs of one router (same grid index) can share an
+    # out-dir without colliding — the additions study puts base + S/C/P/H runs in one directory.
+    (out_dir / f"{index:04d}_{variant}.json").write_text(json.dumps(rec))
     return rec
 
 
@@ -151,10 +186,13 @@ def _agg(rows: list[dict], key: str) -> tuple[float, float, float, int]:
 
 
 def aggregate(records: list[dict], keys: tuple[str, ...]) -> dict[tuple, dict]:
-    """-> ``{(dataset, task, signal): {metric: (mean, std, ci, n)}}`` for each metric in ``keys``."""
+    """-> ``{(dataset, task, variant): {metric: (mean, std, ci, n)}}`` for each metric in ``keys``.
+
+    Groups by the arm ``variant`` (router + S/C/P/H tags) so architecture-addition runs are kept distinct;
+    records without a ``variant`` fall back to their bare ``signal`` (back-compat)."""
     groups: dict[tuple, list[dict]] = {}
     for r in records:
-        groups.setdefault((r["dataset"], r["task"], r["signal"]), []).append(r)
+        groups.setdefault((r["dataset"], r["task"], _variant_of(r)), []).append(r)
     return {gk: {key: _agg(rows, key) for key in keys} for gk, rows in groups.items()}
 
 
@@ -163,15 +201,23 @@ def load_records(out_dir: Path | None = None) -> list[dict]:
     return [json.loads(p.read_text()) for p in sorted(out_dir.glob("*.json"))]
 
 
-def format_table(records: list[dict], *, split: str = "test") -> str:
-    """Per-``(dataset, task)`` table of the primary metric (seed mean ± 95% CI), lift of each arm vs dense."""
+def _variant_sort_key(variant: str):
+    """Canonical router arms first (ROUTER_DISPLAY order), then addition variants alphabetically."""
+    return (ROUTER_DISPLAY.index(variant) if variant in ROUTER_DISPLAY else len(ROUTER_DISPLAY), variant)
+
+
+def format_table(records: list[dict], *, split: str = "test", baseline: str = "dense") -> str:
+    """Per-``(dataset, task)`` table of the primary metric (seed mean ± 95% CI), each arm's lift over the
+    ``baseline`` arm. Rows are the arm ``variant``s present (router + S/C/P/H tags). ``baseline`` is the
+    reference variant for the Δ column (``dense`` for the routing study; a base router for the additions
+    study, e.g. ``signature`` or ``hybrid``)."""
     if not records:
         return "(no records)"
     info: dict[tuple, dict] = {}
     for r in records:
         dt = (r["dataset"], r["task"])
-        info.setdefault(dt, {"type": r.get("task_type", "binary"), "signals": set()})
-        info[dt]["signals"].add(r["signal"])
+        info.setdefault(dt, {"type": r.get("task_type", "binary"), "variants": set()})
+        info[dt]["variants"].add(_variant_of(r))
     lines = [f"{len(records)} runs collected.", ""]
     for dt in sorted(info):
         ds, task = dt
@@ -180,14 +226,15 @@ def format_table(records: list[dict], *, split: str = "test") -> str:
         key = f"{split}_{metric}"
         lower = metric in LOWER_BETTER
         agg = aggregate([r for r in records if (r["dataset"], r["task"]) == dt], keys=(key,))
-        dense = agg.get((ds, task, "dense"), {}).get(key, (float("nan"),))[0]
+        base = agg.get((ds, task, baseline), {}).get(key, (float("nan"),))[0]
         lines.append(f"=== {ds} / {task}  ({ttype}; {split} {metric} {'↓' if lower else '↑'}) ===")
-        for sig in ROUTING_SIGNALS:
-            gk = (ds, task, sig)
+        width = max((len(v) for v in info[dt]["variants"]), default=11)
+        for variant in sorted(info[dt]["variants"], key=_variant_sort_key):
+            gk = (ds, task, variant)
             if gk not in agg:
                 continue
             m, _sd, ci, n = agg[gk][key]
-            lift = (dense - m) if lower else (m - dense)        # positive lift = better than dense
-            lines.append(f"  {sig:11s} {m:9.4f} ± {ci:.4f} (n={n})   Δvs dense={lift:+.4f}")
+            lift = (base - m) if lower else (m - base)          # positive lift = better than baseline
+            lines.append(f"  {variant:{width}s} {m:9.4f} ± {ci:.4f} (n={n})   Δvs {baseline}={lift:+.4f}")
         lines.append("")
     return "\n".join(lines)

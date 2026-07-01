@@ -44,16 +44,47 @@ def expert_usage(model, cell_batches) -> tuple[torch.Tensor, float]:
 @torch.no_grad()
 def specialization_probe(model) -> dict[int, int]:
     """-> ``{column_id: expert}``: the argmax expert each column routes to under the first MoE block's
-    router, at recency bin 0 (signature arm only; ``{}`` otherwise). Cluster columns by value to see
-    cross-table semantic groups."""
+    router, at recency bin 0 (**signature arm only**; ``{}`` otherwise). Cluster columns by value to see
+    cross-table semantic groups. Uses the MoE's own ``_logits`` so cosine and linear routers both work."""
+    if getattr(model, "route_on", None) != "signature":      # hybrid/hidden route depend on h -> ill-defined here
+        return {}
     sig = getattr(model, "signature", None)
     if sig is None:
         return {}
-    router = next((m.router for m in model.substrate.modules() if isinstance(m, MoEFFN)), None)
-    if router is None:
+    moe = next((m for m in model.substrate.modules() if isinstance(m, MoEFFN)), None)
+    if moe is None:
         return {}
     C = int(sig.name_emb.shape[0])
     rec = torch.zeros(C, dtype=torch.long, device=sig.name_emb.device)
     z = sig.norm(sig.schema_proj(sig.name_emb) + sig.stype_emb(sig.modality_id) + sig.recency_emb(rec))
-    expert = router(z).argmax(dim=-1)                         # [C]
+    expert = moe._logits(z).argmax(dim=-1)                    # [C]
     return {i: int(expert[i]) for i in range(C)}
+
+
+@torch.no_grad()
+def mean_active_experts(model, cell_batches) -> float:
+    """Mean number of experts with nonzero gate per token over ``cell_batches`` — the Top-P k̄ efficiency
+    lever (constant ``k`` for top-k arms). Hooks every ``MoEFFN``; returns ``nan`` for dense models."""
+    moes = [m for m in model.modules() if isinstance(m, MoEFFN)]
+    if not moes:
+        return float("nan")
+    tot = torch.zeros(())
+    cnt = torch.zeros(())
+
+    def hook(_mod, _inp, out):
+        _y, g = out
+        nz = (g > 0).sum(-1).float()                          # active experts per token
+        tot.add_(nz.sum().cpu())
+        cnt.add_(float(nz.numel()))
+
+    handles = [m.register_forward_hook(hook) for m in moes]
+    was_training = model.training
+    model.eval()
+    try:
+        for cb in cell_batches:
+            model(cb)
+    finally:
+        for h in handles:
+            h.remove()
+        model.train(was_training)
+    return float(tot / cnt) if float(cnt) > 0 else float("nan")

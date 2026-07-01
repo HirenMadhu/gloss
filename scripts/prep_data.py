@@ -21,8 +21,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-REPO = Path(__file__).resolve().parents[1]
-
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -39,6 +37,7 @@ def main() -> int:
     from gloss.eval.ablation import entity_tasks
     from gloss.text.cache import EmbeddingCache, HashEncoder, QwenEncoder, make_text_encoder
     from gloss.text.schema import build_column_name_embeddings
+    from gloss.utils.paths import graph_cache_dir, schema_cache_path
 
     # Build the (expensive) frozen encoder ONCE and reuse it across datasets; the underlying model loads
     # lazily on first use. Per-dataset cache files mirror finetune._name_encoder's path so the ablation
@@ -59,10 +58,10 @@ def main() -> int:
             for split in ("train", "val", "test"):
                 task.get_table(split)
             print(f"  [{ds}/{name}] task tables ready", flush=True)
-        cache_dir = str(REPO / "data" / "graph_cache" / ds)
+        cache_dir = str(graph_cache_dir(ds))
         bundle = build_gloss_graph(ds, cache_dir=cache_dir)
         print(f"  [{ds}] graph cache -> {cache_dir}", flush=True)
-        cache_path = REPO / "data" / "schema_cache" / ds / f"name_emb_{safe}.pt"
+        cache_path = schema_cache_path(ds, safe)
         enc = EmbeddingCache(base_encoder, cache_path)
         emb = build_column_name_embeddings(bundle, enc, kind="query")
         print(f"[{ds}] schema cache: name_emb {tuple(emb.shape)} -> {cache_path} "

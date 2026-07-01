@@ -31,6 +31,10 @@ def _model_kwargs(cfg, args) -> dict:
         enc_channels=int(m.get("enc_channels", int(m.d_model))),
         d_sig=int(args.d_sig), num_experts=int(args.num_experts), k=int(args.k),
         moe_placement=args.moe_placement,
+        # ablation additions (default off = base top-k MoE)
+        use_shared=args.use_shared, cosine=args.cosine, tau=float(args.tau), top_p=args.top_p,
+        hmoe=args.hmoe, n_groups=int(args.n_groups), experts_per_group=int(args.experts_per_group),
+        k2=int(args.k2),
     )
 
 
@@ -42,8 +46,8 @@ def main() -> int:
     ap.add_argument("--encoder", default="hash", choices=["qwen", "hash"],
                     help="frozen encoder for the column-name table (hash=dev, qwen=real)")
     ap.add_argument("--route-on", default="dense",
-                    choices=["signature", "hidden", "value", "identity", "dense", "dense_wide"],
-                    help="MoE routing arm (dense = plain RT)")
+                    choices=["signature", "hybrid", "hidden", "value", "identity", "dense", "dense_wide"],
+                    help="MoE routing arm (dense = plain RT; hybrid = signature+hidden)")
     ap.add_argument("--dataset", default=None, help="override config data.dataset")
     ap.add_argument("--task", default=None, help="override config data.task")
     ap.add_argument("--num-experts", type=int, default=4)
@@ -51,6 +55,15 @@ def main() -> int:
     ap.add_argument("--d-sig", type=int, default=128)
     ap.add_argument("--lambda-ortho", type=float, default=0.5)
     ap.add_argument("--moe-placement", default="all", choices=["all", "upper_half"])
+    # ablation additions (S/C/P/H); all off by default
+    ap.add_argument("--use-shared", action="store_true", help="S: always-on shared expert")
+    ap.add_argument("--cosine", action="store_true", help="C: cosine/normalized router over learnable keys")
+    ap.add_argument("--tau", type=float, default=0.3, help="cosine router temperature")
+    ap.add_argument("--top-p", type=float, default=None, help="P: adaptive expert count (cumulative mass)")
+    ap.add_argument("--hmoe", action="store_true", help="H: hierarchical two-level gate (HMoEFFN)")
+    ap.add_argument("--n-groups", type=int, default=4, help="HMoE level-1 group count")
+    ap.add_argument("--experts-per-group", type=int, default=2, help="HMoE experts per group")
+    ap.add_argument("--k2", type=int, default=1, help="HMoE within-group top-k2")
     ap.add_argument("--test", action="store_true", help="also score the held-out RelBench test split")
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--epochs", type=int, default=None)

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..data.collate import CellBatch
-from .moe import MoEFFN, SwiGLU
+from .moe import HMoEFFN, MoEFFN, SwiGLU
 
 REL_ORDER = ("col", "feat", "nbr", "full")
 
@@ -83,8 +83,10 @@ class RelationalBlock(nn.Module):
     """col→feat→nbr→full masked attention + an FFN (SwiGLU, or a MoE FFN when ``moe``).
 
     A MoE block returns the router-orthogonality loss as its second output; a dense block returns 0.
-    ``route_on`` selects what the router reads: ``signature`` (``z``), ``hidden`` (the block's own
-    normed hidden), ``value`` (the cell's value component), or ``identity`` (a learned per-column id).
+    ``route_on`` selects what the router reads: ``signature`` (``z``), ``hybrid`` (``[z ; h]``, i.e.
+    signature+hidden), ``hidden`` (the block's own normed hidden), ``value`` (the cell's value component),
+    or ``identity`` (a learned per-column id). The MoE FFN is a flat :class:`MoEFFN` (top-k, optional
+    shared/cosine/top-p additions) unless ``hmoe`` selects the hierarchical :class:`HMoEFFN`.
     """
 
     def __init__(
@@ -98,18 +100,32 @@ class RelationalBlock(nn.Module):
         num_experts: int = 4,
         k: int = 2,
         route_on: str = "dense",
+        use_shared: bool = False,
+        cosine: bool = False,
+        tau: float = 0.3,
+        top_p: float | None = None,
+        hmoe: bool = False,
+        n_groups: int = 4,
+        experts_per_group: int = 2,
+        k2: int = 1,
     ):
         super().__init__()
         self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model) for l in (*REL_ORDER, "ffn")})
         self.attns = nn.ModuleDict({l: MaskedAttention(d_model, num_heads) for l in REL_ORDER})
         self.moe = moe
         self.route_on = route_on
-        if moe:
-            self.ffn = MoEFFN(d_model, d_ff, int(d_route), num_experts=num_experts, k=k)
+        if moe and hmoe:
+            self.ffn = HMoEFFN(d_model, d_ff, int(d_route), n_groups=n_groups,
+                               experts_per_group=experts_per_group, k2=k2)
+        elif moe:
+            self.ffn = MoEFFN(d_model, d_ff, int(d_route), num_experts=num_experts, k=k,
+                              use_shared=use_shared, cosine=cosine, tau=tau, top_p=top_p)
         else:
             self.ffn = SwiGLU(d_model, d_ff)
 
     def _route_feat(self, h, z, value_feat, id_emb):
+        if self.route_on == "hybrid":
+            return torch.cat([z, h], dim=-1)                     # [B, S, d_sig + d_model]
         return {"signature": z, "hidden": h, "value": value_feat, "identity": id_emb}[self.route_on]
 
     def forward(self, x, masks, *, z=None, value_feat=None, id_emb=None):
@@ -143,11 +159,24 @@ class RTSubstrate(nn.Module):
         num_experts: int = 4,
         k: int = 2,
         moe_placement: str = "all",
+        use_shared: bool = False,
+        cosine: bool = False,
+        tau: float = 0.3,
+        top_p: float | None = None,
+        hmoe: bool = False,
+        n_groups: int = 4,
+        experts_per_group: int = 2,
+        k2: int = 1,
     ):
         super().__init__()
         d_ff = d_ff or 4 * d_model
         is_moe_arm = route_on not in ("dense", "dense_wide")
-        d_route = d_sig if route_on in ("signature", "identity") else d_model
+        if route_on in ("signature", "identity"):
+            d_route = d_sig
+        elif route_on == "hybrid":
+            d_route = d_sig + d_model                            # [z ; h]; not pre-computable (accepted)
+        else:                                                    # hidden, value
+            d_route = d_model
         moe_idx = self._placement(n_blocks, moe_placement) if is_moe_arm else set()
         blocks = []
         for i in range(n_blocks):
@@ -157,6 +186,8 @@ class RTSubstrate(nn.Module):
                 d_model, n_heads, d_ff if block_is_moe else block_d_ff,
                 moe=block_is_moe, d_route=d_route, num_experts=num_experts, k=k,
                 route_on=route_on if block_is_moe else "dense",
+                use_shared=use_shared, cosine=cosine, tau=tau, top_p=top_p,
+                hmoe=hmoe, n_groups=n_groups, experts_per_group=experts_per_group, k2=k2,
             ))
         self.blocks = nn.ModuleList(blocks)
         self.norm_out = nn.RMSNorm(d_model)

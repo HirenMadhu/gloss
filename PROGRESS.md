@@ -107,3 +107,47 @@ full headline = signature vs {value, dense, identity} across all entity tasks of
 reported on TEST — runs on SLURM once rel-stack is downloaded and the schema cache is built.
 
 **Remaining.** Phase E doc-sync: `CLAUDE.md` still describes DOC-RT and should be rewritten to MoRE.
+
+---
+
+**Ablation Suite v2 ([moe_ablation.md](moe_ablation.md)) — env bootstrap + hybrid + S/C/P/H [done].**
+Extends the MoE along two independent axes on top of the routing-signal ablation.
+
+*New cluster bootstrap.* Rebuilt `.venv` (uv, py3.12) with **torch 2.8.0+cu128** from the pytorch cu128
+index and the pyg extensions from `data.pyg.org/whl/torch-2.8.0+cu128.html` (a plain resolve pulls CPU
+torch); verified CUDA on the interactive **H200** (driver 580, covers Hopper + Blackwell). Moved all caches
+to a dedicated scratch subtree `~/scratch60/gloss/{hf,relbench,graph_cache,schema_cache}`
+([scripts/env.sh](scripts/env.sh)) via new [gloss/utils/paths.py](gloss/utils/paths.py)
+(`graph_cache_dir`/`schema_cache_path`, env-driven with repo-relative fallback), routed through
+`prep_data.py`, `ablation.run_config`, and `finetune._name_encoder`. Fixed the SLURM scripts for this
+cluster (`--partition=gpu_h200 --gpus=h200:1`; no h100 exists here; array throttle `%16`).
+
+*Router-input axis.* Added the **`hybrid`** arm (= **signature+hidden**, `route_feat = [z ; h]`,
+`d_route = d_sig + d_model`): `RTSubstrate` computes the hybrid width and `RelationalBlock._route_feat`
+concatenates; `MoRE` builds the signature for `signature` **and** `hybrid`; `"hybrid"` added to `ROUTE_ONS`.
+
+*Architecture additions (all off by default = base top-k MoE).* [model/moe.py](gloss/model/moe.py):
+`MoEFFN` gains **S** (`use_shared`, an always-on shared expert added as a residual), **C** (`cosine`/`tau`,
+cosine-normalized logits over learnable `keys`; `ortho_loss` then decorrelates the keys), **P** (`top_p`,
+adaptive support = smallest set reaching cumulative mass P); new **`HMoEFFN`** (**H**) two-level gate
+(learned group gate → per-group top-`k2`, dense combine; balance = level-1 gate-row orthogonality + a
+`log Γ − H(occupancy)` collapse penalty). Threaded `use_shared/cosine/tau/top_p/hmoe/n_groups/
+experts_per_group/k2` through `RTSubstrate → RelationalBlock`, `MoRE`, `configs/default.yaml` (`moe:`
+block), and both CLIs.
+
+*Two decoupled studies.* The additions are **run-level** model_kwargs, not grid axes. `run_config` now
+writes an auto-derived **`variant`** label (router + S/C/P/H tags, e.g. `signature+SCPH`) and puts it in the
+JSON **filename**, so a base router and its addition configs can share one out-dir without colliding.
+`aggregate` groups by `variant` (falls back to `signal` — back-compat); `format_table` orders by a canonical
+`ROUTER_DISPLAY` (dense/dense_wide/signature/hybrid/…) then addition variants, with a **configurable
+`--baseline`** for the Δ column (`dense` for the routing study; a base router for the additions study).
+Study A = routing methods (focus **signature vs hybrid**; signature base already run); Study B = S/C/P/H on
+the signature/hybrid bases. Transfer (Tier 1b) stays deferred.
+
+*Diagnostics.* `specialization_probe` uses the MoE's own `_logits` (cosine-safe) and is guarded to the
+signature arm; added `mean_active_experts` (Top-P k̄).
+
+DoD: `pytest` **65 passed, 2 skipped** (new: shared/cosine/top-p in `test_moe.py`, `test_hmoe.py`, hybrid
+grad-flow + additions forward in `test_shapes.py`; `test_ablation` green via the `variant` fallback). Hash-
+encoder smokes on the H200 trained the `hybrid` arm and S/H additions and produced a per-variant aggregate
+table with Δ vs a chosen baseline. Real runs use the **harrier** schema cache (one-time prep) on `gpu_h200`.

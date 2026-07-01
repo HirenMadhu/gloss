@@ -5,17 +5,14 @@ Builds the frozen schema-name table (``gloss.text.schema``) once and trains the 
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytorch_lightning as pl
 
 from ..data.graph import build_gloss_graph
 from ..text.cache import EmbeddingCache, HashEncoder, QwenEncoder, make_text_encoder
 from ..text.schema import build_column_name_embeddings
+from ..utils.paths import schema_cache_path
 from .datamodule import MoREDataModule
 from .loop import MoRELitModule
-
-REPO = Path(__file__).resolve().parents[2]
 
 
 def _name_encoder(dataset: str, *, encoder: str = "hash", d_text: int = 64):
@@ -28,7 +25,7 @@ def _name_encoder(dataset: str, *, encoder: str = "hash", d_text: int = 64):
     if encoder == "hash":
         return HashEncoder(dim=d_text)
     safe = encoder.replace("/", "__")
-    cache_path = REPO / "data" / "schema_cache" / dataset / f"name_emb_{safe}.pt"
+    cache_path = schema_cache_path(dataset, safe)
     if encoder == "qwen":
         return EmbeddingCache(QwenEncoder("Qwen/Qwen3-Embedding-4B"), cache_path)
     return EmbeddingCache(make_text_encoder(encoder), cache_path)

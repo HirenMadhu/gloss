@@ -39,7 +39,19 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--lambda-ortho", type=float, default=0.5)
     ap.add_argument("--signals", nargs="+", default=list(ablation.ROUTING_SIGNALS),
-                    help="routing arms to run (default: all six); e.g. --signals signature")
+                    help="routing arms to run (default: all six); e.g. --signals signature hybrid")
+    # architecture additions (S/C/P/H) — a whole array run carries one addition config into its out-dir;
+    # the variant label (router + tags) keeps it distinct in --aggregate.
+    ap.add_argument("--use-shared", action="store_true", help="S: always-on shared expert")
+    ap.add_argument("--cosine", action="store_true", help="C: cosine/normalized router over learnable keys")
+    ap.add_argument("--tau", type=float, default=0.3, help="cosine router temperature")
+    ap.add_argument("--top-p", type=float, default=None, help="P: adaptive expert count (cumulative mass)")
+    ap.add_argument("--hmoe", action="store_true", help="H: hierarchical two-level gate (HMoEFFN)")
+    ap.add_argument("--n-groups", type=int, default=4, help="HMoE level-1 group count")
+    ap.add_argument("--experts-per-group", type=int, default=2, help="HMoE experts per group")
+    ap.add_argument("--k2", type=int, default=1, help="HMoE within-group top-k2")
+    ap.add_argument("--baseline", default="dense",
+                    help="reference arm for the Δ column in --aggregate (e.g. dense | signature | hybrid)")
     ap.add_argument("--out-dir", default=None,
                     help="where to write/read result JSONs (default results/ablation)")
     ap.add_argument("--limit-train-batches", type=float, default=None,
@@ -57,7 +69,8 @@ def main() -> int:
         print(len(ablation.enumerate_configs(args.datasets, args.seeds, signals)))
         return 0
     if args.aggregate:
-        print(ablation.format_table(ablation.load_records(out_dir), split=args.split))
+        print(ablation.format_table(ablation.load_records(out_dir), split=args.split,
+                                    baseline=args.baseline))
         return 0
     if args.index is None:
         print("pass --index N (run one config), --list, or --aggregate")
@@ -75,9 +88,11 @@ def main() -> int:
         encoder=args.encoder, d_text=d_text, max_epochs=args.epochs, batch_size=args.batch_size,
         num_workers=args.num_workers, seq_len=args.seq_len, num_experts=args.num_experts,
         k=args.k, lambda_ortho=args.lambda_ortho, test=not args.no_test,
+        use_shared=args.use_shared, cosine=args.cosine, tau=args.tau, top_p=args.top_p,
+        hmoe=args.hmoe, n_groups=args.n_groups, experts_per_group=args.experts_per_group, k2=args.k2,
         out_dir=out_dir, limit_train_batches=ltb, limit_val_batches=lvb,
     )
-    print({kk: rec.get(kk) for kk in ("dataset", "task", "signal", "seed", "task_type")})
+    print({kk: rec.get(kk) for kk in ("dataset", "task", "signal", "variant", "seed", "task_type")})
     return 0
 
 
