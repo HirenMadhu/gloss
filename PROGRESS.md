@@ -199,3 +199,17 @@ DoD: `pytest` **88 passed, 1 skipped** (7 new in `test_setjoin_model.py`: hermet
 SetEncoder permutation-invariance + empty-set/seed-conditioning; rel-f1 full-model forward/grads/budget,
 end-to-end set permutation invariance, empty-set + missing-marker liveness). `run_setjoin.py --dry-run`:
 forward OK on rel-f1 CPU, logits (8,1) finite, aux=0, **0.91M params** (hash encoder).
+
+## Phase S3 — SetJoin training + eval
+
+`gloss/setjoin/train.py`: `SetJoinLitModule` — three-line fork of `MoRELitModule` (SetJoin model,
+`to_join_batch` in transfer_batch_to_device, no aux term); identical val metric names / regression
+z-scoring / nan-grad guard, so `_BestValState` + `EarlyStopping` work unchanged.
+`train_prebuilt_setjoin` mirrors `finetune.train_prebuilt` with `setjoin_neighbors(bundle, fanout)` as
+the sampler fanout and reuses `MoREDataModule` untouched. `gloss/setjoin/eval.py`:
+`predict_split`/`evaluate_split` fork of test_eval.py aligning via the JoinBatch-carried per-seed
+`input_id`.
+
+DoD: `pytest` **92 passed, 1 skipped** (4 new in `test_setjoin_train.py`: overfit-one-batch binary +
+regression, end-to-end grad flow, standardization round-trip). CPU micro-trains complete with TEST eval:
+driver-dnf (binary) and driver-position (regression), 2 epochs × 20 batches, hash encoder.
