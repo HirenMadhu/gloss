@@ -72,6 +72,15 @@ class MoRELitModule(pl.LightningModule):
         self.log("train/loss", loss, prog_bar=True, batch_size=int(cb.num_seeds))
         return loss
 
+    def on_before_optimizer_step(self, optimizer):
+        # Zero any non-finite gradient so an occasional NaN/inf can't poison the weights (the step just
+        # skips those params). Some arms — notably HMoE with hidden routing — produce NaN grads while the
+        # forward stays finite, which gradient clipping can't fix (clipping a NaN grad stays NaN). A no-op
+        # when all grads are finite. If an arm needs this constantly, its numbers reflect an unstable arm.
+        for p in self.parameters():
+            if p.grad is not None:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
     def validation_step(self, cb, _idx):
         out = self(cb)
         m = cb.has_target

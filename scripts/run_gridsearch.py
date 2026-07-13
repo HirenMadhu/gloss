@@ -86,6 +86,11 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) ->
         print(f"index {index} >= grid size {len(J)}; nothing to do")
         return {}
     ci, cfg, ds, tk, seed = J[index]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done_path = out_dir / f"{index:05d}.json"
+    if done_path.exists():                       # idempotent resume: skip already-finished configs
+        print(f"index {index} already done ({done_path.name}); skip")
+        return {}
     graph_cache = str(REPO / "data" / "graph_cache" / ds)
     bundle = build_gloss_graph(ds, cache_dir=graph_cache)
     task = get_task(ds, tk, download=False)

@@ -27,6 +27,51 @@ MP_PAD, MP_SELF, MP_MULTIHOP = 0, 1, 2
 FK_NONE = 0  # fk_role_id for self / non-adjacent / >1-hop pairs
 
 
+def _patch_multiembedding_offset() -> None:
+    """Repair a ``MultiEmbeddingTensor`` whose leading ``offset`` is non-zero before torch_frame's
+    ``validate`` asserts ``offset[0]==0`` and crashes the batch.
+
+    With ``num_workers>0`` (DataLoader IPC), rel-event embedding columns occasionally come back from a
+    worker with the column ``offset`` shifted by a constant while the ``values`` buffer is intact — a
+    serialization/view artifact (``num_workers=0`` never triggers it; the stored TensorFrames are clean).
+    Column ``j``'s embedding is ``values[:, offset[j]:offset[j+1]]``, so subtracting ``offset[0]`` and
+    keeping the referenced value-columns is **content-preserving**: per-column embeddings are byte-identical.
+    It is a strict **no-op** when ``offset[0]==0`` (every normal batch), so it can only turn a crash into
+    the correct result — never change a batch that already succeeds. Genuinely corrupt METs (values shorter
+    than the offsets reference) fall through to the original assertion instead of being silently repaired.
+    Forked DataLoader workers inherit this patch (applied at import, before any loader is built)."""
+    try:
+        from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor as _MET
+    except Exception:
+        return
+    if getattr(_MET, "_gloss_offset_patch", False):
+        return
+    _orig_validate = _MET.validate
+
+    def _validate(self):
+        # Column j's embedding is values[:, offset[j]:offset[j+1]]; the per-column dims (offset diffs) and
+        # the values buffer are intact, only offset's base is shifted by k. Rebasing offset by k restores
+        # offset[0]==0 content-preservingly. Two observed value layouts (T = true total dim = offset[-1]-k):
+        #   * values width == T      : buffer already correct, just rebase offset (the common rel-event case)
+        #   * values width == k + T  : k orphan leading value-columns, drop them then rebase
+        # Any other width is genuinely inconsistent -> fall through to the original assertion (no silent fix).
+        off = self.offset
+        if off is not None and off.numel() >= 2 and int(off[0]) != 0:
+            k = int(off[0]); T = int(off[-1]) - k; w = int(self.values.shape[1])
+            if w == k + T:
+                object.__setattr__(self, "values", self.values[:, k:])
+                object.__setattr__(self, "offset", off - k)
+            elif w == T:
+                object.__setattr__(self, "offset", off - k)
+        return _orig_validate(self)
+
+    _MET.validate = _validate
+    _MET._gloss_offset_patch = True
+
+
+_patch_multiembedding_offset()
+
+
 def canonical_relation(rel: str) -> str:
     """Map a PyG relation name to its undirected FK identity (the fkey column).
 

@@ -28,6 +28,13 @@ ROUTING_SIGNALS = ("signature", "hidden", "value", "identity", "dense", "dense_w
 # addition variants (e.g. ``signature+S``) sort after these, alphabetically.
 ROUTER_DISPLAY = ("dense", "dense_wide", "signature", "hybrid", "hidden", "value", "identity")
 DEFAULT_DATASETS = ("rel-f1", "rel-stack", "rel-trial")
+# The 9 entity tasks RT (from scratch) / GelGT report on the RelBench leaderboard (the only ones with an
+# external baseline to compare against). `--tasks leaderboard` restricts a run to these.
+LEADERBOARD_TASKS = {
+    "rel-f1": ("driver-dnf", "driver-top3", "driver-position"),
+    "rel-trial": ("study-outcome", "study-adverse", "site-success"),
+    "rel-event": ("user-repeat", "user-ignore", "user-attendance"),
+}
 RESULTS_ROOT = Path(__file__).resolve().parents[2] / "results"
 RESULTS = RESULTS_ROOT / "ablation"
 
@@ -70,8 +77,15 @@ def entity_tasks(dataset: str) -> list[str]:
     return out
 
 
-def dataset_tasks(datasets) -> dict[str, list[str]]:
-    return {ds: entity_tasks(ds) for ds in datasets}
+def dataset_tasks(datasets, tasks=None) -> dict[str, list[str]]:
+    """Entity tasks per dataset (sorted). ``tasks`` optionally filters: a list of task names to keep, or
+    the literal ``["leaderboard"]`` to keep only the RT-reported leaderboard tasks (``LEADERBOARD_TASKS``).
+    Filtering preserves ``entity_tasks`` order so the grid index stays stable."""
+    if tasks and list(tasks) == ["leaderboard"]:
+        keep_by_ds = {ds: set(LEADERBOARD_TASKS.get(ds, ())) for ds in datasets}
+        return {ds: [t for t in entity_tasks(ds) if t in keep_by_ds[ds]] for ds in datasets}
+    keep = set(tasks) if tasks else None
+    return {ds: [t for t in entity_tasks(ds) if keep is None or t in keep] for ds in datasets}
 
 
 def build_grid(dataset_tasks_map: dict, seeds: int, signals=ROUTING_SIGNALS) -> list[dict]:
@@ -85,8 +99,8 @@ def build_grid(dataset_tasks_map: dict, seeds: int, signals=ROUTING_SIGNALS) -> 
     ]
 
 
-def enumerate_configs(datasets, seeds: int, signals=ROUTING_SIGNALS) -> list[dict]:
-    return build_grid(dataset_tasks(datasets), seeds, signals)
+def enumerate_configs(datasets, seeds: int, signals=ROUTING_SIGNALS, tasks=None) -> list[dict]:
+    return build_grid(dataset_tasks(datasets, tasks), seeds, signals)
 
 
 def run_config(
@@ -95,6 +109,7 @@ def run_config(
     datasets=DEFAULT_DATASETS,
     seeds: int,
     signals=ROUTING_SIGNALS,
+    tasks=None,
     encoder: str = "qwen",
     d_text: int = 2560,
     model_kwargs: dict | None = None,
@@ -133,7 +148,7 @@ def run_config(
     from ..train.finetune import name_embeddings, task_kind, train_prebuilt
     from ..utils.paths import graph_cache_dir
 
-    grid = build_grid(dataset_tasks(datasets), seeds, signals)
+    grid = build_grid(dataset_tasks(datasets, tasks), seeds, signals)
     if index >= len(grid):
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}

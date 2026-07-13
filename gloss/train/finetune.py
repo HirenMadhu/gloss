@@ -142,6 +142,8 @@ def train_prebuilt(
         logger=logger, enable_checkpointing=False, enable_model_summary=False,
         enable_progress_bar=False, log_every_n_steps=20, callbacks=callbacks,
         num_sanity_val_steps=0,
+        gradient_clip_val=1.0,                     # stabilizes training (hidden-router + HMoE explodes to
+                                                   # NaN without it); a no-op for arms whose grads stay < 1
         check_val_every_n_epoch=1,                 # best-val selection + early stopping need per-epoch val
         limit_train_batches=limit_train_batches or 1.0,
         limit_val_batches=limit_val_batches or 1.0,

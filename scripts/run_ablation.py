@@ -40,6 +40,9 @@ def main() -> int:
     ap.add_argument("--lambda-ortho", type=float, default=0.5)
     ap.add_argument("--signals", nargs="+", default=list(ablation.ROUTING_SIGNALS),
                     help="routing arms to run (default: all six); e.g. --signals signature hybrid")
+    ap.add_argument("--tasks", nargs="+", default=None,
+                    help="restrict to these entity task names, or 'leaderboard' for the 9 RT-reported tasks "
+                         "(default: all entity tasks of each dataset)")
     # architecture additions (S/C/P/H) — a whole array run carries one addition config into its out-dir;
     # the variant label (router + tags) keeps it distinct in --aggregate.
     ap.add_argument("--use-shared", action="store_true", help="S: always-on shared expert")
@@ -66,7 +69,7 @@ def main() -> int:
     out_dir = Path(args.out_dir) if args.out_dir else None
     signals = tuple(args.signals)
     if args.list:
-        print(len(ablation.enumerate_configs(args.datasets, args.seeds, signals)))
+        print(len(ablation.enumerate_configs(args.datasets, args.seeds, signals, tasks=args.tasks)))
         return 0
     if args.aggregate:
         print(ablation.format_table(ablation.load_records(out_dir), split=args.split,
@@ -84,7 +87,7 @@ def main() -> int:
     if lvb is not None and lvb >= 1:
         lvb = int(lvb)
     rec = ablation.run_config(
-        args.index, datasets=tuple(args.datasets), seeds=args.seeds, signals=signals,
+        args.index, datasets=tuple(args.datasets), seeds=args.seeds, signals=signals, tasks=args.tasks,
         encoder=args.encoder, d_text=d_text, max_epochs=args.epochs, batch_size=args.batch_size,
         num_workers=args.num_workers, seq_len=args.seq_len, num_experts=args.num_experts,
         k=args.k, lambda_ortho=args.lambda_ortho, test=not args.no_test,
