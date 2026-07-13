@@ -1,0 +1,141 @@
+"""SetJoin model contracts.
+
+Hermetic tests exercise the sub-modules on raw tensors (no CellEncoder — the repo's synthetic fixtures
+carry no pytorch-frame stats); full-model tests run on the cached rel-f1 (repo convention).
+"""
+from __future__ import annotations
+
+import torch
+
+from gloss.setjoin.model import RowPool, SetEncoder, SetJoin, WideEncoder
+
+from .conftest import rel_f1_available
+
+D = 16
+
+
+# ---------- hermetic sub-module contracts ----------
+
+def test_row_pool_shapes_and_grads():
+    pool = RowPool(D)
+    cells = torch.randn(5, 7, D, requires_grad=True)
+    out = pool(cells)
+    assert out.shape == (5, D)
+    out.sum().backward()
+    assert cells.grad is not None and pool.w1.weight.grad is not None
+
+
+def test_wide_encoder_cls_and_all_pad_row():
+    enc = WideEncoder(D, n_layers=1, n_heads=2, dropout=0.0).eval()
+    h = torch.randn(2, 6, D)
+    is_pad = torch.zeros(2, 6, dtype=torch.bool)
+    is_pad[1] = True                                       # degenerate: all-pad wide row
+    out = enc(h * ~is_pad.unsqueeze(-1), is_pad)
+    assert out.shape == (2, D) and torch.isfinite(out).all()
+
+
+def test_set_encoder_permutation_invariance():
+    enc = SetEncoder(D, n_layers=2, n_heads=2, n_pma=3, dropout=0.0).eval()
+    E = torch.randn(2, 5, D)
+    mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.bool)
+    seed = torch.randn(2, D)
+    out = enc(E, mask, seed)
+    perm = torch.tensor([2, 0, 1, 4, 3])                   # permutes real AND pad slots
+    out_p = enc(E[:, perm], mask[:, perm], seed)
+    assert torch.allclose(out, out_p, atol=1e-5)
+
+
+def test_set_encoder_empty_set_and_seed_conditioning():
+    enc = SetEncoder(D, n_layers=1, n_heads=2, n_pma=2, dropout=0.0).eval()
+    E = torch.zeros(2, 4, D)
+    empty = torch.zeros(2, 4, dtype=torch.bool)
+    seed = torch.randn(2, D)
+    out = enc(E, empty, seed)
+    assert torch.isfinite(out).all()
+    # grads reach the learned null element even with an empty set
+    enc.train()
+    out2 = enc(E, empty, seed)
+    out2.sum().backward()
+    assert enc.null_elem.grad is not None and float(enc.null_elem.grad.abs().sum()) > 0
+    # the readout is conditioned on the seed representation. NOTE: this needs >= 2 attention keys —
+    # over a single key (empty set -> null element only) softmax is 1.0 whatever the query, so seed
+    # conditioning is inert by construction for empty sets (the head still sees seed_repr directly).
+    enc.eval()
+    E2 = torch.randn(2, 4, D)
+    some = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool)
+    assert not torch.allclose(enc(E2, some, seed), enc(E2, some, seed + 1.0), atol=1e-5)
+
+
+# ---------- full model on the cached real dataset ----------
+
+def _real_jb_and_model(encoder="hash"):
+    from relbench.tasks import get_task
+
+    from gloss.data.graph import build_gloss_graph, make_loader
+    from gloss.setjoin.collate import to_join_batch
+    from gloss.setjoin.paths import setjoin_neighbors
+    from gloss.train.finetune import name_embeddings
+
+    bundle = build_gloss_graph("rel-f1")
+    task = get_task("rel-f1", "driver-dnf", download=False)
+    loader = make_loader(bundle, task, "train", num_neighbors=setjoin_neighbors(bundle, fanout=8),
+                         batch_size=8)
+    jb = to_join_batch(next(iter(loader)), bundle, task.entity_table, wide_len=64, set_size=32)
+    name_emb = name_embeddings(bundle, "rel-f1", encoder=encoder, d_text=32)
+    model = SetJoin(bundle, name_emb, task.entity_table, d_model=32, n_heads=2,
+                    n_wide_layers=1, n_set_layers=1, n_pma=2, dropout=0.0)
+    return jb, model
+
+
+@rel_f1_available
+def test_forward_shapes_grads_and_budget():
+    jb, model = _real_jb_and_model()
+    logits, aux = model(jb)
+    assert logits.shape == (jb.num_seeds, 1) and torch.isfinite(logits).all()
+    assert float(aux) == 0.0
+    assert sum(p.numel() for p in model.parameters()) < 30e6
+    logits.sum().backward()
+    for name in ("row_pool.w1.weight", "path_emb.weight", "fk_emb.weight", "table_emb.weight",
+                 "set_enc.null_elem", "encoder.name_proj.weight"):
+        g = dict(model.named_parameters())[name].grad
+        assert g is not None and float(g.abs().sum()) > 0, name
+
+
+@rel_f1_available
+def test_end_to_end_set_permutation_invariance():
+    from dataclasses import replace
+
+    jb, model = _real_jb_and_model()
+    model.eval()
+    logits, _ = model(jb)
+    N = jb.set_size
+    perm = torch.randperm(N)
+    inv = torch.argsort(perm)
+    jb_p = replace(
+        jb,
+        elem_mask=jb.elem_mask[:, perm], elem_rel_idxs=jb.elem_rel_idxs[:, perm],
+        elem_table_idxs=jb.elem_table_idxs[:, perm], elem_row_time=jb.elem_row_time[:, perm],
+        elem_is_timed=jb.elem_is_timed[:, perm], elem_hop=jb.elem_hop[:, perm],
+        elem_rows={nt: (b, inv[n], r, p) for nt, (b, n, r, p) in jb.elem_rows.items()},
+    )
+    logits_p, _ = model(jb_p)
+    assert torch.allclose(logits, logits_p, atol=1e-5)
+
+
+@rel_f1_available
+def test_empty_set_and_missing_marker_paths_are_live():
+    from dataclasses import replace
+
+    jb, model = _real_jb_and_model()
+    model.eval()
+    logits, _ = model(jb)
+    # empty union set: finite output, and it differs from the populated one
+    jb_empty = replace(jb, elem_mask=torch.zeros_like(jb.elem_mask), elem_rows={})
+    logits_e, _ = model(jb_empty)
+    assert torch.isfinite(logits_e).all()
+    assert not torch.allclose(logits, logits_e, atol=1e-5)
+    # flipping a real wide cell into a missing marker changes the output (missing_emb is live)
+    wm = jb.wide_missing.clone()
+    wm[0, 0] = True
+    logits_m, _ = model(replace(jb, wide_missing=wm))
+    assert not torch.allclose(logits[0], logits_m[0], atol=1e-6)

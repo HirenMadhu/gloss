@@ -182,3 +182,20 @@ direction — children arrive via rev_* types). Fixtures: `tests/_join_fixtures.
 DoD: `pytest` **81 passed, 1 skipped**. `run_setjoin.py --dry-run --collate-only` on cached rel-f1:
 **dict num_neighbors accepted by the sampler**, B=8 W=128 N=128, 48 wide cells, 12 set elements
 (2 empty-set early-career seeds), child_counts (8,3), **leakage=0**.
+
+## Phase S2 — SetJoin model
+
+`gloss/setjoin/model.py`: `SetJoin(bundle, name_emb, entity_table, ...)` → `(logits [B,1], aux=0)`.
+Reuses `CellEncoder.encode_type` verbatim (each sampled type encoded ONCE, shared between the wide grid
+scatter and the row-pooled set elements). `WideEncoder` (CLS, pre-norm, pad-masked) → seed_repr;
+`RowPool` (shared gated-attention cell pool); additive element assembly (child @ FK_NONE + flattened
+parents @ fk-role + fk/table/Δt/hop tags — table_emb load-bearing vs fk_role collisions); `SetEncoder`
+(never-masked learned null element, no positional encoding, seed-conditioned PMA readout); head on
+`[seed_repr ; context ; W_cnt log1p(child_counts)]`. Design note surfaced by testing: PMA seed
+conditioning is inert over a single key (empty set → null only) since softmax(1 key)=1 — fine, the head
+sees seed_repr directly; conditioning acts when ≥2 elements exist.
+
+DoD: `pytest` **88 passed, 1 skipped** (7 new in `test_setjoin_model.py`: hermetic RowPool/WideEncoder/
+SetEncoder permutation-invariance + empty-set/seed-conditioning; rel-f1 full-model forward/grads/budget,
+end-to-end set permutation invariance, empty-set + missing-marker liveness). `run_setjoin.py --dry-run`:
+forward OK on rel-f1 CPU, logits (8,1) finite, aux=0, **0.91M params** (hash encoder).
