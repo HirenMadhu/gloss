@@ -1,0 +1,165 @@
+"""SetJoin collate contracts: wide m2o walk, markers, union set, parent flattening, caps."""
+from __future__ import annotations
+
+import torch
+
+from gloss.data.collate import column_vocab
+from gloss.data.graph import FK_NONE
+from gloss.setjoin.collate import to_join_batch
+from gloss.setjoin.paths import child_rels, m2o_paths, parent_rels, setjoin_neighbors
+
+from ._join_fixtures import ENTITY as ORDER
+from ._join_fixtures import chain_bundle, make_chain_batch
+from .conftest import ENTITY as USER
+from .conftest import make_synth_batch, synthetic_bundle
+
+
+def _jb(wide_len=16, set_size=8, **kw):
+    return to_join_batch(make_chain_batch(**kw), chain_bundle(), ORDER,
+                         wide_len=wide_len, set_size=set_size)
+
+
+# ---------- schema maps ----------
+
+def test_schema_maps():
+    b = chain_bundle()
+    assert parent_rels(b, "order") == [("order", "customer", "customer")]
+    assert parent_rels(b, "payment") == [("payment", "method", "method"),
+                                         ("payment", "order", "order")]
+    assert child_rels(b, "order") == [("payment", "order", "order")]
+    paths = m2o_paths(b, "order")
+    assert paths[0] == ()                                  # seed first == path_id 0
+    assert paths[1] == (("order", "customer", "customer"),)
+    assert paths[2] == (("order", "customer", "customer"), ("customer", "region", "region"))
+    assert len(paths) == 3
+
+
+def test_m2o_paths_self_fk_terminates():
+    from gloss.data.graph import GraphBundle, _build_vocabs
+
+    nts = ["emp"]
+    ets = [("emp", "f2p_boss", "emp"), ("emp", "rev_f2p_boss", "emp")]
+    ntid, fkid, mpid = _build_vocabs(nts, ets)
+    b = GraphBundle(dataset_name="synthetic-selffk", data=None, col_stats_dict={}, node_types=nts,
+                    edge_types=ets, node_type_id=ntid, fk_role_id=fkid, metapath_id=mpid)
+    paths = m2o_paths(b, "emp", depth=2)
+    assert len(paths) == 3                                 # (), (boss,), (boss, boss)
+
+
+def test_setjoin_neighbors_dict():
+    b = chain_bundle()
+    nn = setjoin_neighbors(b, fanout=32)
+    assert set(nn) == set(b.edge_types)
+    assert nn[("order", "f2p_customer", "customer")] == [1, 1]
+    assert nn[("order", "rev_f2p_order", "payment")] == [32, 0]
+
+
+# ---------- wide seed row ----------
+
+def test_wide_paths_cells_and_markers():
+    jb = _jb()
+    vocab = column_vocab(chain_bundle())
+    ntid = chain_bundle().node_type_id
+    # segment 0: 2 order cells (path 0) + c_name (path 1) + r_code (path 2), no markers
+    real0 = (~jb.wide_is_pad[0] & ~jb.wide_missing[0])
+    assert int(real0.sum()) == 4 and int(jb.wide_missing[0].sum()) == 0
+    assert jb.wide_path_idxs[0, :4].tolist() == [0, 0, 1, 2]
+    assert jb.wide_col_idxs[0, :4].tolist() == [
+        vocab[("order", "o_amt")], vocab[("order", "o_qty")],
+        vocab[("customer", "c_name")], vocab[("region", "r_code")]]
+    # segment 1: 2 order cells + 2 missing markers (customer path and customer→region path)
+    assert int((~jb.wide_is_pad[1] & ~jb.wide_missing[1]).sum()) == 2
+    assert int(jb.wide_missing[1].sum()) == 2
+    marker_slots = jb.wide_missing[1].nonzero().squeeze(-1)
+    assert jb.wide_path_idxs[1, marker_slots].tolist() == [1, 2]
+    assert jb.wide_table_idxs[1, marker_slots].tolist() == [ntid["customer"], ntid["region"]]
+    assert (jb.wide_col_idxs[1, marker_slots] == -1).all()
+    # wide row_time carried from the node (orders timed at 50/60)
+    assert float(jb.wide_row_time[0, 0]) == 50.0 and bool(jb.wide_is_timed[0, 0])
+
+
+def test_wide_truncation_keeps_seed_cells_first():
+    jb = _jb(wide_len=3)
+    # seg 0: 4 cells > 3; seg 1: 2 cells + 2 markers > 3 (markers count toward the cap)
+    assert jb.wide_truncated == 2
+    assert jb.wide_path_idxs[0, :3].tolist() == [0, 0, 1]  # seed cells survive, region dropped
+    assert jb.wide_path_idxs[1, :3].tolist() == [0, 0, 1] and bool(jb.wide_missing[1, 2])
+
+
+def test_wide_placement_scatter_map():
+    jb = _jb()
+    b_idx, w_idx, row_idx, col_idx = jb.wide_placement["order"]
+    assert b_idx.tolist() == [0, 0, 1, 1] and w_idx.tolist() == [0, 1, 0, 1]
+    assert row_idx.tolist() == [0, 0, 1, 1] and col_idx.tolist() == [0, 1, 0, 1]
+    assert set(jb.wide_placement) == {"order", "customer", "region"}   # markers place nothing
+
+
+# ---------- union set ----------
+
+def test_union_set_from_rev_only_edges():
+    # payments are attached via rev_f2p_order ONLY — the collate must still find them
+    jb = _jb()
+    assert jb.elem_mask[0].sum() == 2 and jb.elem_mask[1].sum() == 1
+    assert jb.child_counts.tolist() == [[2.0], [1.0]]
+    role = chain_bundle().fk_role_id["order"]
+    ntid = chain_bundle().node_type_id["payment"]
+    assert jb.elem_rel_idxs[0, :2].tolist() == [role, role]
+    assert jb.elem_table_idxs[0, :2].tolist() == [ntid, ntid]
+    assert (jb.elem_hop[0, :2] == 1).all()
+
+
+def test_elements_sorted_most_recent_first_and_capped():
+    jb = _jb(set_size=1)
+    assert jb.set_truncated == 1                           # segment 0 had 2 children
+    assert int(jb.elem_mask[0].sum()) == 1
+    assert float(jb.elem_row_time[0, 0]) == 20.0           # P1 (t=20) beats P0 (t=10)
+
+
+def test_elem_parent_flattening_and_seed_exclusion():
+    jb = _jb()
+    # every element carries its own payment row at path FK_NONE
+    b_idx, n_idx, row_idx, path_idx = jb.elem_rows["payment"]
+    assert (path_idx == FK_NONE).all() and len(b_idx) == 3
+    # P0's method parent is flattened in at the method FK's role id
+    role_method = chain_bundle().fk_role_id["method"]
+    b_idx, n_idx, row_idx, path_idx = jb.elem_rows["method"]
+    assert b_idx.tolist() == [0] and row_idx.tolist() == [0]
+    assert path_idx.tolist() == [role_method]
+    p_slot = int(n_idx[0])
+    assert float(jb.elem_row_time[0, p_slot]) == 10.0      # attached to P0's element
+    # payments' order parents are the SEEDS -> excluded by n_id; nothing scatters into "order" elements
+    assert "order" not in jb.elem_rows
+
+
+def test_no_cross_product():
+    jb = _jb()
+    assert float(jb.elem_mask.sum()) == float(jb.child_counts.sum())   # under the cap: 1:1 with children
+
+
+def test_dualfk_distinct_rel_ids_and_seed_exclusion():
+    # conftest dual-FK schema: events reach the seed user via buyer AND seller relations
+    jb = to_join_batch(make_synth_batch(), synthetic_bundle(), USER, wide_len=8, set_size=8)
+    fk = synthetic_bundle().fk_role_id
+    assert int(jb.elem_mask[0].sum()) == 2 and int(jb.elem_mask[1].sum()) == 2
+    assert sorted(jb.elem_rel_idxs[0, :2].tolist()) == sorted([fk["buyer"], fk["seller"]])
+    # user (seed) has no m2o parents; elements are event rows only, seed never re-injected
+    assert set(jb.elem_rows) == {"event"}
+    # wide row: user is parentless -> exactly its own cell, no markers
+    assert int((~jb.wide_is_pad[0]).sum()) == 1 and int(jb.wide_missing.sum()) == 0
+    assert jb.child_counts.shape == (2, 2)                 # R=2 child relations (buyer, seller)
+
+
+# ---------- dtypes / bookkeeping ----------
+
+def test_shapes_dtypes_and_input_id():
+    jb = _jb()
+    assert jb.wide_col_idxs.dtype == torch.long and jb.elem_rel_idxs.dtype == torch.long
+    assert jb.wide_row_time.dtype == torch.float64 and jb.elem_row_time.dtype == torch.float64
+    assert jb.child_counts.dtype == torch.float32
+    assert jb.input_id.tolist() == [-1, -1]                # absent in fixtures
+    assert jb.seed_time.tolist() == [100.0, 100.0]
+    for t in (jb.wide_col_idxs, jb.wide_is_pad, jb.wide_missing):
+        assert t.shape == (2, 16)
+    for t in (jb.elem_mask, jb.elem_rel_idxs, jb.elem_row_time, jb.elem_hop):
+        assert t.shape == (2, 8)
+    assert "JoinBatch" in jb.pretty_shapes()

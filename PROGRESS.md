@@ -165,3 +165,20 @@ exclusion, fk_role_id column-name collisions ⇒ table_emb load-bearing). CLAUDE
 section. MoRE files untouched.
 
 DoD: `pytest` **66 passed, 1 skipped** (baseline unchanged).
+
+## Phase S1 — SetJoin schema paths + JoinBatch collate
+
+`gloss/setjoin/paths.py` (relations as `(child_type, fk_col, parent_type)` triples — the bare
+`fk_role_id` column key collides across tables; `m2o_paths` BFS with depth cap; `setjoin_neighbors`
+per-edge-type fanout dict: f2p `[1,1]`, rev `[fanout,0]` — samples exactly the m2o closure + 1-hop
+children), `recency.py` (fixed log Δt buckets, standalone), `collate.py` (`JoinBatch` + `to_join_batch`:
+wide m2o-flattened seed row with ONE missing-marker slot per dead path; one table-tagged union set of
+child rows, most-recent-first, additive `elem_rows` row scatter = child @ FK_NONE + its flattened
+parents @ fk-role, seed excluded **by n_id**; adjacency read from ALL edge types canonicalized by
+direction — children arrive via rev_* types). Fixtures: `tests/_join_fixtures.py` 3-level chain
+(payment→order→customer→region + payment→method side parent; rev-only child instances). 15 new tests
+(`test_join_collate.py`, `test_join_leakage.py`).
+
+DoD: `pytest` **81 passed, 1 skipped**. `run_setjoin.py --dry-run --collate-only` on cached rel-f1:
+**dict num_neighbors accepted by the sampler**, B=8 W=128 N=128, 48 wide cells, 12 set elements
+(2 empty-set early-career seeds), child_counts (8,3), **leakage=0**.
