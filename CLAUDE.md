@@ -39,6 +39,16 @@ RT's frozen-LM token may already let a single shared FFN absorb every column.
 > **we build on this repo's own faithful RT reimplementation** (`gloss/model/rt_substrate.py`) — same
 > cell-token + relational-mask substrate, SDPA attention, **no upstream clone**.
 
+## THIS BRANCH (`setjoin`): a second, standalone direction lives here
+
+This branch adds **SetJoin** — "one big joined table" + set transformer — as a standalone method in
+`gloss/setjoin/` (own specs: [setjoin_idea.md](setjoin_idea.md) / [setjoin_implementation.md](setjoin_implementation.md),
+own runner `scripts/run_setjoin.{py,sh}`, own tests `tests/test_join_*.py` + `tests/test_setjoin_*.py`).
+Per seed it builds a **wide m2o-flattened row** + **one table-tagged union set of child rows** from the
+SAME temporal sampler, and pools the set with a seed-conditioned set transformer. It reuses MoRE's data
+pipeline, `CellEncoder.encode_type`, text stack, and train/eval scaffolding, but **modifies no MoRE
+file** — everything below this section describes the MoRE main line and still applies here.
+
 ## Naming: MoRE = the method, `gloss` = the package
 
 The *method* is **MoRE** (Mixture of Relational Experts); the *package/repo here* is **`gloss`**. The model

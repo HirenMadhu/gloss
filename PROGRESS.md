@@ -151,3 +151,17 @@ DoD: `pytest` **65 passed, 2 skipped** (new: shared/cosine/top-p in `test_moe.py
 grad-flow + additions forward in `test_shapes.py`; `test_ablation` green via the `variant` fallback). Hash-
 encoder smokes on the H200 trained the `hybrid` arm and S/H additions and produced a per-variant aggregate
 table with Δ vs a chosen baseline. Real runs use the **harrier** schema cache (one-time prep) on `gpu_h200`.
+
+## Phase S0 — SetJoin branch: hygiene, docs (branch `setjoin`)
+
+New standalone direction: **SetJoin** ("one big joined table" + set transformer). Committed the pending
+main-line fixes on `main` (`2403be4`: MET offset collation, nan-grad guard, grad clip, `--tasks
+leaderboard`, gridsearch skip-guard, recap) and cut branch **`setjoin`** from it. Wrote the branch specs —
+`setjoin_idea.md` (thesis: a relational neighborhood = one wide m2o-flattened joined row + one table-tagged
+union set of child rows; a seed-conditioned set transformer replaces join duplication / lossy aggregation;
+falsifier: ≈ the mean-pool LightGBM baseline) and `setjoin_implementation.md` (JoinBatch contract,
+per-edge-type fanout dict, PyG sampling facts: rev-edge traversal storage, disjoint tree ⇒ n_id-based seed
+exclusion, fk_role_id column-name collisions ⇒ table_emb load-bearing). CLAUDE.md got a branch-only pointer
+section. MoRE files untouched.
+
+DoD: `pytest` **66 passed, 1 skipped** (baseline unchanged).
