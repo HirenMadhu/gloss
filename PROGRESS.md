@@ -213,3 +213,16 @@ the sampler fanout and reuses `MoREDataModule` untouched. `gloss/setjoin/eval.py
 DoD: `pytest` **92 passed, 1 skipped** (4 new in `test_setjoin_train.py`: overfit-one-batch binary +
 regression, end-to-end grad flow, standardization round-trip). CPU micro-trains complete with TEST eval:
 driver-dnf (binary) and driver-position (regression), 2 epochs × 20 batches, hash encoder.
+
+## Phase S4 — SetJoin gate runner + SLURM array (THE GATE)
+
+`gloss/setjoin/runner.py`: `gate_grid` (9 leaderboard tasks × 3 seeds = 27, signal="setjoin", reusing
+ablation `dataset_tasks`/`build_grid`), `run_config` (idempotent skip-if-done, CUDA-OOM batch halving à
+la gridsearch, ablation-schema records + run-time `test_nmae` = MAE/train-std), `compare_table`
+(SetJoin vs RT-from-scratch / GelGT from `results/leaderboard_baselines.json` + MoRE grid best).
+`scripts/run_setjoin.py` grew `--list/--index/--aggregate/--compare`; `scripts/run_setjoin.sh` is
+Milgram-native (partition=gpu, h100:1, %8 QOS cap, harrier encoder, rel-event symlink reminder).
+
+DoD: `pytest` **97 passed, 1 skipped** (5 new hermetic runner tests). `--list` = 27. Smoke `--index 0`
+(hash, 1 epoch, 5 batches) wrote `results/setjoin_smoke/0000_setjoin.json` with the full record schema;
+`--aggregate` renders. rel-event symlinks + harrier caches verified. Gate array submitted (see below).
