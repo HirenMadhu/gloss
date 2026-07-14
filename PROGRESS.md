@@ -252,3 +252,22 @@ site-success NMAE≈1 = the model sees almost nothing beyond a near-featureless 
 test on all 9 (no split pathology). Cost: mean cell runtime ~3.4 min on one h100 — an order of
 magnitude cheaper than MoRE per run. **Stopped at the gate; next axis if pursued: hop-2 union
 elements (`elem_hop` reserved), rel-event fanout/set_size sweep.**
+
+## CORRECTION — v1 gate invalidated: fanout-direction inversion; v2 resubmitted
+
+Post-gate diagnosis of the weak tasks found `setjoin_neighbors` had **PyG's sampling direction
+inverted**: `num_neighbors[et]` budgets src-side draws per DST frontier node, so children arrive via
+the FORWARD `f2p` types (which v1 capped at `[1,1]`) and parents via the REV types (which v1 gave
+`[fanout, 0]` — hop-2 budget 0 ⇒ elements never got their flattened parents). Every v1 cell therefore
+trained on ~1 child per relation and parent-less elements — e.g. site-success saw 5 facility columns +
+one 1-column link row (no study!), fully explaining its NMAE≈0.98; that v1 still beat RT on 4/9 with
+~3 rows/seed is a strong wide-row+recency floor, not the method. After the swap (`f2p [fanout,0]`,
+`rev [1,1]`): driver-dnf ~69 elements/seed with races/constructors flattened; user-repeat ~88
+(friends + attendance, event parents in); site-success ~10 with `studies` flattened in.
+
+Why tests missed it: synthetic-batch collate tests bypass the sampler entirely; the rel-f1 tests only
+asserted elements exist (>0). Added `test_sampler_multiplicity_and_parent_flattening_rel_f1`
+(child_counts>1 + parent type present in elem_rows on real sampled data) + hardened the overfit test
+(400 steps — richer batches put 200 at the flake edge). `pytest` **98 passed, 1 skipped** (×3 on the
+hardened test). v1 results kept in `results/setjoin_v1/` for the record; corrected gate resubmitted to
+`results/setjoin_v2/`.

@@ -81,12 +81,19 @@ def path_target_type(entity_table: str, path: tuple[RelKey, ...]) -> str:
 
 
 def setjoin_neighbors(bundle: GraphBundle, fanout: int = 64, depth: int = 2) -> dict:
-    """Per-edge-type ``num_neighbors`` that samples exactly SetJoin's neighborhood and nothing else:
+    """Per-edge-type ``num_neighbors`` that samples exactly SetJoin's neighborhood and nothing else.
 
-    * forward ``f2p_*`` types → ``[1] * depth`` — a parent is unique per FK; hop 2 covers the seed's
-      grandparents and each child row's own parents (the m2o closure).
-    * reverse ``rev_*`` types → ``[fanout, 0, ...]`` — up to ``fanout`` most-recent children per relation
-      at hop 1; NO deeper o2m expansion (no children-of-children, no siblings).
+    PyG DIRECTION SEMANTICS (the v1 gate inverted this — every seed got ~1 child per relation and
+    elements lost their flattened parents): ``num_neighbors[et]`` budgets how many **src**-side
+    neighbors are drawn for each frontier node of type ``et.dst`` (edges are sampled *into* the
+    frontier, message-passing direction). Hence:
+
+    * forward ``(child, f2p_<col>, parent)`` types expand a PARENT-side frontier node by sampling its
+      CHILD rows → ``[fanout, 0, ...]``: up to ``fanout`` most-recent children per relation at hop 1,
+      and NO deeper o2m expansion (hop-2 budget 0 = no children-of-children, no siblings of parents).
+    * reverse ``(parent, rev_f2p_<col>, child)`` types expand a CHILD-side frontier node by sampling
+      its parent (unique per FK) → ``[1] * depth``: the seed's parents at hop 1, grandparents and each
+      child row's own flattened parents at hop 2 (the m2o closure).
     """
-    return {et: ([1] * depth if is_forward_relation(et[1]) else [fanout] + [0] * (depth - 1))
+    return {et: ([fanout] + [0] * (depth - 1) if is_forward_relation(et[1]) else [1] * depth)
             for et in bundle.edge_types}

@@ -37,16 +37,21 @@ tests/test_setjoin_train.py test_setjoin_runner.py
 
 Seeds and as-of correctness come from `make_loader` (`NeighborSampler(time_attr="time",
 temporal_strategy="last", disjoint=True)`). Fanout is a **per-edge-type dict** from
-`setjoin_neighbors(bundle, fanout=64)`:
+`setjoin_neighbors(bundle, fanout=64)`. **PyG direction semantics (the v1 gate had this inverted —
+every seed got ~1 child per relation and elements lost their flattened parents):** `num_neighbors[et]`
+budgets how many *src*-side neighbors are drawn per frontier node of type `et.dst`, so:
 
-- forward `f2p_*` edge types: `[1, 1]` — a parent is unique per FK; hop 2 covers grandparents and the
-  child rows' own parents.
-- reverse `rev_f2p_*` edge types: `[fanout, 0]` — up to `fanout` most-recent children per relation at
-  hop 1; **no** hop-2 o2m expansion (no children-of-children, no siblings).
+- forward `f2p_*` types (`(child, f2p_col, parent)`, dst=parent) pull **children** → `[fanout, 0]` —
+  up to `fanout` most-recent children per relation at hop 1; **no** hop-2 o2m expansion (no
+  children-of-children, no siblings of parents).
+- reverse `rev_f2p_*` types (dst=child) pull the unique **parent** → `[1, 1]` — the seed's parents at
+  hop 1; grandparents and each child row's own flattened parents at hop 2.
 
-This samples exactly the m2o closure + 1-hop children. If relbench's `NeighborSampler` rejects the
-dict, fall back to a flat list `[fanout, 8]` (collate ignores the extra rows; enable tf_dict row
-subsetting for encode cost).
+This samples exactly the m2o closure + 1-hop children. Guarded by a rel-f1 regression test
+(`test_sampler_multiplicity_and_parent_flattening_rel_f1`) asserting real child multiplicity and
+parent flattening on sampled data — synthetic-batch tests bypass the sampler and cannot catch a
+direction inversion. If relbench's `NeighborSampler` rejects the dict, fall back to a flat list
+`[fanout, 8]` (collate ignores the extra rows; enable tf_dict row subsetting for encode cost).
 
 **PyG facts the collate must respect** (stress-tested):
 - Sampled edges are stored under the edge type *traversed*: children arrive via `rev_f2p_*` types.

@@ -38,7 +38,9 @@ def test_overfits_single_batch():
     with torch.no_grad():
         init = masked_bce(module(jb), jb.target, jb.has_target).item()
     final = init
-    for _ in range(200):
+    # 400 steps: with the corrected fanout the batch carries ~10x more set elements than v1, and 200
+    # steps left the threshold within CPU-thread-nondeterminism wiggle (observed one flaky failure).
+    for _ in range(400):
         opt.zero_grad()
         loss = masked_bce(module(jb), jb.target, jb.has_target)
         loss.backward()

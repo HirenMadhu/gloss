@@ -11,7 +11,7 @@ from gloss.setjoin.paths import child_rels, m2o_paths, parent_rels, setjoin_neig
 from ._join_fixtures import ENTITY as ORDER
 from ._join_fixtures import chain_bundle, make_chain_batch
 from .conftest import ENTITY as USER
-from .conftest import make_synth_batch, synthetic_bundle
+from .conftest import make_synth_batch, rel_f1_available, synthetic_bundle
 
 
 def _jb(wide_len=16, set_size=8, **kw):
@@ -47,11 +47,34 @@ def test_m2o_paths_self_fk_terminates():
 
 
 def test_setjoin_neighbors_dict():
+    # PyG budgets src-side neighbors per DST frontier node: forward f2p types (dst=parent) pull
+    # CHILDREN and get the fanout; rev types (dst=child) pull the unique parent and get [1, 1].
     b = chain_bundle()
     nn = setjoin_neighbors(b, fanout=32)
     assert set(nn) == set(b.edge_types)
-    assert nn[("order", "f2p_customer", "customer")] == [1, 1]
-    assert nn[("order", "rev_f2p_order", "payment")] == [32, 0]
+    assert nn[("order", "f2p_customer", "customer")] == [32, 0]   # customer's child orders (o2m)
+    assert nn[("payment", "f2p_order", "order")] == [32, 0]       # order's child payments (o2m)
+    assert nn[("order", "rev_f2p_order", "payment")] == [1, 1]    # payment's parent order (m2o)
+    assert nn[("customer", "rev_f2p_customer", "order")] == [1, 1]
+
+
+@rel_f1_available
+def test_sampler_multiplicity_and_parent_flattening_rel_f1():
+    """Regression test for the v1-gate fanout inversion: on real sampled data the union set must
+    contain MANY children per seed (not ~1 per relation) and elements must flatten their non-seed
+    parents (races/constructors for a driver's results)."""
+    from relbench.tasks import get_task
+
+    from gloss.data.graph import build_gloss_graph, make_loader
+
+    bundle = build_gloss_graph("rel-f1")
+    task = get_task("rel-f1", "driver-dnf", download=False)
+    loader = make_loader(bundle, task, "train", num_neighbors=setjoin_neighbors(bundle, fanout=16),
+                         batch_size=64, shuffle=True)
+    jb = to_join_batch(next(iter(loader)), bundle, task.entity_table, wide_len=64, set_size=64)
+    assert float(jb.child_counts.max()) > 1.0, "children capped at 1 per relation: fanout inverted?"
+    assert float(jb.elem_mask.sum(1).max()) >= 8, "union sets implausibly small on rel-f1"
+    assert "races" in jb.elem_rows, "elements lost their flattened parents: rev hop-2 budget missing?"
 
 
 # ---------- wide seed row ----------
