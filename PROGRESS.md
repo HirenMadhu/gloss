@@ -226,3 +226,29 @@ Milgram-native (partition=gpu, h100:1, %8 QOS cap, harrier encoder, rel-event sy
 DoD: `pytest` **97 passed, 1 skipped** (5 new hermetic runner tests). `--list` = 27. Smoke `--index 0`
 (hash, 1 epoch, 5 batches) wrote `results/setjoin_smoke/0000_setjoin.json` with the full record schema;
 `--aggregate` renders. rel-event symlinks + harrier caches verified. Gate array submitted (see below).
+
+## GATE RESULT — SetJoin v1 (array 28993182, 27/27 completed, 2026-07-13)
+
+**SetJoin beats RT (from scratch) on 4/9 leaderboard tasks** (3 seeds, TEST, harrier encoder,
+d_model=128/fanout=64/wide=set=128, batch 128 everywhere, no OOMs, ~1.6 GPU-h total):
+
+| task | SetJoin | RT | GelGT | MoRE best | vs RT |
+|---|--:|--:|--:|--:|:--:|
+| rel-f1/driver-top3 (AUROC↑) | **89.7±0.2** | 82.7 | 84.1 | 90.6 | ✅ (+7.0, also >GelGT) |
+| rel-f1/driver-dnf (AUROC↑) | **79.1±0.6** | 78.7 | 76.1 | 82.9 | ✅ (also >GelGT) |
+| rel-f1/driver-position (NMAE↓) | **0.448±0.011** | 0.477 | 0.531 | 0.395 | ✅ (also >GelGT) |
+| rel-event/user-attendance (NMAE↓) | **0.477±0.019** | 0.504 | 0.317 | 0.399 | ✅ |
+| rel-trial/study-outcome (AUROC↑) | 67.4±1.9 | 68.6 | 72.5 | 69.4 | ❌ (close) |
+| rel-event/user-ignore (AUROC↑) | 80.8±2.2 | 85.1 | 87.8 | 87.3 | ❌ |
+| rel-trial/study-adverse (NMAE↓) | 0.166±0.006 | 0.131 | 0.126 | 0.161 | ❌ |
+| rel-event/user-repeat (AUROC↑) | 65.2±2.7 | 79.7 | 83.6 | 79.5 | ❌ (big) |
+| rel-trial/site-success (NMAE↓) | 0.978±0.017 | 0.734 | 0.732 | 0.840 | ❌ (≈mean-predictor) |
+
+Reading: wins are exactly the tasks whose signal is the seed's own recent 1-hop fact rows (all of
+rel-f1; attendance counts). The three big losses (user-repeat, user-ignore, site-success) are the tasks
+whose signal lives at 2 hops (event co-attendees / event popularity; a site's linked studies) — the o2m
+context the MVP deliberately dropped (setjoin_idea.md falsifier/risk #2, now empirically confirmed;
+site-success NMAE≈1 = the model sees almost nothing beyond a near-featureless site row). Val tracks
+test on all 9 (no split pathology). Cost: mean cell runtime ~3.4 min on one h100 — an order of
+magnitude cheaper than MoRE per run. **Stopped at the gate; next axis if pursued: hop-2 union
+elements (`elem_hop` reserved), rel-event fanout/set_size sweep.**
