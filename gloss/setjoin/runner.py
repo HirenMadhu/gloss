@@ -39,6 +39,13 @@ def attach_nmae(rec: dict, train_std: float) -> dict:
     return rec
 
 
+def variant_of(model_kwargs: dict | None) -> str:
+    """Arm label: ``setjoin`` for the dense arm (back-compat with the v1/v2 records), else
+    ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method)."""
+    route_on = (model_kwargs or {}).get("route_on", "signature")
+    return "setjoin" if route_on == "dense" else f"setjoin-{route_on}"
+
+
 def run_config(
     index: int,
     *,
@@ -48,6 +55,7 @@ def run_config(
     fanout: int = 64,
     wide_len: int = 128,
     set_size: int = 128,
+    lambda_ortho: float = 0.5,
     batch_size: int = 128,
     lr: float = 3e-4,
     weight_decay: float = 0.01,
@@ -73,8 +81,9 @@ def run_config(
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}
     c = grid[index]
+    variant = variant_of(model_kwargs)
     out_dir = out_dir or RESULTS
-    out_path = out_dir / f"{index:04d}_setjoin.json"
+    out_path = out_dir / f"{index:04d}_{variant}.json"
     if out_path.exists():                                  # idempotent resubmits (gridsearch precedent)
         print(f"{out_path} exists; skipping")
         return json.loads(out_path.read_text())
@@ -90,9 +99,9 @@ def run_config(
         try:
             module, metrics = train_prebuilt_setjoin(
                 bundle, task, name_emb, model_kwargs=model_kwargs,
-                fanout=fanout, wide_len=wide_len, set_size=set_size, batch_size=bs,
-                lr=lr, weight_decay=weight_decay, max_epochs=max_epochs, seed=c["seed"],
-                num_workers=num_workers,
+                fanout=fanout, wide_len=wide_len, set_size=set_size, lambda_ortho=lambda_ortho,
+                batch_size=bs, lr=lr, weight_decay=weight_decay, max_epochs=max_epochs,
+                seed=c["seed"], num_workers=num_workers,
                 limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
             )
             break
@@ -103,8 +112,11 @@ def run_config(
             bs = max(8, bs // 2)
             print(f"CUDA OOM -> retry with batch_size={bs}", flush=True)
 
-    rec = {**c, "variant": "setjoin", "task_type": kind, "batch_size": bs,
-           "fanout": fanout, "wide_len": wide_len, "set_size": set_size}
+    rec = {**c, "variant": variant, "task_type": kind, "batch_size": bs,
+           "fanout": fanout, "wide_len": wide_len, "set_size": set_size,
+           "route_on": (model_kwargs or {}).get("route_on", "signature"),
+           "num_experts": (model_kwargs or {}).get("num_experts", 4),
+           "lambda_ortho": lambda_ortho}
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     if test:
         try:
@@ -119,14 +131,24 @@ def run_config(
     return rec
 
 
-def compare_table(records: list[dict], baselines_path: Path | str | None = None) -> str:
-    """SetJoin (seed mean ± 95% CI) vs RT-from-scratch / GelGT / MoRE grid best, per leaderboard task.
+def compare_table(records: list[dict], baselines_path: Path | str | None = None,
+                  variant: str | None = None) -> str:
+    """SetJoin (seed means) vs RT-from-scratch / GelGT / MoRE grid best, per leaderboard task.
 
     Binary: AUROC × 100 (higher better). Regression: NMAE (lower better), read from the run-time
-    ``test_nmae`` field.
+    ``test_nmae`` field. ``variant`` picks the arm when a results dir mixes several (``setjoin`` =
+    dense, ``setjoin-signature`` = the MoE method); with a single-variant dir it is auto-detected.
     """
     if not records:
         return "(no records)"
+    from ..eval.ablation import _variant_of
+
+    present = sorted({_variant_of(r) for r in records})
+    if variant is None:
+        if len(present) > 1:
+            raise ValueError(f"results dir mixes variants {present}; pass variant=...")
+        variant = present[0]
+    records = [r for r in records if _variant_of(r) == variant]
     baselines_path = Path(baselines_path or RESULTS_ROOT / "leaderboard_baselines.json")
     base = json.loads(baselines_path.read_text()) if baselines_path.exists() else {}
     agg = aggregate(records, keys=("test_roc_auc", "test_nmae"))
@@ -146,7 +168,7 @@ def compare_table(records: list[dict], baselines_path: Path | str | None = None)
         ttype = task_types[(ds, tk)]
         binary = ttype == "binary"
         key, scale = ("test_roc_auc", 100.0) if binary else ("test_nmae", 1.0)
-        mean, _sd, _ci, _n = agg.get((ds, tk, "setjoin"), {}).get(key, (float("nan"), 0, 0, 0))
+        mean, _sd, _ci, _n = agg.get((ds, tk, variant), {}).get(key, (float("nan"), 0, 0, 0))
         side = base.get("classification" if binary else "regression", {}).get(f"{ds} {tk}", {})
         rt = float(side["RT_from_scratch"]) if "RT_from_scratch" in side else float("nan")
         gg = float(side["GelGT"]) if "GelGT" in side else float("nan")

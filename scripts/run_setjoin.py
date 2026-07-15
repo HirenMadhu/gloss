@@ -38,6 +38,12 @@ def main() -> int:
     ap.add_argument("--encoder", default="hash", help="frozen column-name encoder (hash|qwen|harrier|HF id)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--seeds", type=int, default=3, help="gate grid: seeds per (dataset, task)")
+    ap.add_argument("--route-on", default="signature", choices=["signature", "hidden", "dense"],
+                    help="MoE FFN routing arm (signature = the method; dense = plain FFN, the v2 arm)")
+    ap.add_argument("--num-experts", type=int, default=4)
+    ap.add_argument("--k", type=int, default=2)
+    ap.add_argument("--d-sig", type=int, default=64, help="signature width (signature arm)")
+    ap.add_argument("--lambda-ortho", type=float, default=0.5, help="router orthogonality weight")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--n-wide-layers", type=int, default=2)
@@ -114,7 +120,8 @@ def _dry_run(args) -> int:
 
     name_emb = name_embeddings(bundle, args.dataset, encoder=args.encoder, d_text=64)
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
-                    n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma)
+                    n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
+                    route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig)
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
         logits, aux = model(jb)
@@ -138,8 +145,10 @@ def _train(args) -> int:
         bundle, task, name_emb,
         model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                           n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
-                          n_pma=args.n_pma),
+                          n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
+                          k=args.k, d_sig=args.d_sig),
         fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
+        lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         max_epochs=args.epochs, seed=args.seed, num_workers=args.num_workers,
         limit_train_batches=args.limit_train_batches, limit_val_batches=args.limit_val_batches,
@@ -167,8 +176,10 @@ def _gate(args) -> int:
             args.index, seeds=args.seeds, encoder=args.encoder,
             model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                               n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
-                              n_pma=args.n_pma),
+                              n_pma=args.n_pma, route_on=args.route_on,
+                              num_experts=args.num_experts, k=args.k, d_sig=args.d_sig),
             fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
+            lambda_ortho=args.lambda_ortho,
             batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
             max_epochs=args.epochs, num_workers=args.num_workers,
             limit_train_batches=args.limit_train_batches, limit_val_batches=args.limit_val_batches,
@@ -179,7 +190,8 @@ def _gate(args) -> int:
 
     records = load_records(out_dir)
     if args.aggregate:
-        print(format_table(records, split="test", baseline="setjoin"))
+        print(format_table(records, split="test",
+                           baseline=runner.variant_of(dict(route_on=args.route_on))))
         return 0
     if args.compare:
         print(runner.compare_table(records))

@@ -300,3 +300,23 @@ blocker). Still unsolved: site-success (0.94 ≈ mean predictor even with ~10 st
 label likely depends on study outcomes, 2-hop o2m) and study-adverse (everything loses to RT here;
 MoRE ties us). user-repeat's remaining −1.7 gap is consistent with missing co-attendee context (2-hop).
 Cost: ~2.4 GPU-h for the full gate.
+
+## Phase S5 — the MoE lands in SetJoin ("that was the whole thing")
+
+SetJoin now carries **MoRE's Mixture-of-Relational-Experts FFN in every wide/set layer**
+(`gloss/model/moe.py::MoEFFN` reused verbatim; new `MoELayer` = pre-norm attention + MoE-FFN).
+Value-free routing signatures computed once per forward: `WideSignature` (wide tokens ARE cells → the
+true MoRE cell signature: frozen name emb + modality + Δt + join path; learned CLS sig) and
+`ElemSignature` (row analog: table + FK role + Δt + hop; learned null sig). Arms `route_on ∈
+{signature, hidden, dense}` — `dense` keeps the stock layers byte-identical to the v2 gate model, so
+**v2 IS the dense baseline** of the in-substrate ablation. Balance = router orthogonality → `aux`,
+weighted `λ_ortho=0.5` in the Lit module. CLI: `--route-on --num-experts --k --d-sig --lambda-ortho`;
+records carry `variant setjoin-<arm>` (dense keeps bare `setjoin` for v1/v2 back-compat).
+
+Subtlety unit-tested: wide-signature routing needs `n_wide_layers ≥ 2` to influence the CLS readout
+(with 1 layer no attention follows the FFN, so non-CLS routed outputs never reach CLS).
+
+DoD: `pytest` **101 passed, 1 skipped** (new: hermetic MoELayer routing/perm-invariance; signature-arm
+aux>0 + router/signature grad flow; dense-arm aux==0 no-router regression; signatures value-free under
+tf value perturbation). `--dry-run`: aux=0.655, 2.22M params (vs 0.91M dense). Gate v3 (signature arm,
+27 cells) submitted → `results/setjoin_v3/`.

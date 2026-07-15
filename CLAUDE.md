@@ -45,9 +45,12 @@ This branch adds **SetJoin** — "one big joined table" + set transformer — as
 `gloss/setjoin/` (own specs: [setjoin_idea.md](setjoin_idea.md) / [setjoin_implementation.md](setjoin_implementation.md),
 own runner `scripts/run_setjoin.{py,sh}`, own tests `tests/test_join_*.py` + `tests/test_setjoin_*.py`).
 Per seed it builds a **wide m2o-flattened row** + **one table-tagged union set of child rows** from the
-SAME temporal sampler, and pools the set with a seed-conditioned set transformer. It reuses MoRE's data
-pipeline, `CellEncoder.encode_type`, text stack, and train/eval scaffolding, but **modifies no MoRE
-file** — everything below this section describes the MoRE main line and still applies here.
+SAME temporal sampler, and pools the set with a seed-conditioned set transformer whose every FFN is
+**MoRE's signature-routed `MoEFFN`** (reused verbatim; wide cells route on the name/modality/recency
+cell signature, set elements on a table/FK-role/recency row signature; arms `signature|hidden|dense`,
+`dense` = the v2 gate). It reuses MoRE's data pipeline, `CellEncoder.encode_type`, text stack, and
+train/eval scaffolding, but **modifies no MoRE file** — everything below this section describes the
+MoRE main line and still applies here.
 
 ## Naming: MoRE = the method, `gloss` = the package
 
@@ -165,6 +168,42 @@ binary, `driver-position`/`qualifying-position`/`results-position` regression). 
 smallest** by rows — **rel-f1, rel-stack, rel-trial** — all entity (classification + regression) tasks,
 TEST-set reported. `entity_tasks()` enumerates them and excludes link/recommendation. **rel-stack is not cached
 yet** (download + `build_schema_cache.sh` before the SLURM array). rel-trial and rel-event are cached.
+
+## RESULTS — architecture grid search (2026-07-12; sweep 2450/2592 done)
+
+The headline. **Best MoRE config per task** (`route_on=signature`, harrier encoder, 3 seeds, 30 epochs)
+vs the two RelBench-leaderboard references: **`RT (from scratch)`** — the plain-RT method we build on, the
+*direct* baseline — and **`GelGT`**, the strongest task-specific competitor. AUROC ×100 (higher better);
+**NMAE = MAE / train-std** (lower better; the pipeline stores raw `test_mae`, divide by
+`finetune.target_stats(task)[1]`). Baselines: `results/leaderboard_baselines.json`. Runs:
+`results/gridsearch/*.json`; aggregate: `scripts/run_gridsearch.py --aggregate`.
+
+| Task | Metric | GelGT | RT (scratch) | **MoRE (best)** | >RT | >GelGT | best config |
+|---|---|--:|--:|--:|:--:|:--:|---|
+| rel-f1/driver-top3 | AUROC↑ | 84.1 | 82.7 | **90.6** | ✅ | ✅ | d_model=128, n_blocks=8, n_heads=4, d_ff=512, experts=8 |
+| rel-event/user-ignore | AUROC↑ | 87.8 | 85.1 | **89.3** ⚠️n=1 | ✅ | ✅ | d_model=512, n_blocks=8, n_heads=4, d_ff=1024, experts=4 |
+| rel-f1/driver-dnf | AUROC↑ | 76.1 | 78.7 | **82.8** | ✅ | ✅ | d_model=128, n_blocks=8, n_heads=8, d_ff=256, experts=4 |
+| rel-trial/study-outcome | AUROC↑ | 72.5 | 68.6 | **70.7** | ✅ | ❌ | d_model=256, n_blocks=8, n_heads=8, d_ff=512, experts=4 |
+| rel-event/user-repeat | AUROC↑ | 83.6 | 79.7 | 79.0 | ❌ | ❌ | d_model=128, n_blocks=4, n_heads=4, d_ff=512, experts=4 |
+| rel-f1/driver-position | NMAE↓ | 0.531 | 0.477 | **0.395** | ✅ | ✅ | d_model=128, n_blocks=8, n_heads=4, d_ff=256, experts=8 |
+| rel-event/user-attendance | NMAE↓ | 0.317 | 0.504 | **0.383** ⚠️n=1 | ✅ | ❌ | d_model=512, n_blocks=8, n_heads=8, d_ff=1024, experts=4 |
+| rel-trial/study-adverse | NMAE↓ | 0.126 | 0.131 | 0.155 | ❌ | ❌ | d_model=256, n_blocks=4, n_heads=8, d_ff=512, experts=8 |
+| rel-trial/site-success | NMAE↓ | 0.732 | 0.734 | 0.840 | ❌ | ❌ | d_model=128, n_blocks=8, n_heads=8, d_ff=256, experts=8 |
+
+**MoRE beats `RT (from scratch)` on 6/9 and `GelGT` on 4/9.** Winners are **small** (`d_model` 128–256 on
+7/9; ~5–7M *active* params, top-2 of M experts). Losses: `user-repeat` (thin), and `study-adverse` /
+`site-success` (hard tasks; nothing beats the baselines there).
+
+⚠️ `user-ignore` and `user-attendance` bests are **single-seed** — re-seed to 3 before trusting the margin
+(best-of-~90-configs on 1 seed carries winner's-curse risk). 135 cells failed on the sporadic
+`num_workers>0` collation assert; re-run those with `--num-workers 0`.
+
+**MoE-additions ablation (S/C/P/H) — DONE, negative result.** 16 arms (`signature`/`hidden` × the
+shared-expert/cosine/Top-P/HMoE ladder). **No addition beats its base router.** `signature` is the stronger
+base (mean AUROC 78.2 vs `hidden` 76.6). Shared expert (S) is the only positive signal and it's narrow (best
+mean NMAE 0.474 vs base 0.483, at an AUROC cost). HMoE × `hidden` NaN'd (needed the non-finite-grad guard in
+`train/loop.py`) and still doesn't win. Results: `results/v2_add_{signature,hidden}/`. **Conclusion: the win
+comes from the core signature-routing mechanism + backbone sizing, not add-ons — keep the model simple.**
 
 ## Commands
 

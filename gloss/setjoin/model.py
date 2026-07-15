@@ -1,17 +1,25 @@
-"""The SetJoin model: wide-row tabular transformer + seed-conditioned set transformer.
+"""The SetJoin model: wide-row tabular transformer + seed-conditioned set transformer, with the
+Mixture-of-Relational-Experts FFN inside every layer ("route on semantics, transform the content" on
+the single-table substrate).
 
-    seed_repr = WideEncoder( wide cells + path/recency tags, missing markers )        # CLS readout
+    seed_repr = WideEncoder( wide cells + path/recency tags, missing markers | z_wide )   # CLS readout
     E_n       = RowPool(child_n cells) + Σ_p RowPool(parent_p cells) + fk/table/Δt/hop tags
-    context   = SetEncoder( {E_n} ∪ {null_elem} | seed_repr )                          # PMA readout
+    context   = SetEncoder( {E_n} ∪ {null} | seed_repr, z_elem )                           # PMA readout
     logits    = MLP([seed_repr ; context ; W_cnt log1p(child_counts)])
 
-Cell encoding reuses ``CellEncoder.encode_type`` verbatim (frozen-LM name token + pytorch-frame stype
-value encoder); each sampled node type is encoded ONCE and shared between the wide grid (cell-granular
-scatter) and the set elements (row-pooled additive scatter). The set path uses no positional encoding
-anywhere — permutation invariance of the pooled context is a tested contract. ``table_emb`` on elements
-is load-bearing, not decorative: ``fk_role_id`` is keyed by canonical FK *column name* and collides
-across tables. ``aux`` is always 0 — kept so the ``forward -> (logits, aux)`` contract matches MoRE and
-the training scaffolding forks stay thin.
+Every transformer layer's FFN is MoRE's ``MoEFFN`` (reused verbatim from ``gloss/model/moe.py``): a
+pool of SwiGLU experts whose top-k router reads a **value-free signature** while the experts transform
+the evolving hidden state. Wide tokens ARE cells, so they route on the true MoRE signature — frozen-LM
+column-name embedding + modality + recency (+ join path). Set elements are rows, so they route on the
+row-level analog — table type + FK role + recency (+ hop). Balance is the router-orthogonality loss,
+summed over layers and returned as ``aux``.
+
+``route_on`` arms: ``signature`` (the method) | ``hidden`` (router reads the normed hidden state) |
+``dense`` (plain FFN layers, aux=0 — the v2-gate baseline). Cell encoding reuses
+``CellEncoder.encode_type`` verbatim; each sampled node type is encoded ONCE and shared between the
+wide grid and the set elements. No positional encoding on the set path — permutation invariance of the
+pooled context is a tested contract. ``table_emb`` on elements is load-bearing (``fk_role_id`` is keyed
+by canonical FK column name and collides across tables).
 """
 from __future__ import annotations
 
@@ -20,9 +28,12 @@ from torch import Tensor, nn
 
 from ..data.graph import GraphBundle
 from ..model.column_encoder import CellEncoder
+from ..model.moe import MoEFFN
 from .collate import JoinBatch
 from .paths import child_rels, m2o_paths
 from .recency import N_RECENCY_BINS, recency_bins
+
+ROUTE_ARMS = ("signature", "hidden", "dense")
 
 
 class RowPool(nn.Module):
@@ -46,23 +57,142 @@ def _encoder_layer(d_model: int, n_heads: int, dropout: float) -> nn.Transformer
     )
 
 
+class MoELayer(nn.Module):
+    """Pre-norm attention + MoE-FFN layer (the SetJoin analog of MoRE's RelationalBlock): the router
+    reads the value-free per-token signature ``z`` (or the normed hidden state for the ``hidden`` arm);
+    the experts transform the hidden state."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, d_route: int, *,
+                 num_experts: int = 4, k: int = 2, dropout: float = 0.1,
+                 route_on: str = "signature"):
+        super().__init__()
+        self.route_on = route_on
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor, z: Tensor | None, key_padding_mask: Tensor | None) -> Tensor:
+        h = self.norm1(x)
+        a, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
+        x = x + self.drop(a)
+        h = self.norm2(x)
+        y, _ = self.ffn(h, z if self.route_on == "signature" else h)
+        return x + self.drop(y)
+
+
+class _MoEStack(nn.Module):
+    """A stack of dense TransformerEncoder layers (``route_on='dense'``) or MoELayers, one interface."""
+
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
+                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int):
+        super().__init__()
+        self.route_on = route_on
+        if route_on == "dense":
+            self.layers = nn.TransformerEncoder(_encoder_layer(d_model, n_heads, dropout), n_layers,
+                                                enable_nested_tensor=False)
+        else:
+            self.layers = nn.ModuleList(
+                MoELayer(d_model, n_heads, d_ff, d_route, num_experts=num_experts, k=k,
+                         dropout=dropout, route_on=route_on)
+                for _ in range(n_layers))
+
+    def forward(self, x: Tensor, pad: Tensor, z: Tensor | None) -> Tensor:
+        if self.route_on == "dense":
+            return self.layers(x, src_key_padding_mask=pad)
+        for lyr in self.layers:
+            x = lyr(x, z, pad)
+        return x
+
+    def ortho_loss(self) -> Tensor | float:
+        if self.route_on == "dense":
+            return 0.0
+        return sum(lyr.ffn.ortho_loss() for lyr in self.layers)
+
+
+class WideSignature(nn.Module):
+    """Value-free routing signature for the wide tokens — the MoRE cell signature on JoinBatch fields:
+
+        z = RMSNorm( W_s·name_emb[col] + ψ(modality) + φ(recency) + π(join path) )
+
+    Markers/pads keep only path+recency (no name/modality — there is no column). A learned CLS
+    signature is prepended to match the encoder's CLS token. Nothing value-dependent enters z.
+    """
+
+    def __init__(self, name_emb: Tensor, modality_id: Tensor, n_stypes: int, n_paths: int, d_sig: int):
+        super().__init__()
+        self.register_buffer("name_emb", name_emb.detach().to(torch.float32), persistent=False)
+        self.register_buffer("modality_id", modality_id.detach().to(torch.long), persistent=False)
+        self.schema_proj = nn.Linear(int(name_emb.shape[1]), d_sig, bias=False)
+        self.stype_emb = nn.Embedding(max(int(n_stypes), 1), d_sig)
+        self.recency_emb = nn.Embedding(N_RECENCY_BINS, d_sig)
+        self.path_emb = nn.Embedding(max(n_paths, 1), d_sig)
+        self.cls_sig = nn.Parameter(torch.randn(1, 1, d_sig) * 0.02)
+        self.norm = nn.RMSNorm(d_sig)
+
+    def forward(self, jb: JoinBatch) -> Tensor:            # -> [B, W+1, d_sig]
+        col = jb.wide_col_idxs.clamp(min=0)
+        B, W = col.shape
+        flat = col.reshape(-1)
+        name = self.name_emb.index_select(0, flat).view(B, W, -1)
+        mod = self.modality_id.index_select(0, flat).view(B, W)
+        has_col = (jb.wide_col_idxs >= 0).unsqueeze(-1).float()
+        z = (self.schema_proj(name) + self.stype_emb(mod)) * has_col
+        z = z + self.path_emb(jb.wide_path_idxs.clamp(min=0))
+        z = z + self.recency_emb(recency_bins(jb.seed_time, jb.wide_row_time, jb.wide_is_timed))
+        z = self.norm(z)
+        return torch.cat([self.cls_sig.expand(B, -1, -1), z], dim=1)
+
+
+class ElemSignature(nn.Module):
+    """Value-free routing signature for set elements — the row-level signature analog:
+
+        z = RMSNorm( table type + FK role + φ(recency) + hop )
+
+    A learned null-element signature is prepended to match the encoder's null token.
+    """
+
+    def __init__(self, num_node_types: int, num_fk_roles: int, d_sig: int):
+        super().__init__()
+        self.table_emb = nn.Embedding(num_node_types, d_sig)
+        self.fk_emb = nn.Embedding(num_fk_roles, d_sig)
+        self.recency_emb = nn.Embedding(N_RECENCY_BINS, d_sig)
+        self.hop_emb = nn.Embedding(4, d_sig)
+        self.null_sig = nn.Parameter(torch.randn(1, 1, d_sig) * 0.02)
+        self.norm = nn.RMSNorm(d_sig)
+
+    def forward(self, jb: JoinBatch) -> Tensor:            # -> [B, N+1, d_sig]
+        z = self.table_emb(jb.elem_table_idxs) + self.fk_emb(jb.elem_rel_idxs) \
+            + self.recency_emb(recency_bins(jb.seed_time, jb.elem_row_time, jb.elem_is_timed)) \
+            + self.hop_emb(jb.elem_hop.clamp(min=0, max=3))
+        z = self.norm(z)
+        return torch.cat([self.null_sig.expand(z.shape[0], -1, -1), z], dim=1)
+
+
 class WideEncoder(nn.Module):
     """Wide cell grid ``[B, W, d]`` (+ pad mask) -> ``seed_repr [B, d]`` via a prepended CLS token.
 
     The CLS is never key-masked, so a degenerate all-pad wide row still yields a finite readout.
     """
 
-    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
+                 route_on: str = "dense", d_ff: int | None = None, d_route: int | None = None,
+                 num_experts: int = 4, k: int = 2):
         super().__init__()
         self.cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.layers = nn.TransformerEncoder(_encoder_layer(d_model, n_heads, dropout), n_layers,
-                                            enable_nested_tensor=False)
+        self.stack = _MoEStack(d_model, n_layers, n_heads, dropout, route_on=route_on,
+                               d_ff=d_ff or 2 * d_model, d_route=d_route or d_model,
+                               num_experts=num_experts, k=k)
 
-    def forward(self, h: Tensor, is_pad: Tensor) -> Tensor:
+    def forward(self, h: Tensor, is_pad: Tensor, z: Tensor | None = None) -> Tensor:
         B = h.shape[0]
         x = torch.cat([self.cls.expand(B, -1, -1), h], dim=1)
         pad = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=h.device), is_pad], dim=1)
-        return self.layers(x, src_key_padding_mask=pad)[:, 0]
+        return self.stack(x, pad, z)[:, 0]
+
+    def ortho_loss(self):
+        return self.stack.ortho_loss()
 
 
 class SetEncoder(nn.Module):
@@ -74,24 +204,30 @@ class SetEncoder(nn.Module):
     ``n_pma`` learned queries, each shifted by a projection of ``seed_repr``, cross-attend into the set.
     """
 
-    def __init__(self, d_model: int, n_layers: int, n_heads: int, n_pma: int, dropout: float):
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, n_pma: int, dropout: float, *,
+                 route_on: str = "dense", d_ff: int | None = None, d_route: int | None = None,
+                 num_experts: int = 4, k: int = 2):
         super().__init__()
         self.null_elem = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.layers = nn.TransformerEncoder(_encoder_layer(d_model, n_heads, dropout), n_layers,
-                                            enable_nested_tensor=False)
+        self.stack = _MoEStack(d_model, n_layers, n_heads, dropout, route_on=route_on,
+                               d_ff=d_ff or 2 * d_model, d_route=d_route or d_model,
+                               num_experts=num_experts, k=k)
         self.pma_emb = nn.Parameter(torch.randn(1, n_pma, d_model) * 0.02)
         self.w_q = nn.Linear(d_model, d_model)
         self.pma = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.out = nn.Linear(n_pma * d_model, d_model)
 
-    def forward(self, E: Tensor, mask: Tensor, seed_repr: Tensor) -> Tensor:
+    def forward(self, E: Tensor, mask: Tensor, seed_repr: Tensor, z: Tensor | None = None) -> Tensor:
         B = E.shape[0]
         x = torch.cat([self.null_elem.expand(B, -1, -1), E], dim=1)
         kpm = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=E.device), ~mask], dim=1)
-        x = self.layers(x, src_key_padding_mask=kpm)
+        x = self.stack(x, kpm, z)
         q = self.pma_emb.expand(B, -1, -1) + self.w_q(seed_repr).unsqueeze(1)
         ctx, _ = self.pma(q, x, x, key_padding_mask=kpm, need_weights=False)
         return self.out(ctx.reshape(B, -1))
+
+    def ortho_loss(self):
+        return self.stack.ortho_loss()
 
 
 class SetJoin(nn.Module):
@@ -109,10 +245,18 @@ class SetJoin(nn.Module):
         n_pma: int = 4,
         dropout: float = 0.1,
         out_dim: int = 1,
+        route_on: str = "signature",
+        num_experts: int = 4,
+        k: int = 2,
+        d_sig: int = 64,
+        d_ff: int | None = None,
     ):
         super().__init__()
+        if route_on not in ROUTE_ARMS:
+            raise ValueError(f"route_on must be one of {ROUTE_ARMS}, got {route_on!r}")
         self.d_model = d_model
         self.entity_table = entity_table
+        self.route_on = route_on
         self.encoder = CellEncoder(bundle, name_emb, d_model=d_model, enc_channels=enc_channels)
 
         n_paths = len(m2o_paths(bundle, entity_table, depth=2))
@@ -124,9 +268,22 @@ class SetJoin(nn.Module):
         self.hop_emb = nn.Embedding(4, d_model)
         self.missing_emb = nn.Parameter(torch.randn(d_model) * 0.02)
 
+        # value-free routing signatures (signature arm only; hidden routes on the normed state)
+        if route_on == "signature":
+            from ..text.schema import build_column_modality_ids
+
+            modality_id, n_stypes = build_column_modality_ids(bundle)
+            self.wide_sig = WideSignature(self.encoder.name_emb, modality_id, n_stypes,
+                                          n_paths, d_sig)
+            self.elem_sig = ElemSignature(bundle.num_node_types, bundle.num_fk_roles, d_sig)
+        else:
+            self.wide_sig = self.elem_sig = None
+        d_route = d_sig if route_on == "signature" else d_model
+
+        moe = dict(route_on=route_on, d_ff=d_ff, d_route=d_route, num_experts=num_experts, k=k)
         self.row_pool = RowPool(d_model)
-        self.wide_enc = WideEncoder(d_model, n_wide_layers, n_heads, dropout)
-        self.set_enc = SetEncoder(d_model, n_set_layers, n_heads, n_pma, dropout)
+        self.wide_enc = WideEncoder(d_model, n_wide_layers, n_heads, dropout, **moe)
+        self.set_enc = SetEncoder(d_model, n_set_layers, n_heads, n_pma, dropout, **moe)
         self.elem_norm = nn.LayerNorm(d_model)
         self.w_cnt = nn.Linear(self.n_child_rels, d_model) if self.n_child_rels else None
         self.head = nn.Sequential(
@@ -161,7 +318,8 @@ class SetJoin(nn.Module):
         marker = self.missing_emb.view(1, 1, -1) + self.table_emb(jb.wide_table_idxs.clamp(min=0))
         h = h + jb.wide_missing.unsqueeze(-1).float() * marker
         h = h * (~jb.wide_is_pad).unsqueeze(-1).float()
-        seed_repr = self.wide_enc(h, jb.wide_is_pad)                    # [B, d]
+        z_w = self.wide_sig(jb) if self.wide_sig is not None else None
+        seed_repr = self.wide_enc(h, jb.wide_is_pad, z_w)               # [B, d]
 
         # ---- set elements: additive row scatter (child @ FK_NONE + flattened parents @ fk role) ----
         E = torch.zeros(B, N, d, device=dev)
@@ -174,7 +332,8 @@ class SetJoin(nn.Module):
         E = E + self.fk_emb(jb.elem_rel_idxs) + self.table_emb(jb.elem_table_idxs) \
             + self.recency_emb(elem_rec) + self.hop_emb(jb.elem_hop.clamp(min=0, max=3))
         E = self.elem_norm(E) * jb.elem_mask.unsqueeze(-1).float()
-        context = self.set_enc(E, jb.elem_mask, seed_repr)              # [B, d]
+        z_e = self.elem_sig(jb) if self.elem_sig is not None else None
+        context = self.set_enc(E, jb.elem_mask, seed_repr, z_e)         # [B, d]
 
         # ---- head ----
         if self.w_cnt is not None:
@@ -182,4 +341,7 @@ class SetJoin(nn.Module):
         else:
             cnt = torch.zeros(B, d, device=dev)
         logits = self.head(torch.cat([seed_repr, context, cnt], dim=-1))
-        return logits, logits.new_zeros(())
+        aux = self.wide_enc.ortho_loss() + self.set_enc.ortho_loss()    # router orthogonality balance
+        if not torch.is_tensor(aux):
+            aux = logits.new_zeros(())                                  # dense arm
+        return logits, aux

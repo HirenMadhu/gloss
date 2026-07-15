@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from gloss.setjoin.model import RowPool, SetEncoder, SetJoin, WideEncoder
+from gloss.setjoin.model import MoELayer, RowPool, SetEncoder, SetJoin, WideEncoder
 
 from .conftest import rel_f1_available
 
@@ -45,6 +45,29 @@ def test_set_encoder_permutation_invariance():
     assert torch.allclose(out, out_p, atol=1e-5)
 
 
+def test_moe_layer_routes_and_flows():
+    d_sig = 8
+    lyr = MoELayer(D, n_heads=2, d_ff=2 * D, d_route=d_sig, num_experts=3, k=2,
+                   dropout=0.0, route_on="signature")
+    x = torch.randn(2, 5, D, requires_grad=True)
+    z = torch.randn(2, 5, d_sig)
+    kpm = torch.zeros(2, 5, dtype=torch.bool)
+    out = lyr(x, z, kpm)
+    assert out.shape == (2, 5, D) and torch.isfinite(out).all()
+    # different signatures -> different routing -> different output
+    out2 = lyr(x, torch.randn(2, 5, d_sig), kpm)
+    assert not torch.allclose(out, out2, atol=1e-6)
+    out.sum().backward()
+    assert lyr.ffn.router.weight.grad is not None and x.grad is not None
+    assert float(lyr.ffn.ortho_loss()) >= 0.0
+    # set-side permutation invariance survives the MoE layer (z permutes with x)
+    lyr.eval()
+    perm = torch.tensor([3, 1, 4, 0, 2])
+    a = lyr(x.detach(), z, kpm)
+    b = lyr(x.detach()[:, perm], z[:, perm], kpm[:, perm])
+    assert torch.allclose(a[:, perm], b, atol=1e-5)
+
+
 def test_set_encoder_empty_set_and_seed_conditioning():
     enc = SetEncoder(D, n_layers=1, n_heads=2, n_pma=2, dropout=0.0).eval()
     E = torch.zeros(2, 4, D)
@@ -68,7 +91,7 @@ def test_set_encoder_empty_set_and_seed_conditioning():
 
 # ---------- full model on the cached real dataset ----------
 
-def _real_jb_and_model(encoder="hash"):
+def _real_jb_and_model(encoder="hash", route_on="signature"):
     from relbench.tasks import get_task
 
     from gloss.data.graph import build_gloss_graph, make_loader
@@ -82,23 +105,52 @@ def _real_jb_and_model(encoder="hash"):
                          batch_size=8)
     jb = to_join_batch(next(iter(loader)), bundle, task.entity_table, wide_len=64, set_size=32)
     name_emb = name_embeddings(bundle, "rel-f1", encoder=encoder, d_text=32)
+    # n_wide_layers=2, NOT 1: with a single wide layer the non-CLS tokens' FFN outputs never reach
+    # the CLS readout (no attention follows the FFN), so wide-signature routing would get zero grad.
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=32, n_heads=2,
-                    n_wide_layers=1, n_set_layers=1, n_pma=2, dropout=0.0)
+                    n_wide_layers=2, n_set_layers=1, n_pma=2, dropout=0.0,
+                    route_on=route_on, num_experts=3, k=2, d_sig=16)
     return jb, model
 
 
 @rel_f1_available
 def test_forward_shapes_grads_and_budget():
+    # default arm = signature-routed MoE (the method): aux is the router ortho loss, > 0
     jb, model = _real_jb_and_model()
     logits, aux = model(jb)
     assert logits.shape == (jb.num_seeds, 1) and torch.isfinite(logits).all()
-    assert float(aux) == 0.0
+    assert torch.isfinite(aux) and float(aux) > 0.0
     assert sum(p.numel() for p in model.parameters()) < 30e6
-    logits.sum().backward()
+    (logits.sum() + aux).backward()
     for name in ("row_pool.w1.weight", "path_emb.weight", "fk_emb.weight", "table_emb.weight",
-                 "set_enc.null_elem", "encoder.name_proj.weight"):
+                 "set_enc.null_elem", "encoder.name_proj.weight",
+                 "wide_enc.stack.layers.0.ffn.router.weight",
+                 "set_enc.stack.layers.0.ffn.router.weight",
+                 "wide_sig.schema_proj.weight", "elem_sig.fk_emb.weight"):
         g = dict(model.named_parameters())[name].grad
         assert g is not None and float(g.abs().sum()) > 0, name
+
+
+@rel_f1_available
+def test_dense_arm_has_no_moe_and_zero_aux():
+    jb, model = _real_jb_and_model(route_on="dense")
+    logits, aux = model(jb)
+    assert torch.isfinite(logits).all() and float(aux) == 0.0
+    assert model.wide_sig is None and model.elem_sig is None
+    assert not any("ffn.router" in n for n, _ in model.named_parameters())
+
+
+@rel_f1_available
+def test_signatures_are_value_free():
+    # the routing signal must not depend on cell VALUES — only on schema ids and times
+    jb, model = _real_jb_and_model()
+    z_w, z_e = model.wide_sig(jb), model.elem_sig(jb)
+    import torch_frame
+
+    for tf in jb.tf_dict.values():                          # perturb every numerical value
+        if torch_frame.numerical in tf.feat_dict:
+            tf.feat_dict[torch_frame.numerical] += 123.0
+    assert torch.equal(z_w, model.wide_sig(jb)) and torch.equal(z_e, model.elem_sig(jb))
 
 
 @rel_f1_available

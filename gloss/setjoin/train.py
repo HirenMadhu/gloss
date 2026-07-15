@@ -38,6 +38,7 @@ class SetJoinLitModule(pl.LightningModule):
         weight_decay: float = 0.01,
         wide_len: int = 128,
         set_size: int = 128,
+        lambda_ortho: float = 0.5,
     ):
         super().__init__()
         self.bundle = bundle
@@ -49,6 +50,7 @@ class SetJoinLitModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.wide_len = wide_len
         self.set_size = set_size
+        self.lambda_ortho = lambda_ortho
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
         self.model = SetJoin(bundle, name_emb, entity_table, **mk)
@@ -69,9 +71,10 @@ class SetJoinLitModule(pl.LightningModule):
         return target
 
     def training_step(self, jb, _idx):
-        logits, _aux = self.model(jb)
+        logits, aux = self.model(jb)
         y = self._standardize(jb.target)
-        loss = task_loss(logits.squeeze(-1), y, jb.has_target, self.task_type)
+        loss = task_loss(logits.squeeze(-1), y, jb.has_target, self.task_type) \
+            + self.lambda_ortho * aux                       # router orthogonality (0 on the dense arm)
         self.log("train/loss", loss, prog_bar=True, batch_size=int(jb.num_seeds))
         return loss
 
@@ -117,6 +120,7 @@ def train_prebuilt_setjoin(
     fanout: int = 64,
     wide_len: int = 128,
     set_size: int = 128,
+    lambda_ortho: float = 0.5,
     batch_size: int = 128,
     lr: float = 3e-4,
     weight_decay: float = 0.01,
@@ -140,7 +144,7 @@ def train_prebuilt_setjoin(
         bundle, name_emb, task.entity_table,
         task_type=kind, target_mean=mean, target_std=std,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
-        wide_len=wide_len, set_size=set_size,
+        wide_len=wide_len, set_size=set_size, lambda_ortho=lambda_ortho,
     )
     dm = MoREDataModule(bundle, task, num_neighbors=setjoin_neighbors(bundle, fanout),
                         batch_size=batch_size, num_workers=num_workers)

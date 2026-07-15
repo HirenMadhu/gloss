@@ -37,19 +37,29 @@ The as-of join is never materialized: RelBench's leakage-safe temporal neighbor 
 (`time_attr="time"`, `temporal_strategy="last"`) already yields exactly the as-of-correct rows per
 seed, so SetJoin is a **collate + model**, not a data pipeline.
 
-## The one mechanism
+## The mechanism
 
 Per seed: cell-encode every relevant row with the frozen-LM-name + stype value encoder (shared with
 RT/MoRE), then
 
 ```
-seed_repr = TabularTransformer( wide seed row cells + join-path tags )        # CLS readout
-E_i       = RowPool(child_i cells) + Σ RowPool(child_i's parents) + tags      # tags: relation, table, Δt-recency
-context   = PMA_{seed_repr}( SetAttention({E_i} ∪ {null}) )                   # seed-conditioned pooled readout
+seed_repr = TabularTransformer( wide seed row cells + join-path tags | z_wide )   # CLS readout
+E_i       = RowPool(child_i cells) + Σ RowPool(child_i's parents) + tags          # tags: relation, table, Δt-recency
+context   = PMA_{seed_repr}( SetAttention({E_i} ∪ {null} | z_elem) )              # seed-conditioned pooled readout
 ŷ         = MLP([seed_repr ; context ; log1p(child counts)])
 ```
 
 No relational attention masks, no graph message passing at depth — one flat row, one set, one pooling.
+
+**Every layer's FFN is MoRE's Mixture-of-Relational-Experts** (`MoEFFN`, reused verbatim): the top-k
+router reads a **value-free signature** while the experts transform the hidden state — "route on
+semantics, transform the content", carried onto the single-table substrate. Wide tokens ARE cells, so
+they route on the true MoRE cell signature, `z_wide = RMSNorm(W_s·name_c + ψ(modality_c) + φ(Δt) +
+π(join path))`; set elements are rows, so they route on the row-level analog, `z_elem =
+RMSNorm(table + FK role + φ(Δt) + hop)`. Balance is the router-orthogonality loss (`aux`, weighted by
+`λ_ortho`), not a uniform load-balancing loss. Routing arms: `signature` (the method) | `hidden`
+(router reads the normed hidden state) | `dense` (plain FFNs, aux=0) — `signature vs dense` is the
+in-substrate headline, and the dense arm is exactly the v2 gate.
 
 ## Positioning
 

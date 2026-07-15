@@ -104,9 +104,22 @@ reports wide/set truncation and empty-set counts).
 
 ## `SetJoin` model
 
-`SetJoin(bundle, name_emb, *, d_model=128, enc_channels=None, n_wide_layers=2, n_set_layers=2,
-n_heads=4, n_pma=4, dropout=0.1, out_dim=1)`; `forward(jb) -> (logits [B,out_dim], aux)` with
-`aux = 0` (keeps MoRE's `(logits, aux)` contract so the training forks stay thin).
+`SetJoin(bundle, name_emb, entity_table, *, d_model=128, enc_channels=None, n_wide_layers=2,
+n_set_layers=2, n_heads=4, n_pma=4, dropout=0.1, out_dim=1, route_on="signature", num_experts=4, k=2,
+d_sig=64, d_ff=None→2·d_model)`; `forward(jb) -> (logits [B,out_dim], aux)` where `aux` = summed
+router-orthogonality loss (0 on the `dense` arm).
+
+**MoE FFN (the MoRE mechanism on this substrate):** every wide/set layer's FFN is
+`gloss/model/moe.py`'s `MoEFFN`, reused verbatim (`MoELayer` = pre-norm attention + MoE-FFN; the
+`dense` arm keeps the stock `nn.TransformerEncoder` path, byte-identical to the v2 gate model).
+Routing signals, computed ONCE per forward and value-free by construction:
+- `WideSignature` (wide tokens ARE cells → the true MoRE cell signature): `z = RMSNorm(W_s·name_emb[col]
+  + ψ(modality) + φ(Δt recency) + π(join path))`; markers/pads keep only path+recency; learned CLS sig.
+- `ElemSignature` (row-level analog): `z = RMSNorm(table + FK role + φ(Δt) + hop)`; learned null sig.
+- `route_on ∈ {signature, hidden, dense}` — `hidden` routes on the normed hidden state (`d_route =
+  d_model`); `signature` uses `d_sig`. Training adds `λ_ortho · aux` (default 0.5) to the task loss.
+- NOTE: wide-signature routing needs `n_wide_layers ≥ 2` to influence the CLS readout — with a single
+  layer no attention follows the FFN, so non-CLS routed outputs never reach CLS (unit-tested).
 
 - Cells: `CellEncoder.encode_type(nt, tf)` → `[n, C, d_model]` (frozen name token + stype value enc).
 - `WideEncoder`: scatter wide cells → `[B,W,d]`; + `path_emb + recency_emb`; missing markers =
@@ -128,9 +141,9 @@ n_heads=4, n_pma=4, dropout=0.1, out_dim=1)`; `forward(jb) -> (logits [B,out_dim
 ## Training / eval / runner
 
 - `SetJoinLitModule` = `MoRELitModule` fork: `SetJoin` instead of `MoRE`, `to_join_batch` in
-  `transfer_batch_to_device`, no aux term in the loss. Identical `val/*` metric names (best-val
-  selection and early stopping monitor `val/auroc` max / `val/mae` min), identical regression
-  standardization, nan-grad guard kept.
+  `transfer_batch_to_device`, loss = `task_loss + λ_ortho·aux`. Identical `val/*` metric names
+  (best-val selection and early stopping monitor `val/auroc` max / `val/mae` min), identical
+  regression standardization, nan-grad guard kept.
 - `train_prebuilt_setjoin` mirrors `finetune.train_prebuilt` (same trainer flags,
   `gradient_clip_val=1.0`, patience 3, `seed_everything` first) with
   `num_neighbors=setjoin_neighbors(bundle, fanout)`.
