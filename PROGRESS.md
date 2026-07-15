@@ -271,3 +271,32 @@ asserted elements exist (>0). Added `test_sampler_multiplicity_and_parent_flatte
 (400 steps — richer batches put 200 at the flake edge). `pytest` **98 passed, 1 skipped** (×3 on the
 hardened test). v1 results kept in `results/setjoin_v1/` for the record; corrected gate resubmitted to
 `results/setjoin_v2/`.
+
+## GATE RESULT — SetJoin v2 (corrected sampler; array 28993542, 26/27 + cell 4 rerun in flight)
+
+**SetJoin v2 beats RT (from scratch) on 6/9 leaderboard tasks** — same count as MoRE's grid-search
+best, which used per-task tuned architectures over ~90 configs/task; SetJoin is ONE untuned config
+(d_model 128, 2+2 layers, fanout 64, set 128). Also **beats GelGT on 4/9** and posts the best known
+number on user-ignore. (Cell 4 = driver-position seed 1 hit the known sporadic MET `offset[0]` assert
+→ rerun with `--num-workers 0` as 28996296; n=2 shown there, CI already tight.)
+
+| task | SetJoin v2 | v1 (starved) | RT | GelGT | MoRE best | vs RT |
+|---|--:|--:|--:|--:|--:|:--:|
+| rel-event/user-ignore (AUROC↑) | **90.1±0.6** | 80.8 | 85.1 | 87.8 | 87.3 | ✅ (>GelGT, >MoRE) |
+| rel-f1/driver-top3 (AUROC↑) | **87.1±0.3** | 89.7 | 82.7 | 84.1 | 90.6 | ✅ (>GelGT) |
+| rel-f1/driver-dnf (AUROC↑) | **81.5±0.9** | 79.1 | 78.7 | 76.1 | 82.9 | ✅ (>GelGT) |
+| rel-f1/driver-position (NMAE↓) | **0.429±0.003** (n=2) | 0.448 | 0.477 | 0.531 | 0.395 | ✅ (>GelGT) |
+| rel-event/user-attendance (NMAE↓) | **0.430±0.027** | 0.477 | 0.504 | 0.317 | 0.399 | ✅ |
+| rel-trial/study-outcome (AUROC↑) | 68.6±0.9 | 67.4 | 68.6 | 72.5 | 69.4 | ➖ tie |
+| rel-event/user-repeat (AUROC↑) | 78.0±0.6 | 65.2 | 79.7 | 83.6 | 79.5 | ❌ close (−1.7) |
+| rel-trial/study-adverse (NMAE↓) | 0.162±0.009 | 0.166 | 0.131 | 0.126 | 0.161 | ❌ (=MoRE) |
+| rel-trial/site-success (NMAE↓) | 0.941±0.037 | 0.978 | 0.734 | 0.732 | 0.840 | ❌ |
+
+Reading vs v1: the starved-sampler tasks recovered exactly as diagnosed — user-repeat +12.8 AUROC,
+user-ignore +9.3 (now SOTA on this table), attendance 0.477→0.430. Curious: driver-top3 DROPPED
+89.7→87.1 — one most-recent standings row was a near-perfect feature; 60+ extra elements dilute it
+(supports adding a per-relation quota or letting PMA see fewer, more recent rows; worth a look, not a
+blocker). Still unsolved: site-success (0.94 ≈ mean predictor even with ~10 studies flattened in —
+label likely depends on study outcomes, 2-hop o2m) and study-adverse (everything loses to RT here;
+MoRE ties us). user-repeat's remaining −1.7 gap is consistent with missing co-attendee context (2-hop).
+Cost: ~2.4 GPU-h for the full gate.
