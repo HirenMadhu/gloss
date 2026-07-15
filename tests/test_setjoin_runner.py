@@ -58,8 +58,14 @@ def test_compare_table_renders_vs_leaderboard_baselines():
     assert "rel-f1 / driver-dnf" in out and "rel-f1 / driver-position" in out
     assert "81.000" in out                                 # AUROC mean x100
     assert "0.410" in out                                  # NMAE mean
-    assert "RT(scratch)" in out and "GelGT" in out and "MoRE best" in out
-    assert "* = beats RT" in out
+    assert "single table" in out and "multi table" in out and "RT" in out and "GelGT" in out
+    assert "±" not in out                                  # no CI/std in the table
+    assert "\033[1m" in out and "\033[4m" in out           # best bolded, 2nd best underlined
+    # driver-dnf: single table 81.0 > RT 78.7 > GelGT 76.1, MoRE 82.9 → best = multi table (82.9 bold),
+    # 2nd = single table (81.0 underlined)
+    assert "\033[1m" + f"{82.9:>12.3f}" + "\033[0m" in out
+    assert "\033[4m" + f"{81.0:>14.3f}" + "\033[0m" in out
+    assert "beats RT" in out
 
 
 def test_compare_table_empty():

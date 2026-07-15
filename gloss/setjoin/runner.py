@@ -134,21 +134,36 @@ def compare_table(records: list[dict], baselines_path: Path | str | None = None)
 
     lines = [f"{len(records)} runs.  binary: AUROC x100 (higher better)  |  "
              "regression: NMAE (lower better)", ""]
-    header = f"{'task':34s} {'SetJoin':>16s} {'RT(scratch)':>12s} {'GelGT':>8s} {'MoRE best':>10s}"
+    # column names: "single table" = SetJoin (this method), "multi table" = MoRE grid best (the
+    # repo's cell-token relational method), RT = RT (from scratch), GelGT = task-specific SOTA.
+    # Per row the BEST method is bold and the SECOND BEST underlined (ANSI; paper convention).
+    BOLD, UL, END = "\033[1m", "\033[4m", "\033[0m"
+    widths = (14, 8, 8, 12)
+    header = (f"{'task':34s} {'single table':>{widths[0]}s} {'RT':>{widths[1]}s} "
+              f"{'GelGT':>{widths[2]}s} {'multi table':>{widths[3]}s}")
     lines += [header, "-" * len(header)]
     for (ds, tk) in sorted(task_types):
         ttype = task_types[(ds, tk)]
         binary = ttype == "binary"
         key, scale = ("test_roc_auc", 100.0) if binary else ("test_nmae", 1.0)
-        mean, _sd, ci, n = agg.get((ds, tk, "setjoin"), {}).get(key, (float("nan"), 0, 0, 0))
+        mean, _sd, _ci, _n = agg.get((ds, tk, "setjoin"), {}).get(key, (float("nan"), 0, 0, 0))
         side = base.get("classification" if binary else "regression", {}).get(f"{ds} {tk}", {})
         rt = float(side["RT_from_scratch"]) if "RT_from_scratch" in side else float("nan")
         gg = float(side["GelGT"]) if "GelGT" in side else float("nan")
         more = MORE_GRID_BEST.get((ds, tk), float("nan"))
         ours = mean * scale
+        vals = [ours, rt, gg, more]
+        cells = [f"{v:>{w}.3f}" for v, w in zip(vals, widths)]      # pad BEFORE ANSI wrapping
+        ranked = sorted(((i, v) for i, v in enumerate(vals) if v == v),
+                        key=lambda t: -t[1] if binary else t[1])
+        if ranked:
+            i = ranked[0][0]
+            cells[i] = BOLD + cells[i] + END
+        if len(ranked) > 1:
+            i = ranked[1][0]
+            cells[i] = UL + cells[i] + END
         beats = (ours > rt) if binary else (ours < rt)
         mark = "" if ours != ours or rt != rt else (" *" if beats else "")
-        lines.append(f"{ds + ' / ' + tk:34s} {ours:10.3f}±{ci * scale:.3f}(n={n})"
-                     f" {rt:>12.3f} {gg:>8.3f} {more:>10.3f}{mark}")
-    lines += ["", "* = beats RT (from scratch), the target baseline"]
+        lines.append(f"{ds + ' / ' + tk:34s} {' '.join(cells)}{mark}")
+    lines += ["", "bold = best, underline = 2nd best; * = single table beats RT (the target baseline)"]
     return "\n".join(lines)
