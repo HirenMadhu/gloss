@@ -320,3 +320,21 @@ DoD: `pytest` **101 passed, 1 skipped** (new: hermetic MoELayer routing/perm-inv
 aux>0 + router/signature grad flow; dense-arm aux==0 no-router regression; signatures value-free under
 tf value perturbation). `--dry-run`: aux=0.655, 2.22M params (vs 0.91M dense). Gate v3 (signature arm,
 27 cells) submitted → `results/setjoin_v3/`.
+
+## Phase S6 — three-level attention (row / column / set): apples-to-apples with RT's masks
+
+`AxialCellEncoder` + `AxialCellBlock` (shared across types): per-seed per-type cell grids get
+row-level attention (across columns), column-level attention (same column across the seed's rows),
+and the signature-routed MoE FFN; set-level attention downstream completes RT's interaction patterns
+(same-row / same-column / cross-table) at axial cost `O(n·C² + C·n² + N²)` instead of RT's
+`O((n·C)²)`. Collate now carries per-TensorFrame-row metadata (`row_seg/row_times/row_timed`) for the
+grids. Default `n_axial_layers=0` and module created LAST in `__init__` — behavior- and RNG-order-
+preserving for the in-flight v3 arm; v4 enables it explicitly. Two findings while testing: constant
+perturbations lie in pre-norm LayerNorm's null space (tests must perturb randomly), and pad grid
+queries emit NaN under fully-masked SDPA which survives 0-weight attention (NaN·0=NaN) — pads are
+re-zeroed after every sublayer.
+
+DoD: `pytest` **107 passed, 1 skipped** (axial NaN-safety, cross-row mixing with cross-seed isolation,
+row-axis mixing, MoE routing/ortho, full three-level forward/grads on rel-f1, collate row metadata).
+`--dry-run --n-axial-layers 1`: aux=0.74, 2.75M params. Gate v4 (signature + axial, 27 cells)
+submitted → `results/setjoin_v4/`.

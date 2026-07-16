@@ -44,6 +44,8 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=2)
     ap.add_argument("--d-sig", type=int, default=64, help="signature width (signature arm)")
     ap.add_argument("--lambda-ortho", type=float, default=0.5, help="router orthogonality weight")
+    ap.add_argument("--n-axial-layers", type=int, default=0,
+                    help="row+column cell-attention blocks per node type (0 = off; the three-level arm uses 1)")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--n-wide-layers", type=int, default=2)
@@ -121,7 +123,8 @@ def _dry_run(args) -> int:
     name_emb = name_embeddings(bundle, args.dataset, encoder=args.encoder, d_text=64)
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
                     n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
-                    route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig)
+                    route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
+                    n_axial_layers=args.n_axial_layers)
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
         logits, aux = model(jb)
@@ -146,7 +149,7 @@ def _train(args) -> int:
         model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                           n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                           n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
-                          k=args.k, d_sig=args.d_sig),
+                          k=args.k, d_sig=args.d_sig, n_axial_layers=args.n_axial_layers),
         fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -177,7 +180,8 @@ def _gate(args) -> int:
             model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                               n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                               n_pma=args.n_pma, route_on=args.route_on,
-                              num_experts=args.num_experts, k=args.k, d_sig=args.d_sig),
+                              num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
+                              n_axial_layers=args.n_axial_layers),
             fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
             lambda_ortho=args.lambda_ortho,
             batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,

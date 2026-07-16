@@ -63,6 +63,11 @@ class JoinBatch:
     tf_dict: dict                  # node_type -> torch_frame.TensorFrame (as sampled)
     wide_placement: dict           # node_type -> (b, w, row_in_tf, col_pos) — CELL scatter into [B, W, d]
     elem_rows: dict                # node_type -> (b, n, row_in_tf, path_id) — additive ROW scatter into [B, N, d]
+    # ---- per-TensorFrame-row metadata [n_t] (axial row/column attention grids; disjoint sampling
+    # means every row copy belongs to exactly one seed) ----
+    row_seg: dict                  # node_type -> long [n_t]; the row's seed/segment index
+    row_times: dict                # node_type -> float64 [n_t]; 0 untimed (gate with row_timed)
+    row_timed: dict                # node_type -> bool [n_t]
     wide_truncated: int = 0        # seeds whose wide row hit the cap with cells left over
     set_truncated: int = 0         # seeds whose union set hit the cap with children left over
 
@@ -85,6 +90,9 @@ class JoinBatch:
             tf_dict={k: v.to(device) for k, v in self.tf_dict.items()},
             wide_placement={k: tuple(t.to(device) for t in v) for k, v in self.wide_placement.items()},
             elem_rows={k: tuple(t.to(device) for t in v) for k, v in self.elem_rows.items()},
+            row_seg={k: v.to(device) for k, v in self.row_seg.items()},
+            row_times={k: v.to(device) for k, v in self.row_times.items()},
+            row_timed={k: v.to(device) for k, v in self.row_timed.items()},
             wide_truncated=self.wide_truncated, set_truncated=self.set_truncated,
         )
 
@@ -320,6 +328,11 @@ def to_join_batch(
         return {nt: tuple(torch.tensor(x, dtype=torch.long) for x in p)
                 for nt, p in place.items() if p[0]}
 
+    # per-TensorFrame-row metadata for the axial (row/column) attention grids
+    row_seg = {nt: seg[type_slice[nt]].clone() for nt in node_types}
+    row_times = {nt: rowt[type_slice[nt]].clone() for nt in node_types}
+    row_timed = {nt: timed[type_slice[nt]].clone() for nt in node_types}
+
     return JoinBatch(
         num_seeds=B, wide_len=wide_len, set_size=set_size,
         wide_col_idxs=wide_col_idxs, wide_table_idxs=wide_table_idxs, wide_path_idxs=wide_path_idxs,
@@ -331,5 +344,6 @@ def to_join_batch(
         seed_time=seed_time, target=target, has_target=has_target, input_id=input_id,
         tf_dict={nt: batch[nt].tf for nt in node_types},
         wide_placement=pack(wide_place), elem_rows=pack(elem_place),
+        row_seg=row_seg, row_times=row_times, row_timed=row_timed,
         wide_truncated=wide_truncated, set_truncated=set_truncated,
     )

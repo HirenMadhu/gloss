@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from gloss.setjoin.model import MoELayer, RowPool, SetEncoder, SetJoin, WideEncoder
+from gloss.setjoin.model import (AxialCellEncoder, MoELayer, RowPool, SetEncoder, SetJoin,
+                                 WideEncoder)
 
 from .conftest import rel_f1_available
 
@@ -89,6 +90,58 @@ def test_set_encoder_empty_set_and_seed_conditioning():
     assert not torch.allclose(enc(E2, some, seed), enc(E2, some, seed + 1.0), atol=1e-5)
 
 
+def test_axial_encoder_shapes_and_nan_safety():
+    # seg 1 has ZERO rows of this type: its all-pad grid row must not leak NaN anywhere
+    enc = AxialCellEncoder(D, n_layers=1, n_heads=2, dropout=0.0,
+                           route_on="dense", d_ff=2 * D, d_route=D, num_experts=2, k=1).eval()
+    cell = torch.randn(5, 3, D)
+    seg = torch.tensor([0, 0, 0, 2, 2])
+    out = enc(cell, seg, num_seeds=3, z=None)
+    assert out.shape == cell.shape and torch.isfinite(out).all()
+
+
+def test_axial_column_attention_mixes_rows_within_seed_only():
+    enc = AxialCellEncoder(D, n_layers=1, n_heads=2, dropout=0.0,
+                           route_on="dense", d_ff=2 * D, d_route=D, num_experts=2, k=1).eval()
+    cell = torch.randn(4, 3, D)
+    seg = torch.tensor([0, 0, 1, 1])
+    base = enc(cell, seg, num_seeds=2, z=None)
+    pert = cell.clone()
+    # NOTE: perturb with a random vector — a constant shift lies in pre-norm LayerNorm's null space
+    torch.manual_seed(1)
+    pert[0] += torch.randn_like(pert[0])                    # perturb row 0 (seed 0)
+    out = enc(pert, seg, num_seeds=2, z=None)
+    assert not torch.allclose(out[1], base[1], atol=1e-6)   # same-seed row sees it (column attention)
+    assert torch.allclose(out[2:], base[2:], atol=1e-6)     # other seed is isolated (per-seed grids)
+
+
+def test_axial_row_attention_mixes_columns():
+    enc = AxialCellEncoder(D, n_layers=1, n_heads=2, dropout=0.0,
+                           route_on="dense", d_ff=2 * D, d_route=D, num_experts=2, k=1).eval()
+    cell = torch.randn(1, 4, D)                             # single row, 4 columns -> only row-level acts
+    seg = torch.tensor([0])
+    base = enc(cell, seg, num_seeds=1, z=None)
+    pert = cell.clone()
+    torch.manual_seed(1)
+    pert[0, 0] += torch.randn_like(pert[0, 0])              # random, not constant (LayerNorm null space)
+    out = enc(pert, seg, num_seeds=1, z=None)
+    assert not torch.allclose(out[0, 2], base[0, 2], atol=1e-6)   # col 0 change reaches col 2
+
+
+def test_axial_moe_arm_routes_and_balances():
+    d_sig = 8
+    enc = AxialCellEncoder(D, n_layers=1, n_heads=2, dropout=0.0,
+                           route_on="signature", d_ff=2 * D, d_route=d_sig, num_experts=3, k=2)
+    cell = torch.randn(4, 3, D, requires_grad=True)
+    seg = torch.tensor([0, 0, 1, 1])
+    z = torch.randn(4, 3, d_sig)
+    out = enc(cell, seg, num_seeds=2, z=z)
+    assert torch.isfinite(out).all()
+    (out.sum() + enc.ortho_loss()).backward()
+    assert enc.blocks[0].ffn.router.weight.grad is not None
+    assert cell.grad is not None and float(enc.ortho_loss()) >= 0.0
+
+
 # ---------- full model on the cached real dataset ----------
 
 def _real_jb_and_model(encoder="hash", route_on="signature"):
@@ -138,6 +191,35 @@ def test_dense_arm_has_no_moe_and_zero_aux():
     assert torch.isfinite(logits).all() and float(aux) == 0.0
     assert model.wide_sig is None and model.elem_sig is None
     assert not any("ffn.router" in n for n, _ in model.named_parameters())
+
+
+@rel_f1_available
+def test_three_level_model_forward_and_grads():
+    # v4 arm: axial (row+column) + set attention + signature-routed MoE everywhere
+    from relbench.tasks import get_task
+
+    from gloss.data.graph import build_gloss_graph, make_loader
+    from gloss.setjoin.collate import to_join_batch
+    from gloss.setjoin.paths import setjoin_neighbors
+    from gloss.train.finetune import name_embeddings
+
+    bundle = build_gloss_graph("rel-f1")
+    task = get_task("rel-f1", "driver-dnf", download=False)
+    loader = make_loader(bundle, task, "train", num_neighbors=setjoin_neighbors(bundle, fanout=8),
+                         batch_size=8)
+    jb = to_join_batch(next(iter(loader)), bundle, task.entity_table, wide_len=64, set_size=32)
+    name_emb = name_embeddings(bundle, "rel-f1", encoder="hash", d_text=32)
+    model = SetJoin(bundle, name_emb, task.entity_table, d_model=32, n_heads=2,
+                    n_wide_layers=2, n_set_layers=1, n_pma=2, dropout=0.0,
+                    route_on="signature", num_experts=3, k=2, d_sig=16, n_axial_layers=1)
+    logits, aux = model(jb)
+    assert logits.shape == (jb.num_seeds, 1) and torch.isfinite(logits).all()
+    assert torch.isfinite(aux) and float(aux) > 0.0
+    (logits.sum() + aux).backward()
+    for name in ("axial.blocks.0.attn_r.in_proj_weight", "axial.blocks.0.attn_c.in_proj_weight",
+                 "axial.blocks.0.ffn.router.weight"):
+        g = dict(model.named_parameters())[name].grad
+        assert g is not None and float(g.abs().sum()) > 0, name
 
 
 @rel_f1_available

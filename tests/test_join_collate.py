@@ -174,6 +174,17 @@ def test_dualfk_distinct_rel_ids_and_seed_exclusion():
 
 # ---------- dtypes / bookkeeping ----------
 
+def test_per_row_metadata_for_axial_grids():
+    jb = _jb()
+    # every TensorFrame row carries its seed/segment + time (payment rows: segs 0,0,1; timed)
+    assert jb.row_seg["payment"].tolist() == [0, 0, 1]
+    assert jb.row_times["payment"].tolist() == [10.0, 20.0, 30.0]
+    assert jb.row_timed["payment"].all()
+    assert jb.row_seg["order"].tolist() == [0, 1]
+    assert not jb.row_timed["customer"].any()               # untimed table
+    assert set(jb.row_seg) == set(jb.tf_dict)
+
+
 def test_shapes_dtypes_and_input_id():
     jb = _jb()
     assert jb.wide_col_idxs.dtype == torch.long and jb.elem_rel_idxs.dtype == torch.long

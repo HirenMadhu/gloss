@@ -116,6 +116,7 @@ def run_config(
            "fanout": fanout, "wide_len": wide_len, "set_size": set_size,
            "route_on": (model_kwargs or {}).get("route_on", "signature"),
            "num_experts": (model_kwargs or {}).get("num_experts", 4),
+           "n_axial_layers": (model_kwargs or {}).get("n_axial_layers", 0),
            "lambda_ortho": lambda_ortho}
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     if test:

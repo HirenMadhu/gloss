@@ -144,6 +144,16 @@ class WideSignature(nn.Module):
         z = self.norm(z)
         return torch.cat([self.cls_sig.expand(B, -1, -1), z], dim=1)
 
+    def type_cells(self, col_gids: Tensor, rec_bins: Tensor) -> Tensor:
+        """Value-free cell signatures for one node type's TensorFrame rows -> ``[n, C, d_sig]``
+        (same signature space as the wide tokens; no path term — these are set-side cells).
+        ``col_gids [C]`` = global column ids, ``rec_bins [n]`` = per-row Δt recency bins."""
+        name = self.name_emb.index_select(0, col_gids)                    # [C, d_text]
+        mod = self.modality_id.index_select(0, col_gids)                  # [C]
+        z = (self.schema_proj(name) + self.stype_emb(mod)).unsqueeze(0) \
+            + self.recency_emb(rec_bins).unsqueeze(1)                     # [n, C, d_sig]
+        return self.norm(z)
+
 
 class ElemSignature(nn.Module):
     """Value-free routing signature for set elements — the row-level signature analog:
@@ -168,6 +178,96 @@ class ElemSignature(nn.Module):
             + self.hop_emb(jb.elem_hop.clamp(min=0, max=3))
         z = self.norm(z)
         return torch.cat([self.null_sig.expand(z.shape[0], -1, -1), z], dim=1)
+
+
+class AxialCellBlock(nn.Module):
+    """One axial block over a per-type cell grid ``[B, R, C, d]`` (R = the seed's sampled rows of this
+    table, C = its columns): **row-level** attention (cells of one row attend across columns), then
+    **column-level** attention (same column attends across the seed's rows — RT's same-column pattern),
+    then the (MoE-)FFN. Pre-norm residuals. Pad positions are re-zeroed via ``torch.where`` after every
+    sublayer: fully-masked pad queries produce NaN in SDPA, and a NaN value behind a zero attention
+    weight still poisons the weighted sum, so pads must never carry NaN into the next sublayer."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, d_route: int, *,
+                 num_experts: int = 4, k: int = 2, dropout: float = 0.1,
+                 route_on: str = "signature"):
+        super().__init__()
+        self.route_on = route_on
+        self.norm_r = nn.LayerNorm(d_model)
+        self.attn_r = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm_c = nn.LayerNorm(d_model)
+        self.attn_c = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm_f = nn.LayerNorm(d_model)
+        if route_on == "dense":
+            self.ffn = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(),
+                                     nn.Dropout(dropout), nn.Linear(d_ff, d_model))
+        else:
+            self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, grid: Tensor, valid: Tensor, z: Tensor | None) -> Tensor:
+        B, R, C, d = grid.shape
+        keep = valid.unsqueeze(-1).unsqueeze(-1)                          # [B, R, 1, 1]
+        zero = grid.new_zeros(())
+        # row-level: attend across the C columns of each row
+        h = self.norm_r(grid).reshape(B * R, C, d)
+        kpm_r = (~valid).reshape(B * R, 1).expand(B * R, C)
+        a, _ = self.attn_r(h, h, h, key_padding_mask=kpm_r, need_weights=False)
+        grid = torch.where(keep, grid + self.drop(a.view(B, R, C, d)), zero)
+        # column-level: attend across the seed's R rows within each column
+        h = self.norm_c(grid).permute(0, 2, 1, 3).reshape(B * C, R, d)
+        kpm_c = (~valid).unsqueeze(1).expand(B, C, R).reshape(B * C, R)
+        a, _ = self.attn_c(h, h, h, key_padding_mask=kpm_c, need_weights=False)
+        a = a.view(B, C, R, d).permute(0, 2, 1, 3)
+        grid = torch.where(keep, grid + self.drop(a), zero)
+        # (MoE-)FFN
+        h = self.norm_f(grid)
+        if self.route_on == "dense":
+            y = self.ffn(h)
+        else:
+            y, _ = self.ffn(h, z if self.route_on == "signature" else h)
+        return torch.where(keep, grid + self.drop(y), zero)
+
+
+class AxialCellEncoder(nn.Module):
+    """Shared across node types: scatter one type's cells ``[n, C, d]`` into per-seed grids
+    ``[B, R, C, d]`` (disjoint sampling ⇒ every row copy belongs to exactly one seed), run
+    ``n_layers`` axial blocks, gather back. This supplies RT's same-row and same-column interaction
+    patterns at cell granularity — the set-level attention downstream supplies the cross-table one."""
+
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
+                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            AxialCellBlock(d_model, n_heads, d_ff, d_route, num_experts=num_experts, k=k,
+                           dropout=dropout, route_on=route_on)
+            for _ in range(n_layers))
+
+    def forward(self, cell: Tensor, seg: Tensor, num_seeds: int, z: Tensor | None) -> Tensor:
+        n, C, d = cell.shape
+        order = torch.argsort(seg, stable=True)
+        sseg = seg[order]
+        counts = torch.bincount(sseg, minlength=num_seeds)
+        R = int(counts.max())
+        offs = torch.cumsum(counts, 0) - counts
+        slot = torch.arange(n, device=cell.device) - offs[sseg]
+        grid = cell.new_zeros(num_seeds, R, C, d)
+        grid[sseg, slot] = cell[order]
+        valid = torch.zeros(num_seeds, R, dtype=torch.bool, device=cell.device)
+        valid[sseg, slot] = True
+        zg = None
+        if z is not None:
+            zg = z.new_zeros(num_seeds, R, C, z.shape[-1])
+            zg[sseg, slot] = z[order]
+        for blk in self.blocks:
+            grid = blk(grid, valid, zg)
+        out = torch.empty_like(cell)
+        out[order] = grid[sseg, slot]
+        return out
+
+    def ortho_loss(self) -> Tensor | float:
+        return sum((blk.ffn.ortho_loss() for blk in self.blocks
+                    if isinstance(blk.ffn, MoEFFN)), 0.0)
 
 
 class WideEncoder(nn.Module):
@@ -250,6 +350,7 @@ class SetJoin(nn.Module):
         k: int = 2,
         d_sig: int = 64,
         d_ff: int | None = None,
+        n_axial_layers: int = 0,
     ):
         super().__init__()
         if route_on not in ROUTE_ARMS:
@@ -293,6 +394,14 @@ class SetJoin(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, out_dim),
         )
+        # created LAST so the RNG draw order of every pre-existing module is unchanged when
+        # n_axial_layers=0 (keeps v2/v3 arms bit-reproducible under the same seed)
+        if n_axial_layers > 0:
+            self.axial = AxialCellEncoder(d_model, n_axial_layers, n_heads, dropout,
+                                          route_on=route_on, d_ff=d_ff or 2 * d_model,
+                                          d_route=d_route, num_experts=num_experts, k=k)
+        else:
+            self.axial = None
 
     def forward(self, jb: JoinBatch) -> tuple[Tensor, Tensor]:
         dev = self.encoder.name_emb.device
@@ -306,6 +415,14 @@ class SetJoin(nn.Module):
             if nt not in self.encoder.cell_encoders or not (in_wide or in_set):
                 continue
             cell, _ = self.encoder.encode_type(nt, tf)                  # [n, C, d]
+            if self.axial is not None:                                  # row+column cell attention
+                seg_t = jb.row_seg[nt]
+                z_t = None
+                if self.wide_sig is not None:
+                    gids = self.encoder._col_gids[nt].to(dev)
+                    bins = recency_bins(jb.seed_time[seg_t], jb.row_times[nt], jb.row_timed[nt])
+                    z_t = self.wide_sig.type_cells(gids, bins)
+                cell = self.axial(cell, seg_t, B, z_t)
             if in_wide:
                 b_idx, w_idx, row_idx, col_idx = jb.wide_placement[nt]
                 h[b_idx, w_idx] = cell[row_idx, col_idx]
@@ -342,6 +459,8 @@ class SetJoin(nn.Module):
             cnt = torch.zeros(B, d, device=dev)
         logits = self.head(torch.cat([seed_repr, context, cnt], dim=-1))
         aux = self.wide_enc.ortho_loss() + self.set_enc.ortho_loss()    # router orthogonality balance
+        if self.axial is not None:
+            aux = aux + self.axial.ortho_loss()
         if not torch.is_tensor(aux):
             aux = logits.new_zeros(())                                  # dense arm
         return logits, aux

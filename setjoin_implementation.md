@@ -187,3 +187,17 @@ sbatch --array=0-$((N-1))%8 scripts/run_setjoin.sh --out-dir results/setjoin_v1
 
 Phases S0–S4 with DoD commands live in the approved build plan; each phase ends green on
 `.venv/bin/python -m pytest tests/` + its DoD, appends `PROGRESS.md`, commits `feat(setjoin-N): …`.
+
+## Three-level attention (v4 arm): `n_axial_layers`
+
+`AxialCellEncoder` (shared across node types; `n_axial_layers=0` default = off) inserts, between
+`encode_type` and the wide/RowPool consumers, per-seed per-type cell grids `[B, R, C, d]` (disjoint
+sampling ⇒ each row copy belongs to one seed) with axial blocks: **row-level** attention (across a
+row's columns), **column-level** attention (same column across the seed's rows — RT's same-column
+pattern), then the (MoE-)FFN routed on the cell signature (`WideSignature.type_cells`; no path term).
+Set-level attention downstream supplies cross-table interaction, completing RT's mask set at ~1/100th
+the quadratic cost: `O(Σ_t n_t·C_t² + Σ_t C_t·n_t² + N²)` vs RT's `O((Σ n·C)²)` per layer. Pads are
+re-zeroed via `torch.where` after every sublayer (fully-masked pad queries emit NaN in SDPA, and
+NaN·0 = NaN in downstream weighted sums). Cross-seed isolation, NaN-safety, and both mixing directions
+are unit-tested (NOTE for tests: perturb with random vectors — constant shifts lie in pre-norm
+LayerNorm's null space).
