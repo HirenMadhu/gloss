@@ -338,3 +338,21 @@ DoD: `pytest` **107 passed, 1 skipped** (axial NaN-safety, cross-row mixing with
 row-axis mixing, MoE routing/ortho, full three-level forward/grads on rel-f1, collate row metadata).
 `--dry-run --n-axial-layers 1`: aux=0.74, 2.75M params. Gate v4 (signature + axial, 27 cells)
 submitted → `results/setjoin_v4/`.
+
+## Phase S7 — multi-horizon study (predict k=1..10 timestamps ahead, both substrates)
+
+`gloss/setjoin/horizon.py`: horizon-k evaluation = keep the held-out TEST labels, move each seed's
+as-of feature time BACK k·task.timedelta (`shifted_task_table` + `make_shifted_loader`) — the model
+predicts the label window starting k timestamps beyond everything it can see; k=0 is the standard
+eval and is asserted equal to the normal path (`test_horizon.py`). Nothing is retrained: a
+next-step-trained model is probed at longer ranges, isolating short-range recency vs longer-range
+structure. Works for BOTH substrates (`kind="setjoin"` JoinBatch / `kind="more"` CellBatch; MoRE
+files untouched). Runner: `run_config_horizon` — 9 leaderboard tasks × 3 seeds × {setjoin, more} =
+**54 cells**; fixed configs per substrate (setjoin = the v4 arm: signature MoE + 1 axial block;
+more = the grid modal winner d128×8blk/8 experts/signature); `plot_horizon_curves` → 3×3 PNG
+(x = timestamps ahead, y = AUROC×100 / NMAE, mean ± 95% CI band per substrate).
+`scripts/run_horizon.{py,sh}`.
+
+DoD: `pytest` **110 passed, 1 skipped** (grid=54; k=0 ≡ standard eval; shift math; plot renders).
+CPU smoke (hash, 1 epoch) ran both substrates end-to-end incl. the PNG. Array submitted →
+`results/horizon/`.
