@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from gloss.setjoin.model import (AxialCellEncoder, MoELayer, RowPool, SetEncoder, SetJoin,
-                                 WideEncoder)
+from gloss.setjoin.model import (AxialCellEncoder, ElemSignature, MoELayer, RowPool, SetEncoder,
+                                 SetJoin, WideEncoder)
 
 from .conftest import rel_f1_available
 
@@ -67,6 +67,29 @@ def test_moe_layer_routes_and_flows():
     a = lyr(x.detach(), z, kpm)
     b = lyr(x.detach()[:, perm], z[:, perm], kpm[:, perm])
     assert torch.allclose(a[:, perm], b, atol=1e-5)
+
+
+def test_elem_signature_distinguishes_hops():
+    """Hop-2 elements must route differently from hop-1: the row-level signature reads elem_hop,
+    so flipping an element's hop tag (all else equal) must change its z."""
+    from types import SimpleNamespace
+
+    sig = ElemSignature(num_node_types=3, num_fk_roles=4, d_sig=16).eval()
+
+    def jb(hop):
+        return SimpleNamespace(
+            elem_table_idxs=torch.tensor([[1, 2]]),
+            elem_rel_idxs=torch.tensor([[1, 3]]),
+            elem_row_time=torch.tensor([[10.0, 20.0]], dtype=torch.float64),
+            elem_is_timed=torch.ones(1, 2, dtype=torch.bool),
+            elem_hop=torch.full((1, 2), hop, dtype=torch.long),
+            seed_time=torch.tensor([100.0], dtype=torch.float64),
+        )
+
+    z1, z2 = sig(jb(1)), sig(jb(2))
+    assert z1.shape == z2.shape == (1, 3, 16)                 # null sig prepended
+    assert torch.allclose(z1[:, 0], z2[:, 0])                 # null element unaffected
+    assert not torch.allclose(z1[:, 1:], z2[:, 1:], atol=1e-6)
 
 
 def test_moe_layer_shared_expert_arm():

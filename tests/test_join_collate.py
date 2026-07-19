@@ -9,7 +9,7 @@ from gloss.setjoin.collate import to_join_batch
 from gloss.setjoin.paths import child_rels, m2o_paths, parent_rels, setjoin_neighbors
 
 from ._join_fixtures import ENTITY as ORDER
-from ._join_fixtures import chain_bundle, make_chain_batch
+from ._join_fixtures import chain_bundle, make_chain_batch, make_hop2_batch
 from .conftest import ENTITY as USER
 from .conftest import make_synth_batch, rel_f1_available, synthetic_bundle
 
@@ -56,6 +56,15 @@ def test_setjoin_neighbors_dict():
     assert nn[("payment", "f2p_order", "order")] == [32, 0]       # order's child payments (o2m)
     assert nn[("order", "rev_f2p_order", "payment")] == [1, 1]    # payment's parent order (m2o)
     assert nn[("customer", "rev_f2p_customer", "order")] == [1, 1]
+
+
+def test_setjoin_neighbors_fanout2():
+    # hop-2 arm: three layers so the co-child walk seed→child→parent→child is reachable
+    b = chain_bundle()
+    nn = setjoin_neighbors(b, fanout=32, fanout2=8)
+    assert nn[("payment", "f2p_order", "order")] == [32, 8, 8]
+    assert nn[("order", "rev_f2p_order", "payment")] == [1, 1, 1]
+    assert setjoin_neighbors(b, fanout=32, fanout2=0) == setjoin_neighbors(b, fanout=32)
 
 
 @rel_f1_available
@@ -155,8 +164,70 @@ def test_elem_parent_flattening_and_seed_exclusion():
 
 
 def test_no_cross_product():
+    # hop-1 contract: under the cap, hop-1 elements are 1:1 with sampled children (child_counts is
+    # hop-1-only by definition — the same numbers as the pre-hop2 total-count contract when hop2 off)
     jb = _jb()
-    assert float(jb.elem_mask.sum()) == float(jb.child_counts.sum())   # under the cap: 1:1 with children
+    assert float(((jb.elem_hop == 1) & jb.elem_mask).sum()) == float(jb.child_counts.sum())
+    assert float(jb.elem_mask.sum()) == float(jb.child_counts.sum())
+    jb2 = to_join_batch(make_hop2_batch(), chain_bundle(), ORDER, wide_len=16, set_size=8, hop2=True)
+    assert float(((jb2.elem_hop == 1) & jb2.elem_mask).sum()) == float(jb2.child_counts.sum())
+
+
+# ---------- hop-2 union elements (default off) ----------
+
+def _jb2(set_size=8, hop2=True, **kw):
+    return to_join_batch(make_hop2_batch(**kw), chain_bundle(), ORDER,
+                         wide_len=16, set_size=set_size, hop2=hop2)
+
+
+def test_hop2_default_off_is_unchanged():
+    # hop2=False on a batch CONTAINING hop-2 rows: only the direct children become elements
+    jb = _jb2(hop2=False)
+    assert int(jb.elem_mask.sum()) == 2                       # P1, P0 only
+    assert (jb.elem_hop[jb.elem_mask] == 1).all()
+    assert jb.elem_row_time[0, :2].tolist() == [20.0, 10.0]   # most-recent-first, as before
+    assert "order" not in jb.elem_rows and "refund" not in jb.elem_rows
+
+
+def test_hop2_grandchild_sibling_and_cochild_tagged():
+    jb = _jb2()
+    b = chain_bundle()
+    assert int(jb.elem_mask.sum()) == 5                       # P1 P0 | O2 P3 RF0
+    assert jb.elem_hop[0, :5].tolist() == [1, 1, 2, 2, 2]
+    # hop-1 first, then hop-2 by recency: O2 (t=40) > P3 (t=15) > RF0 (t=12)
+    assert jb.elem_row_time[0, :5].tolist() == [20.0, 10.0, 40.0, 15.0, 12.0]
+    assert jb.elem_table_idxs[0, 2:5].tolist() == [
+        b.node_type_id["order"], b.node_type_id["payment"], b.node_type_id["refund"]]
+    # role = LAST traversed FK: sibling via customer, co-child via method, grandchild via payment
+    assert jb.elem_rel_idxs[0, 2:5].tolist() == [
+        b.fk_role_id["customer"], b.fk_role_id["method"], b.fk_role_id["payment"]]
+
+
+def test_hop2_seed_and_duplicate_dedup():
+    jb = _jb2()
+    # the sibling family reaches a duplicate copy of the seed (n_id 0) — never re-emitted; the
+    # co-child family reaches P0 again (already hop-1) — not duplicated. Filter to each element's
+    # OWN row (path FK_NONE) — the scatter also carries flattened parents (e.g. P0 under RF0).
+    def own_rows(nt):
+        _, _, row_idx, path_idx = jb.elem_rows[nt]
+        return sorted(int(r) for r, p in zip(row_idx, path_idx) if int(p) == FK_NONE)
+
+    assert own_rows("order") == [1]                           # O2 only; rows 0/2 (seed copies) never
+    assert own_rows("payment") == [0, 1, 2]                   # P0, P1, P3 exactly once each
+    assert own_rows("refund") == [0]                          # RF0 (P0 reappears only as its parent)
+
+
+def test_hop2_sort_hop1_first_and_cap():
+    # cap 3: both hop-1 payments survive; only the most recent hop-2 element (O2) fits
+    jb = _jb2(set_size=3)
+    assert jb.set_truncated == 1
+    assert jb.elem_hop[0, :3].tolist() == [1, 1, 2]
+    assert jb.elem_row_time[0, :3].tolist() == [20.0, 10.0, 40.0]
+
+
+def test_hop2_child_counts_hop1_only():
+    jb = _jb2()
+    assert jb.child_counts.tolist() == [[2.0]]                # P0, P1 — hop-2 rows never counted
 
 
 def test_dualfk_distinct_rel_ids_and_seed_exclusion():

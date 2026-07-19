@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from gloss.setjoin.collate import to_join_batch
 
-from ._join_fixtures import ENTITY, chain_bundle, make_chain_batch
+from ._join_fixtures import ENTITY, chain_bundle, make_chain_batch, make_hop2_batch
 from .conftest import rel_f1_available
 
 
@@ -24,6 +24,20 @@ def test_planted_leak_is_detectable():
     # a payment at t=150 > seed 100 must be flagged by the element predicate
     jb = to_join_batch(make_chain_batch(seed_time=100.0, payment_times=(10.0, 150.0, 30.0)),
                        chain_bundle(), ENTITY, wide_len=16, set_size=8)
+    assert _n_leaks(jb) >= 1
+
+
+def test_no_leakage_hop2():
+    jb = to_join_batch(make_hop2_batch(seed_time=100.0), chain_bundle(), ENTITY,
+                       wide_len=16, set_size=8, hop2=True)
+    assert int((jb.elem_hop[jb.elem_mask] == 2).sum()) > 0     # hop-2 elements are actually present
+    assert _n_leaks(jb) == 0
+
+
+def test_planted_hop2_leak_is_detectable():
+    # a GRANDCHILD at t=150 > seed 100 must be flagged by the same element predicate
+    jb = to_join_batch(make_hop2_batch(seed_time=100.0, refund_time=150.0), chain_bundle(), ENTITY,
+                       wide_len=16, set_size=8, hop2=True)
     assert _n_leaks(jb) >= 1
 
 

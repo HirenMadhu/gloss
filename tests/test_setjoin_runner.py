@@ -5,8 +5,8 @@ import math
 
 import gloss.eval.ablation as ablation
 from gloss.eval.ablation import LEADERBOARD_TASKS, aggregate, format_table
-from gloss.setjoin.runner import (GATE_DATASETS, attach_nmae, compare_table, gate_grid,
-                                  variant_of)
+from gloss.setjoin.runner import (GATE_DATASETS, attach_nmae, compare_table, diff_table,
+                                  gate_grid, variant_of)
 
 
 def test_gate_grid_is_9_tasks_x_seeds(monkeypatch):
@@ -36,6 +36,24 @@ def test_variant_of_labels_all_arms():
     assert variant_of(dict(route_on="hidden", use_shared=True)) == "setjoin-hidden-shared"
     assert variant_of(dict(route_on="dense", use_shared=True)) == "setjoin"   # dense has no MoE
     assert variant_of(None) == "setjoin-signature"
+    # hop-2 / per-relation-cap suffixes (defaults leave every label above unchanged)
+    assert variant_of(dict(route_on="signature"), fanout2=8) == "setjoin-signature-hop2"
+    assert variant_of(dict(route_on="signature"), per_relation_cap=32) == "setjoin-signature-cap32"
+    assert variant_of(dict(route_on="signature"), fanout2=8,
+                      per_relation_cap=32) == "setjoin-signature-hop2-cap32"
+    assert variant_of(dict(route_on="dense"), fanout2=8) == "setjoin-hop2"
+
+
+def test_diff_table_deltas():
+    a = [_rec("rel-f1", "driver-dnf", s, task_type="binary", test_roc_auc=0.82) for s in range(3)]
+    a += [_rec("rel-f1", "driver-position", s, task_type="regression", test_nmae=0.40)
+          for s in range(3)]
+    b = [_rec("rel-f1", "driver-dnf", s, task_type="binary", test_roc_auc=0.80) for s in range(3)]
+    b += [_rec("rel-f1", "driver-position", s, task_type="regression", test_nmae=0.45)
+          for s in range(3)]
+    out = diff_table(a, b, label_a="hop2", label_b="ctrl")
+    assert "driver-dnf" in out and "Δ= +2.000" in out.replace("Δ=+", "Δ= +")
+    assert "driver-position" in out and "-0.050" in out
 
 
 def _rec(ds, task, seed, **m):

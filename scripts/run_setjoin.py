@@ -56,6 +56,11 @@ def main() -> int:
     ap.add_argument("--wide-len", type=int, default=128)
     ap.add_argument("--set-size", type=int, default=128)
     ap.add_argument("--fanout", type=int, default=64, help="children sampled per o2m relation at hop 1")
+    ap.add_argument("--fanout2", type=int, default=0,
+                    help="hop-2 o2m fanout (0 = off; >0 adds grandchild/sibling/co-child elements)")
+    ap.add_argument("--d-ff", type=int, default=None, help="FFN width (default 2*d_model)")
+    ap.add_argument("--diff", default=None, metavar="DIR2",
+                    help="print per-task deltas: --out-dir results vs DIR2 results")
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01)
@@ -73,7 +78,7 @@ def main() -> int:
         return _dry_run(args)
     if args.train:
         return _train(args)
-    if args.list or args.index is not None or args.aggregate or args.compare:
+    if args.list or args.index is not None or args.aggregate or args.compare or args.diff:
         return _gate(args)
     log.error("pass --dry-run, --train, --list, --index N, --aggregate, or --compare")
     return 2
@@ -96,7 +101,7 @@ def _dry_run(args) -> int:
     log.info(f"building {args.dataset} graph ...")
     bundle = _build(args.dataset)
     task = get_task(args.dataset, args.task, download=False)
-    nn = setjoin_neighbors(bundle, fanout=args.fanout)
+    nn = setjoin_neighbors(bundle, fanout=args.fanout, fanout2=args.fanout2)
     try:
         loader = make_loader(bundle, task, "train", num_neighbors=nn, batch_size=8, shuffle=False)
         raw = next(iter(loader))
@@ -106,7 +111,8 @@ def _dry_run(args) -> int:
         loader = make_loader(bundle, task, "train", num_neighbors=[args.fanout, 8],
                              batch_size=8, shuffle=False)
         raw = next(iter(loader))
-    jb = to_join_batch(raw, bundle, task.entity_table, wide_len=args.wide_len, set_size=args.set_size)
+    jb = to_join_batch(raw, bundle, task.entity_table, wide_len=args.wide_len,
+                       set_size=args.set_size, hop2=args.fanout2 > 0)
     print(jb.pretty_shapes())
 
     st = jb.seed_time.unsqueeze(1)
@@ -126,7 +132,7 @@ def _dry_run(args) -> int:
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
                     n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
                     route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                    n_axial_layers=args.n_axial_layers, use_shared=args.use_shared)
+                    d_ff=args.d_ff, n_axial_layers=args.n_axial_layers, use_shared=args.use_shared)
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
         logits, aux = model(jb)
@@ -151,9 +157,9 @@ def _train(args) -> int:
         model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                           n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                           n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
-                          k=args.k, d_sig=args.d_sig, n_axial_layers=args.n_axial_layers,
-                          use_shared=args.use_shared),
-        fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
+                          k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
+                          n_axial_layers=args.n_axial_layers, use_shared=args.use_shared),
+        fanout=args.fanout, fanout2=args.fanout2, wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         max_epochs=args.epochs, seed=args.seed, num_workers=args.num_workers,
@@ -163,7 +169,7 @@ def _train(args) -> int:
     if args.test:
         from gloss.setjoin.eval import evaluate_split
 
-        tm = evaluate_split(module, bundle, task, "test", fanout=args.fanout,
+        tm = evaluate_split(module, bundle, task, "test", fanout=args.fanout, fanout2=args.fanout2,
                             wide_len=args.wide_len, set_size=args.set_size,
                             batch_size=args.batch_size, num_workers=args.num_workers)
         print("[test] " + "  ".join(f"{k}={v:.4f}" for k, v in tm.items()))
@@ -184,9 +190,10 @@ def _gate(args) -> int:
                               n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                               n_pma=args.n_pma, route_on=args.route_on,
                               num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                              n_axial_layers=args.n_axial_layers, use_shared=args.use_shared),
-            fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
-            lambda_ortho=args.lambda_ortho,
+                              d_ff=args.d_ff, n_axial_layers=args.n_axial_layers,
+                              use_shared=args.use_shared),
+            fanout=args.fanout, fanout2=args.fanout2, wide_len=args.wide_len,
+            set_size=args.set_size, lambda_ortho=args.lambda_ortho,
             batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
             max_epochs=args.epochs, num_workers=args.num_workers,
             limit_train_batches=args.limit_train_batches, limit_val_batches=args.limit_val_batches,
@@ -199,10 +206,15 @@ def _gate(args) -> int:
     if args.aggregate:
         print(format_table(records, split="test",
                            baseline=runner.variant_of(dict(route_on=args.route_on,
-                                                           use_shared=args.use_shared))))
+                                                           use_shared=args.use_shared),
+                                                      fanout2=args.fanout2)))
         return 0
     if args.compare:
         print(runner.compare_table(records))
+        return 0
+    if args.diff:
+        print(runner.diff_table(records, load_records(Path(args.diff)),
+                                label_a=str(out_dir), label_b=args.diff))
         return 0
     return 2
 

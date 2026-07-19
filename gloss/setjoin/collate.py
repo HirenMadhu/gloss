@@ -51,7 +51,7 @@ class JoinBatch:
     elem_table_idxs: Tensor        # long; child node-type id (pad 0)
     elem_row_time: Tensor          # float64
     elem_is_timed: Tensor          # bool
-    elem_hop: Tensor               # long; 1 everywhere (MVP; reserved for deeper union sets)
+    elem_hop: Tensor               # long; 1 = direct child, 2 = grandchild/sibling/co-child (hop2 arm)
     # ---- per child relation [B, R] (order = paths.child_rels; post-sampler, PRE-truncation) ----
     child_counts: Tensor           # float32
     # ---- per seed [B] ----
@@ -104,7 +104,9 @@ class JoinBatch:
             f"JoinBatch: B={self.num_seeds} W={self.wide_len} N={self.set_size}",
             f"  wide: real cells={n_cells}  missing markers={n_markers}  "
             f"truncated seeds={self.wide_truncated}",
-            f"  set:  elements={int(per_seed.sum())}  empty-set seeds={int((per_seed == 0).sum())}  "
+            f"  set:  elements={int(per_seed.sum())} "
+            f"(hop-2: {int((self.elem_mask & (self.elem_hop == 2)).sum())})  "
+            f"empty-set seeds={int((per_seed == 0).sum())}  "
             f"truncated seeds={self.set_truncated}",
             f"  child_counts {tuple(self.child_counts.shape)}  targets={int(self.has_target.sum())}",
             f"  tf_dict types: {sorted(self.tf_dict)}  elem_rows types: {sorted(self.elem_rows)}",
@@ -119,8 +121,17 @@ def to_join_batch(
     *,
     wide_len: int = 128,
     set_size: int = 128,
+    hop2: bool = False,
 ) -> JoinBatch:
-    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`JoinBatch`."""
+    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`JoinBatch`.
+
+    ``hop2=True`` (needs a ``fanout2>0`` sampler) additionally admits two hop-2 element families —
+    **grandchildren** (children of the seed's children) and **siblings/co-children** (children of the
+    seed's parents and of the children's non-seed parents), tagged ``elem_hop=2`` with the role id of
+    the last traversed FK. Hop-1 elements keep priority under the ``set_size`` cap, and hop-2
+    candidates are deduped by global n_id against the seed and all hop-1 elements. Default off —
+    the emitted batch is then bit-identical to the 1-hop MVP.
+    """
     vocab = column_vocab(bundle)
     node_types = [nt for nt in bundle.node_types if nt in batch.node_types and batch[nt].num_nodes > 0]
 
@@ -294,27 +305,62 @@ def to_join_batch(
         p[2].append(row_in_type)
         p[3].append(path_id)
 
+    # sort: hop-1 before hop-2, then most recent first, untimed last, flat index as a stable
+    # deterministic tiebreak (identical to the 1-hop ordering when every item is hop 1)
+    def _key(it):
+        return (it[2], 0 if timed[it[0]] else 1,
+                -float(rowt[it[0]]) if timed[it[0]] else 0.0, it[0])
+
     for b in range(B):
-        items: list[tuple[int, int]] = []                 # (child flat idx, child-relation index)
+        sf = int(seed_flat[b])
+        items: list[tuple[int, int, int]] = []            # (flat idx, fk role id, hop)
         for r_idx, rk in enumerate(crels):
-            kids = children_of.get(rk, {}).get(int(seed_flat[b]), [])
+            kids = children_of.get(rk, {}).get(sf, [])
             child_counts[b, r_idx] = float(len(kids))
-            items.extend((c, r_idx) for c in kids)
-        # most recent first; untimed last; flat index as a stable deterministic tiebreak
-        items.sort(key=lambda it: (0 if timed[it[0]] else 1,
-                                   -float(rowt[it[0]]) if timed[it[0]] else 0.0, it[0]))
+            role = bundle.fk_role_id.get(rk[1], FK_NONE)
+            items.extend((c, role, 1) for c in kids)
+        if hop2:
+            seen_nids = {int(seed_nid[b])}
+            seen_nids.update(int(nid[c]) for c, _, _ in items)
+            h1 = [c for c, _, _ in items]
+            cand: list[tuple[int, int]] = []              # (flat idx, role of the last traversed FK)
+            for c in h1:                                  # grandchildren first (deterministic priority)
+                for rk2 in child_rels(bundle, node_types[int(typeidx[c])]):
+                    cand.extend((g, bundle.fk_role_id.get(rk2[1], FK_NONE))
+                                for g in children_of.get(rk2, {}).get(c, []))
+            pseen: set[int] = set()                       # parents dedup by n_id (disjoint copies)
+            parents: list[int] = []
+            walk = [(sf, entity_table)] + [(c, node_types[int(typeidx[c])]) for c in h1]
+            for node, nt in walk:
+                for prk in parent_rels(bundle, nt):
+                    p = parent_of.get(prk, {}).get(node)
+                    if p is None or int(nid[p]) == int(seed_nid[b]) or int(nid[p]) in pseen:
+                        continue
+                    pseen.add(int(nid[p]))
+                    parents.append(p)
+            for p in parents:                             # siblings + co-children via each parent
+                for rk3 in child_rels(bundle, node_types[int(typeidx[p])]):
+                    cand.extend((s, bundle.fk_role_id.get(rk3[1], FK_NONE))
+                                for s in children_of.get(rk3, {}).get(p, []))
+            for f, role in cand:
+                key = int(nid[f])
+                if key in seen_nids:                      # never the seed, a hop-1 element, or a dup
+                    continue
+                seen_nids.add(key)
+                items.append((f, role, 2))
+        items.sort(key=_key)
         if len(items) > set_size:
             set_truncated += 1
             items = items[:set_size]
-        for n, (c, r_idx) in enumerate(items):
-            rk = crels[r_idx]
+        for n, (c, role, hop) in enumerate(items):
             child_nt = node_types[int(typeidx[c])]
             elem_mask[b, n] = True
-            elem_rel_idxs[b, n] = bundle.fk_role_id.get(rk[1], FK_NONE)
+            elem_rel_idxs[b, n] = role
             elem_table_idxs[b, n] = bundle.node_type_id[child_nt]
             elem_row_time[b, n] = float(rowt[c])
             elem_is_timed[b, n] = bool(timed[c])
-            elem_append(child_nt, b, n, int(intype[c]), FK_NONE)        # the child row itself
+            elem_hop[b, n] = hop
+            elem_append(child_nt, b, n, int(intype[c]), FK_NONE)        # the element row itself
             for prk in parent_rels(bundle, child_nt):                   # + its flattened parents
                 p = parent_of.get(prk, {}).get(c)
                 if p is None:

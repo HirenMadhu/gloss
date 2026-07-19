@@ -39,15 +39,23 @@ def attach_nmae(rec: dict, train_std: float) -> dict:
     return rec
 
 
-def variant_of(model_kwargs: dict | None) -> str:
+def variant_of(model_kwargs: dict | None, *, fanout2: int = 0,
+               per_relation_cap: int | None = None) -> str:
     """Arm label: ``setjoin`` for the dense arm (back-compat with the v1/v2 records), else
     ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method), with a ``-shared``
-    suffix when the always-on shared expert (the S addition) is enabled."""
+    suffix for the always-on shared expert (the S addition), ``-hop2`` for the hop-2 union arm,
+    and ``-cap<N>`` for the per-relation recency cap."""
     mk = model_kwargs or {}
     route_on = mk.get("route_on", "signature")
     if route_on == "dense":
-        return "setjoin"
-    return f"setjoin-{route_on}" + ("-shared" if mk.get("use_shared") else "")
+        label = "setjoin"
+    else:
+        label = f"setjoin-{route_on}" + ("-shared" if mk.get("use_shared") else "")
+    if fanout2 > 0:
+        label += "-hop2"
+    if per_relation_cap is not None:
+        label += f"-cap{per_relation_cap}"
+    return label
 
 
 def run_config(
@@ -57,6 +65,7 @@ def run_config(
     encoder: str = "harrier",
     model_kwargs: dict | None = None,
     fanout: int = 64,
+    fanout2: int = 0,
     wide_len: int = 128,
     set_size: int = 128,
     lambda_ortho: float = 0.5,
@@ -85,7 +94,7 @@ def run_config(
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}
     c = grid[index]
-    variant = variant_of(model_kwargs)
+    variant = variant_of(model_kwargs, fanout2=fanout2)
     out_dir = out_dir or RESULTS
     out_path = out_dir / f"{index:04d}_{variant}.json"
     if out_path.exists():                                  # idempotent resubmits (gridsearch precedent)
@@ -103,7 +112,8 @@ def run_config(
         try:
             module, metrics = train_prebuilt_setjoin(
                 bundle, task, name_emb, model_kwargs=model_kwargs,
-                fanout=fanout, wide_len=wide_len, set_size=set_size, lambda_ortho=lambda_ortho,
+                fanout=fanout, fanout2=fanout2, wide_len=wide_len, set_size=set_size,
+                lambda_ortho=lambda_ortho,
                 batch_size=bs, lr=lr, weight_decay=weight_decay, max_epochs=max_epochs,
                 seed=c["seed"], num_workers=num_workers,
                 limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
@@ -116,18 +126,23 @@ def run_config(
             bs = max(8, bs // 2)
             print(f"CUDA OOM -> retry with batch_size={bs}", flush=True)
 
+    mk = model_kwargs or {}
     rec = {**c, "variant": variant, "task_type": kind, "batch_size": bs,
-           "fanout": fanout, "wide_len": wide_len, "set_size": set_size,
-           "route_on": (model_kwargs or {}).get("route_on", "signature"),
-           "num_experts": (model_kwargs or {}).get("num_experts", 4),
-           "n_axial_layers": (model_kwargs or {}).get("n_axial_layers", 0),
-           "use_shared": bool((model_kwargs or {}).get("use_shared", False)),
+           "fanout": fanout, "fanout2": fanout2, "wide_len": wide_len, "set_size": set_size,
+           "route_on": mk.get("route_on", "signature"),
+           "num_experts": mk.get("num_experts", 4),
+           "n_axial_layers": mk.get("n_axial_layers", 0),
+           "use_shared": bool(mk.get("use_shared", False)),
+           "d_model": mk.get("d_model", 128), "d_ff": mk.get("d_ff"),
+           "n_wide_layers": mk.get("n_wide_layers", 2), "n_set_layers": mk.get("n_set_layers", 2),
+           "n_params": sum(p.numel() for p in module.model.parameters()),
            "lambda_ortho": lambda_ortho}
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     if test:
         try:
-            tm = evaluate_split(module, bundle, task, "test", fanout=fanout, wide_len=wide_len,
-                                set_size=set_size, batch_size=bs, num_workers=num_workers)
+            tm = evaluate_split(module, bundle, task, "test", fanout=fanout, fanout2=fanout2,
+                                wide_len=wide_len, set_size=set_size, batch_size=bs,
+                                num_workers=num_workers)
             rec.update({f"test_{k}": v for k, v in tm.items()})
             attach_nmae(rec, target_stats(task)[1])
         except Exception as exc:               # never lose the trained val metrics to a test-eval failure
@@ -135,6 +150,34 @@ def run_config(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(rec))
     return rec
+
+
+def diff_table(records_a: list[dict], records_b: list[dict],
+               label_a: str = "A", label_b: str = "B") -> str:
+    """Per-task seed-mean deltas between two gate result sets (A − B for AUROC, B − A would flip
+    sign; regression deltas are NMAE so NEGATIVE = A better). Each side may hold one variant only."""
+    from ..eval.ablation import _variant_of
+
+    def side(records):
+        vs = {_variant_of(r) for r in records}
+        if len(vs) > 1:
+            raise ValueError(f"records mix variants {sorted(vs)}")
+        agg = aggregate(records, keys=("test_roc_auc", "test_nmae"))
+        ttypes = {(r["dataset"], r["task"]): r.get("task_type", "binary") for r in records}
+        return vs.pop() if vs else "?", agg, ttypes
+
+    va, agg_a, tt_a = side(records_a)
+    vb, agg_b, tt_b = side(records_b)
+    lines = [f"{label_a} = {va}  vs  {label_b} = {vb}   (Δ = {label_a} − {label_b}; "
+             "AUROC↑: positive Δ better, NMAE↓: negative Δ better)", ""]
+    for (ds, tk) in sorted(set(tt_a) | set(tt_b)):
+        binary = tt_a.get((ds, tk), tt_b.get((ds, tk))) == "binary"
+        key, scale = ("test_roc_auc", 100.0) if binary else ("test_nmae", 1.0)
+        ma = agg_a.get((ds, tk, va), {}).get(key, (float("nan"),) * 4)[0] * scale
+        mb = agg_b.get((ds, tk, vb), {}).get(key, (float("nan"),) * 4)[0] * scale
+        unit = "AUROC" if binary else "NMAE"
+        lines.append(f"{ds + ' / ' + tk:34s} {unit:5s} {ma:8.3f} {mb:8.3f}  Δ={ma - mb:+7.3f}")
+    return "\n".join(lines)
 
 
 def compare_table(records: list[dict], baselines_path: Path | str | None = None,

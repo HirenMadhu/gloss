@@ -80,7 +80,8 @@ def path_target_type(entity_table: str, path: tuple[RelKey, ...]) -> str:
     return path[-1][2] if path else entity_table
 
 
-def setjoin_neighbors(bundle: GraphBundle, fanout: int = 64, depth: int = 2) -> dict:
+def setjoin_neighbors(bundle: GraphBundle, fanout: int = 64, depth: int = 2,
+                      fanout2: int = 0) -> dict:
     """Per-edge-type ``num_neighbors`` that samples exactly SetJoin's neighborhood and nothing else.
 
     PyG DIRECTION SEMANTICS (the v1 gate inverted this — every seed got ~1 child per relation and
@@ -94,6 +95,17 @@ def setjoin_neighbors(bundle: GraphBundle, fanout: int = 64, depth: int = 2) -> 
     * reverse ``(parent, rev_f2p_<col>, child)`` types expand a CHILD-side frontier node by sampling
       its parent (unique per FK) → ``[1] * depth``: the seed's parents at hop 1, grandparents and each
       child row's own flattened parents at hop 2 (the m2o closure).
+
+    ``fanout2 > 0`` (the hop-2 union arm) switches to a THREE-layer schedule — forward
+    ``[fanout, fanout2, fanout2]``, reverse ``[1, 1, 1]``. Layer 2 expands the hop-1 frontier's
+    o2m side: grandchildren (children of the seed's children) and children of the seed's own parents
+    (sibling rows). Layer 3 exists for the co-child walk seed→child→parent→child (e.g. an event's
+    other attendances for user-repeat) and to give layer-2 rows their flattened parents via the
+    reverse budget. The collate only turns the grandchild/sibling/co-child families into set
+    elements; other layer-3 reach (e.g. great-grandchildren) is sampled but unused.
     """
+    if fanout2 > 0:
+        return {et: ([fanout, fanout2, fanout2] if is_forward_relation(et[1]) else [1, 1, 1])
+                for et in bundle.edge_types}
     return {et: ([fanout] + [0] * (depth - 1) if is_forward_relation(et[1]) else [1] * depth)
             for et in bundle.edge_types}
