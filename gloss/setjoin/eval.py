@@ -22,6 +22,7 @@ def predict_split(
     *,
     fanout: int = 64,
     fanout2: int = 0,
+    per_relation_cap: int | None = None,
     wide_len: int = 128,
     set_size: int = 128,
     batch_size: int = 128,
@@ -41,7 +42,8 @@ def predict_split(
     pred = np.full(n, np.nan, dtype=np.float64)
     for raw in loader:
         jb = to_join_batch(raw, bundle, task.entity_table,
-                           wide_len=wide_len, set_size=set_size, hop2=fanout2 > 0).to(device)
+                           wide_len=wide_len, set_size=set_size, hop2=fanout2 > 0,
+                           per_relation_cap=per_relation_cap).to(device)
         out = module(jb).float().cpu()                        # [B] one prediction per seed
         if getattr(module, "task_type", "binary") == "regression":
             pred_b = out * module.target_std + module.target_mean
@@ -63,6 +65,7 @@ def evaluate_split(
     *,
     fanout: int = 64,
     fanout2: int = 0,
+    per_relation_cap: int | None = None,
     wide_len: int = 128,
     set_size: int = 128,
     batch_size: int = 128,
@@ -71,7 +74,8 @@ def evaluate_split(
 ) -> dict:
     """Predict ``split`` and score with ``task.evaluate`` (labels coerced for boolean-string targets)."""
     pred = predict_split(
-        module, bundle, task, split, fanout=fanout, fanout2=fanout2, wide_len=wide_len,
+        module, bundle, task, split, fanout=fanout, fanout2=fanout2,
+        per_relation_cap=per_relation_cap, wide_len=wide_len,
         set_size=set_size, batch_size=batch_size, num_workers=num_workers, device=device,
     )
     target_table = coerce_binary_target(task.get_table(split, mask_input_cols=False), task)

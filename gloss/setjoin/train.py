@@ -40,6 +40,7 @@ class SetJoinLitModule(pl.LightningModule):
         set_size: int = 128,
         lambda_ortho: float = 0.5,
         fanout2: int = 0,
+        per_relation_cap: int | None = None,
     ):
         super().__init__()
         self.bundle = bundle
@@ -53,6 +54,7 @@ class SetJoinLitModule(pl.LightningModule):
         self.set_size = set_size
         self.lambda_ortho = lambda_ortho
         self.fanout2 = fanout2
+        self.per_relation_cap = per_relation_cap
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
         self.model = SetJoin(bundle, name_emb, entity_table, **mk)
@@ -65,7 +67,7 @@ class SetJoinLitModule(pl.LightningModule):
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int = 0):
         jb = to_join_batch(batch, self.bundle, self.entity_table,
                            wide_len=self.wide_len, set_size=self.set_size,
-                           hop2=self.fanout2 > 0)
+                           hop2=self.fanout2 > 0, per_relation_cap=self.per_relation_cap)
         return jb.to(device)
 
     def _standardize(self, target):
@@ -122,6 +124,7 @@ def train_prebuilt_setjoin(
     model_kwargs: dict | None = None,
     fanout: int = 64,
     fanout2: int = 0,
+    per_relation_cap: int | None = None,
     wide_len: int = 128,
     set_size: int = 128,
     lambda_ortho: float = 0.5,
@@ -149,6 +152,7 @@ def train_prebuilt_setjoin(
         task_type=kind, target_mean=mean, target_std=std,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
         wide_len=wide_len, set_size=set_size, lambda_ortho=lambda_ortho, fanout2=fanout2,
+        per_relation_cap=per_relation_cap,
     )
     dm = MoREDataModule(bundle, task,
                         num_neighbors=setjoin_neighbors(bundle, fanout, fanout2=fanout2),

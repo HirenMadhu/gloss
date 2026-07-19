@@ -175,9 +175,10 @@ def test_no_cross_product():
 
 # ---------- hop-2 union elements (default off) ----------
 
-def _jb2(set_size=8, hop2=True, **kw):
+def _jb2(set_size=8, hop2=True, per_relation_cap=None, **kw):
     return to_join_batch(make_hop2_batch(**kw), chain_bundle(), ORDER,
-                         wide_len=16, set_size=set_size, hop2=hop2)
+                         wide_len=16, set_size=set_size, hop2=hop2,
+                         per_relation_cap=per_relation_cap)
 
 
 def test_hop2_default_off_is_unchanged():
@@ -228,6 +229,46 @@ def test_hop2_sort_hop1_first_and_cap():
 def test_hop2_child_counts_hop1_only():
     jb = _jb2()
     assert jb.child_counts.tolist() == [[2.0]]                # P0, P1 — hop-2 rows never counted
+
+
+# ---------- per-relation recency cap (default off) ----------
+
+def test_per_relation_cap_keeps_most_recent():
+    # chain fixture: 2 payments in segment 0 (t=10, 20); cap 1 keeps the most recent only,
+    # child_counts stays PRE-cap (the model keeps the true-count signal)
+    jb = to_join_batch(make_chain_batch(), chain_bundle(), ORDER,
+                       wide_len=16, set_size=8, per_relation_cap=1)
+    assert int(jb.elem_mask[0].sum()) == 1
+    assert float(jb.elem_row_time[0, 0]) == 20.0              # P1 survives, P0 capped away
+    assert jb.child_counts.tolist() == [[2.0], [1.0]]         # pre-cap counts intact
+    assert jb.set_truncated == 0                              # the cap is not set_size truncation
+
+
+def test_per_relation_cap_is_per_relation():
+    # dual-FK fixture: buyer + seller relations; cap 1 keeps one element of EACH role
+    jb = to_join_batch(make_synth_batch(), synthetic_bundle(), USER, wide_len=8, set_size=8,
+                       per_relation_cap=1)
+    fk = synthetic_bundle().fk_role_id
+    assert int(jb.elem_mask[0].sum()) == 2
+    assert sorted(jb.elem_rel_idxs[0, :2].tolist()) == sorted([fk["buyer"], fk["seller"]])
+
+
+def test_per_relation_cap_default_off_unchanged():
+    a = to_join_batch(make_chain_batch(), chain_bundle(), ORDER, wide_len=16, set_size=8)
+    b = to_join_batch(make_chain_batch(), chain_bundle(), ORDER, wide_len=16, set_size=8,
+                      per_relation_cap=None)
+    assert torch.equal(a.elem_mask, b.elem_mask) and torch.equal(a.elem_row_time, b.elem_row_time)
+    assert torch.equal(a.elem_rel_idxs, b.elem_rel_idxs)
+
+
+def test_per_relation_cap_composes_with_hop2():
+    # groups are (hop, table, role): capping at 1 keeps the most recent of EACH hop-2 family
+    # (order-sibling, payment-co-child, refund-grandchild are separate groups) and 1 hop-1 payment
+    jb = _jb2(per_relation_cap=1)
+    assert int(jb.elem_mask.sum()) == 4                       # P1 | O2, P3, RF0
+    assert jb.elem_hop[0, :4].tolist() == [1, 2, 2, 2]
+    assert jb.elem_row_time[0, :4].tolist() == [20.0, 40.0, 15.0, 12.0]
+    assert jb.child_counts.tolist() == [[2.0]]                # still pre-cap
 
 
 def test_dualfk_distinct_rel_ids_and_seed_exclusion():

@@ -66,6 +66,7 @@ def run_config(
     model_kwargs: dict | None = None,
     fanout: int = 64,
     fanout2: int = 0,
+    per_relation_cap: int | None = None,
     wide_len: int = 128,
     set_size: int = 128,
     lambda_ortho: float = 0.5,
@@ -94,7 +95,7 @@ def run_config(
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}
     c = grid[index]
-    variant = variant_of(model_kwargs, fanout2=fanout2)
+    variant = variant_of(model_kwargs, fanout2=fanout2, per_relation_cap=per_relation_cap)
     out_dir = out_dir or RESULTS
     out_path = out_dir / f"{index:04d}_{variant}.json"
     if out_path.exists():                                  # idempotent resubmits (gridsearch precedent)
@@ -112,7 +113,8 @@ def run_config(
         try:
             module, metrics = train_prebuilt_setjoin(
                 bundle, task, name_emb, model_kwargs=model_kwargs,
-                fanout=fanout, fanout2=fanout2, wide_len=wide_len, set_size=set_size,
+                fanout=fanout, fanout2=fanout2, per_relation_cap=per_relation_cap,
+                wide_len=wide_len, set_size=set_size,
                 lambda_ortho=lambda_ortho,
                 batch_size=bs, lr=lr, weight_decay=weight_decay, max_epochs=max_epochs,
                 seed=c["seed"], num_workers=num_workers,
@@ -128,7 +130,8 @@ def run_config(
 
     mk = model_kwargs or {}
     rec = {**c, "variant": variant, "task_type": kind, "batch_size": bs,
-           "fanout": fanout, "fanout2": fanout2, "wide_len": wide_len, "set_size": set_size,
+           "fanout": fanout, "fanout2": fanout2, "per_relation_cap": per_relation_cap,
+           "wide_len": wide_len, "set_size": set_size,
            "route_on": mk.get("route_on", "signature"),
            "num_experts": mk.get("num_experts", 4),
            "n_axial_layers": mk.get("n_axial_layers", 0),
@@ -141,8 +144,8 @@ def run_config(
     if test:
         try:
             tm = evaluate_split(module, bundle, task, "test", fanout=fanout, fanout2=fanout2,
-                                wide_len=wide_len, set_size=set_size, batch_size=bs,
-                                num_workers=num_workers)
+                                per_relation_cap=per_relation_cap, wide_len=wide_len,
+                                set_size=set_size, batch_size=bs, num_workers=num_workers)
             rec.update({f"test_{k}": v for k, v in tm.items()})
             attach_nmae(rec, target_stats(task)[1])
         except Exception as exc:               # never lose the trained val metrics to a test-eval failure

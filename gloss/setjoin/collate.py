@@ -122,6 +122,7 @@ def to_join_batch(
     wide_len: int = 128,
     set_size: int = 128,
     hop2: bool = False,
+    per_relation_cap: int | None = None,
 ) -> JoinBatch:
     """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`JoinBatch`.
 
@@ -131,6 +132,11 @@ def to_join_batch(
     the last traversed FK. Hop-1 elements keep priority under the ``set_size`` cap, and hop-2
     candidates are deduped by global n_id against the seed and all hop-1 elements. Default off —
     the emitted batch is then bit-identical to the 1-hop MVP.
+
+    ``per_relation_cap=N`` (the anti-dilution arm) keeps only the ``N`` most-recent candidates per
+    ``(hop, table, FK role)`` group before the merged sort, so one high-volume relation can't crowd
+    the rest out of the set. ``child_counts`` stays PRE-cap (the model keeps the true-count signal).
+    Default off — no behavior change.
     """
     vocab = column_vocab(bundle)
     node_types = [nt for nt in bundle.node_types if nt in batch.node_types and batch[nt].num_nodes > 0]
@@ -348,6 +354,11 @@ def to_join_batch(
                     continue
                 seen_nids.add(key)
                 items.append((f, role, 2))
+        if per_relation_cap is not None:                  # keep the cap most-recent per group
+            groups: dict[tuple, list] = {}
+            for it in items:
+                groups.setdefault((it[2], int(typeidx[it[0]]), it[1]), []).append(it)
+            items = [it for g in groups.values() for it in sorted(g, key=_key)[:per_relation_cap]]
         items.sort(key=_key)
         if len(items) > set_size:
             set_truncated += 1

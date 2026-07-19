@@ -58,6 +58,8 @@ def main() -> int:
     ap.add_argument("--fanout", type=int, default=64, help="children sampled per o2m relation at hop 1")
     ap.add_argument("--fanout2", type=int, default=0,
                     help="hop-2 o2m fanout (0 = off; >0 adds grandchild/sibling/co-child elements)")
+    ap.add_argument("--per-relation-cap", type=int, default=None,
+                    help="keep only the N most-recent elements per (hop, table, FK role) group")
     ap.add_argument("--d-ff", type=int, default=None, help="FFN width (default 2*d_model)")
     ap.add_argument("--diff", default=None, metavar="DIR2",
                     help="print per-task deltas: --out-dir results vs DIR2 results")
@@ -112,7 +114,8 @@ def _dry_run(args) -> int:
                              batch_size=8, shuffle=False)
         raw = next(iter(loader))
     jb = to_join_batch(raw, bundle, task.entity_table, wide_len=args.wide_len,
-                       set_size=args.set_size, hop2=args.fanout2 > 0)
+                       set_size=args.set_size, hop2=args.fanout2 > 0,
+                       per_relation_cap=args.per_relation_cap)
     print(jb.pretty_shapes())
 
     st = jb.seed_time.unsqueeze(1)
@@ -159,7 +162,8 @@ def _train(args) -> int:
                           n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
                           k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
                           n_axial_layers=args.n_axial_layers, use_shared=args.use_shared),
-        fanout=args.fanout, fanout2=args.fanout2, wide_len=args.wide_len, set_size=args.set_size,
+        fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
+        wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         max_epochs=args.epochs, seed=args.seed, num_workers=args.num_workers,
@@ -170,6 +174,7 @@ def _train(args) -> int:
         from gloss.setjoin.eval import evaluate_split
 
         tm = evaluate_split(module, bundle, task, "test", fanout=args.fanout, fanout2=args.fanout2,
+                            per_relation_cap=args.per_relation_cap,
                             wide_len=args.wide_len, set_size=args.set_size,
                             batch_size=args.batch_size, num_workers=args.num_workers)
         print("[test] " + "  ".join(f"{k}={v:.4f}" for k, v in tm.items()))
@@ -192,7 +197,8 @@ def _gate(args) -> int:
                               num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
                               d_ff=args.d_ff, n_axial_layers=args.n_axial_layers,
                               use_shared=args.use_shared),
-            fanout=args.fanout, fanout2=args.fanout2, wide_len=args.wide_len,
+            fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
+            wide_len=args.wide_len,
             set_size=args.set_size, lambda_ortho=args.lambda_ortho,
             batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
             max_epochs=args.epochs, num_workers=args.num_workers,
@@ -207,7 +213,8 @@ def _gate(args) -> int:
         print(format_table(records, split="test",
                            baseline=runner.variant_of(dict(route_on=args.route_on,
                                                            use_shared=args.use_shared),
-                                                      fanout2=args.fanout2)))
+                                                      fanout2=args.fanout2,
+                                                      per_relation_cap=args.per_relation_cap)))
         return 0
     if args.compare:
         print(runner.compare_table(records))
