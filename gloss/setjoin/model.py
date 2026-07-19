@@ -64,13 +64,14 @@ class MoELayer(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, d_route: int, *,
                  num_experts: int = 4, k: int = 2, dropout: float = 0.1,
-                 route_on: str = "signature"):
+                 route_on: str = "signature", use_shared: bool = False):
         super().__init__()
         self.route_on = route_on
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k)
+        self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k,
+                          use_shared=use_shared)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, z: Tensor | None, key_padding_mask: Tensor | None) -> Tensor:
@@ -86,7 +87,8 @@ class _MoEStack(nn.Module):
     """A stack of dense TransformerEncoder layers (``route_on='dense'``) or MoELayers, one interface."""
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
-                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int):
+                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int,
+                 use_shared: bool = False):
         super().__init__()
         self.route_on = route_on
         if route_on == "dense":
@@ -95,7 +97,7 @@ class _MoEStack(nn.Module):
         else:
             self.layers = nn.ModuleList(
                 MoELayer(d_model, n_heads, d_ff, d_route, num_experts=num_experts, k=k,
-                         dropout=dropout, route_on=route_on)
+                         dropout=dropout, route_on=route_on, use_shared=use_shared)
                 for _ in range(n_layers))
 
     def forward(self, x: Tensor, pad: Tensor, z: Tensor | None) -> Tensor:
@@ -190,7 +192,7 @@ class AxialCellBlock(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, d_route: int, *,
                  num_experts: int = 4, k: int = 2, dropout: float = 0.1,
-                 route_on: str = "signature"):
+                 route_on: str = "signature", use_shared: bool = False):
         super().__init__()
         self.route_on = route_on
         self.norm_r = nn.LayerNorm(d_model)
@@ -202,7 +204,8 @@ class AxialCellBlock(nn.Module):
             self.ffn = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(),
                                      nn.Dropout(dropout), nn.Linear(d_ff, d_model))
         else:
-            self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k)
+            self.ffn = MoEFFN(d_model, d_ff, d_route, num_experts=num_experts, k=k,
+                              use_shared=use_shared)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, grid: Tensor, valid: Tensor, z: Tensor | None) -> Tensor:
@@ -236,11 +239,12 @@ class AxialCellEncoder(nn.Module):
     patterns at cell granularity — the set-level attention downstream supplies the cross-table one."""
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
-                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int):
+                 route_on: str, d_ff: int, d_route: int, num_experts: int, k: int,
+                 use_shared: bool = False):
         super().__init__()
         self.blocks = nn.ModuleList(
             AxialCellBlock(d_model, n_heads, d_ff, d_route, num_experts=num_experts, k=k,
-                           dropout=dropout, route_on=route_on)
+                           dropout=dropout, route_on=route_on, use_shared=use_shared)
             for _ in range(n_layers))
 
     def forward(self, cell: Tensor, seg: Tensor, num_seeds: int, z: Tensor | None) -> Tensor:
@@ -278,12 +282,12 @@ class WideEncoder(nn.Module):
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
                  route_on: str = "dense", d_ff: int | None = None, d_route: int | None = None,
-                 num_experts: int = 4, k: int = 2):
+                 num_experts: int = 4, k: int = 2, use_shared: bool = False):
         super().__init__()
         self.cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.stack = _MoEStack(d_model, n_layers, n_heads, dropout, route_on=route_on,
                                d_ff=d_ff or 2 * d_model, d_route=d_route or d_model,
-                               num_experts=num_experts, k=k)
+                               num_experts=num_experts, k=k, use_shared=use_shared)
 
     def forward(self, h: Tensor, is_pad: Tensor, z: Tensor | None = None) -> Tensor:
         B = h.shape[0]
@@ -306,12 +310,12 @@ class SetEncoder(nn.Module):
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, n_pma: int, dropout: float, *,
                  route_on: str = "dense", d_ff: int | None = None, d_route: int | None = None,
-                 num_experts: int = 4, k: int = 2):
+                 num_experts: int = 4, k: int = 2, use_shared: bool = False):
         super().__init__()
         self.null_elem = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.stack = _MoEStack(d_model, n_layers, n_heads, dropout, route_on=route_on,
                                d_ff=d_ff or 2 * d_model, d_route=d_route or d_model,
-                               num_experts=num_experts, k=k)
+                               num_experts=num_experts, k=k, use_shared=use_shared)
         self.pma_emb = nn.Parameter(torch.randn(1, n_pma, d_model) * 0.02)
         self.w_q = nn.Linear(d_model, d_model)
         self.pma = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -351,6 +355,7 @@ class SetJoin(nn.Module):
         d_sig: int = 64,
         d_ff: int | None = None,
         n_axial_layers: int = 0,
+        use_shared: bool = False,
     ):
         super().__init__()
         if route_on not in ROUTE_ARMS:
@@ -381,7 +386,8 @@ class SetJoin(nn.Module):
             self.wide_sig = self.elem_sig = None
         d_route = d_sig if route_on == "signature" else d_model
 
-        moe = dict(route_on=route_on, d_ff=d_ff, d_route=d_route, num_experts=num_experts, k=k)
+        moe = dict(route_on=route_on, d_ff=d_ff, d_route=d_route, num_experts=num_experts, k=k,
+                   use_shared=use_shared)
         self.row_pool = RowPool(d_model)
         self.wide_enc = WideEncoder(d_model, n_wide_layers, n_heads, dropout, **moe)
         self.set_enc = SetEncoder(d_model, n_set_layers, n_heads, n_pma, dropout, **moe)
@@ -399,7 +405,8 @@ class SetJoin(nn.Module):
         if n_axial_layers > 0:
             self.axial = AxialCellEncoder(d_model, n_axial_layers, n_heads, dropout,
                                           route_on=route_on, d_ff=d_ff or 2 * d_model,
-                                          d_route=d_route, num_experts=num_experts, k=k)
+                                          d_route=d_route, num_experts=num_experts, k=k,
+                                          use_shared=use_shared)
         else:
             self.axial = None
 

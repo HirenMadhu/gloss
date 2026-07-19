@@ -69,6 +69,27 @@ def test_moe_layer_routes_and_flows():
     assert torch.allclose(a[:, perm], b, atol=1e-5)
 
 
+def test_moe_layer_shared_expert_arm():
+    """use_shared=True (the S addition): the always-on expert exists, contributes to the output,
+    and receives gradients; the base arm keeps ffn.shared=None so default behavior is unchanged."""
+    d_sig = 8
+    base = MoELayer(D, n_heads=2, d_ff=2 * D, d_route=d_sig, num_experts=3, k=2,
+                    dropout=0.0, route_on="signature")
+    assert base.ffn.shared is None
+    lyr = MoELayer(D, n_heads=2, d_ff=2 * D, d_route=d_sig, num_experts=3, k=2,
+                   dropout=0.0, route_on="signature", use_shared=True)
+    assert lyr.ffn.shared is not None
+    x = torch.randn(2, 5, D, requires_grad=True)
+    z = torch.randn(2, 5, d_sig)
+    kpm = torch.zeros(2, 5, dtype=torch.bool)
+    out = lyr(x, z, kpm)
+    assert out.shape == (2, 5, D) and torch.isfinite(out).all()
+    out.sum().backward()
+    assert lyr.ffn.shared.w1.weight.grad is not None
+    assert float(lyr.ffn.shared.w1.weight.grad.abs().sum()) > 0
+    assert lyr.ffn.router.weight.grad is not None and x.grad is not None
+
+
 def test_set_encoder_empty_set_and_seed_conditioning():
     enc = SetEncoder(D, n_layers=1, n_heads=2, n_pma=2, dropout=0.0).eval()
     E = torch.zeros(2, 4, D)

@@ -41,9 +41,13 @@ def attach_nmae(rec: dict, train_std: float) -> dict:
 
 def variant_of(model_kwargs: dict | None) -> str:
     """Arm label: ``setjoin`` for the dense arm (back-compat with the v1/v2 records), else
-    ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method)."""
-    route_on = (model_kwargs or {}).get("route_on", "signature")
-    return "setjoin" if route_on == "dense" else f"setjoin-{route_on}"
+    ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method), with a ``-shared``
+    suffix when the always-on shared expert (the S addition) is enabled."""
+    mk = model_kwargs or {}
+    route_on = mk.get("route_on", "signature")
+    if route_on == "dense":
+        return "setjoin"
+    return f"setjoin-{route_on}" + ("-shared" if mk.get("use_shared") else "")
 
 
 def run_config(
@@ -117,6 +121,7 @@ def run_config(
            "route_on": (model_kwargs or {}).get("route_on", "signature"),
            "num_experts": (model_kwargs or {}).get("num_experts", 4),
            "n_axial_layers": (model_kwargs or {}).get("n_axial_layers", 0),
+           "use_shared": bool((model_kwargs or {}).get("use_shared", False)),
            "lambda_ortho": lambda_ortho}
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     if test:

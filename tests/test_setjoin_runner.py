@@ -5,7 +5,8 @@ import math
 
 import gloss.eval.ablation as ablation
 from gloss.eval.ablation import LEADERBOARD_TASKS, aggregate, format_table
-from gloss.setjoin.runner import GATE_DATASETS, attach_nmae, compare_table, gate_grid
+from gloss.setjoin.runner import (GATE_DATASETS, attach_nmae, compare_table, gate_grid,
+                                  variant_of)
 
 
 def test_gate_grid_is_9_tasks_x_seeds(monkeypatch):
@@ -26,6 +27,15 @@ def test_attach_nmae():
     assert math.isclose(attach_nmae(rec, 2.0)["test_nmae"], 1.5)
     assert "test_nmae" not in attach_nmae({"task_type": "binary", "test_mae": 3.0}, 2.0)
     assert "test_nmae" not in attach_nmae({"task_type": "regression"}, 2.0)
+
+
+def test_variant_of_labels_all_arms():
+    assert variant_of(dict(route_on="dense")) == "setjoin"
+    assert variant_of(dict(route_on="signature")) == "setjoin-signature"
+    assert variant_of(dict(route_on="signature", use_shared=True)) == "setjoin-signature-shared"
+    assert variant_of(dict(route_on="hidden", use_shared=True)) == "setjoin-hidden-shared"
+    assert variant_of(dict(route_on="dense", use_shared=True)) == "setjoin"   # dense has no MoE
+    assert variant_of(None) == "setjoin-signature"
 
 
 def _rec(ds, task, seed, **m):

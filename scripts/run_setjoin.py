@@ -42,6 +42,8 @@ def main() -> int:
                     help="MoE FFN routing arm (signature = the method; dense = plain FFN, the v2 arm)")
     ap.add_argument("--num-experts", type=int, default=4)
     ap.add_argument("--k", type=int, default=2)
+    ap.add_argument("--use-shared", action="store_true",
+                    help="add an always-on shared expert to every MoE FFN (the S addition)")
     ap.add_argument("--d-sig", type=int, default=64, help="signature width (signature arm)")
     ap.add_argument("--lambda-ortho", type=float, default=0.5, help="router orthogonality weight")
     ap.add_argument("--n-axial-layers", type=int, default=0,
@@ -124,7 +126,7 @@ def _dry_run(args) -> int:
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
                     n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
                     route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                    n_axial_layers=args.n_axial_layers)
+                    n_axial_layers=args.n_axial_layers, use_shared=args.use_shared)
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
         logits, aux = model(jb)
@@ -149,7 +151,8 @@ def _train(args) -> int:
         model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
                           n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                           n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
-                          k=args.k, d_sig=args.d_sig, n_axial_layers=args.n_axial_layers),
+                          k=args.k, d_sig=args.d_sig, n_axial_layers=args.n_axial_layers,
+                          use_shared=args.use_shared),
         fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -181,7 +184,7 @@ def _gate(args) -> int:
                               n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                               n_pma=args.n_pma, route_on=args.route_on,
                               num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                              n_axial_layers=args.n_axial_layers),
+                              n_axial_layers=args.n_axial_layers, use_shared=args.use_shared),
             fanout=args.fanout, wide_len=args.wide_len, set_size=args.set_size,
             lambda_ortho=args.lambda_ortho,
             batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -195,7 +198,8 @@ def _gate(args) -> int:
     records = load_records(out_dir)
     if args.aggregate:
         print(format_table(records, split="test",
-                           baseline=runner.variant_of(dict(route_on=args.route_on))))
+                           baseline=runner.variant_of(dict(route_on=args.route_on,
+                                                           use_shared=args.use_shared))))
         return 0
     if args.compare:
         print(runner.compare_table(records))
