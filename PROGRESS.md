@@ -356,3 +356,34 @@ more = the grid modal winner d128×8blk/8 experts/signature); `plot_horizon_curv
 DoD: `pytest` **110 passed, 1 skipped** (grid=54; k=0 ≡ standard eval; shift math; plot renders).
 CPU smoke (hash, 1 epoch) ran both substrates end-to-end incl. the PNG. Array submitted →
 `results/horizon/`.
+
+## Phase S8 — shared-expert arm + the 2×2 MoE grid (shared/regular × 4/8 experts)
+
+`use_shared` (MoRE's S addition — an always-on SwiGLU expert added to the routed sum, already in
+`gloss/model/moe.py`) threaded through every SetJoin MoE site (`MoELayer`, `_MoEStack`, wide/set
+encoders, axial blocks) + `--use-shared` CLI; variant label `setjoin-signature-shared`. Grid = 3 new
+27-cell h100 arrays (29001032-34, all 81/81 COMPLETED, ~96 min wall) + v3 reused as regular-e4:
+`results/setjoin_v5_{shared_e4,shared_e8,sig_e8}/`.
+
+**RESULT — negative, matching the MoRE S/C/P/H ablation: no addition beats the base.** Beats-RT
+counts: regular-e4 (v3) 5/9, shared-e4 5/9, regular-e8 5/9, shared-e8 4/9; v3 has the best mean
+AUROC (79.8 vs 79.4/79.2/79.0) AND best mean NMAE (0.476 vs 0.479/0.497/0.491). Shared's only real
+win is driver-dnf (81.2 at shared-e8, best MoE-arm number — still under v2 dense's 81.5); it costs
+user-ignore (88.4→86.9) and driver-top3 (84.7→83.6). **Keep: v2 dense remains the best overall
+single-table config (6/9), v3 the best MoE arm; shared expert and e8 both rejected.**
+
+DoD: `pytest` **112 passed, 1 skipped** (shared-expert grads/arm label; variant_of). GPU smoke-train
+green.
+
+## Phase S9 — substrate complexity: asymptotics + measured latency
+
+`scripts/bench_complexity.py` (A40, rel-f1/driver-dnf, real trained configs; JSONs in
+`results/complexity/`). Asymptotics per seed: MoRE = O(L·4·S²·d) attention (S=512 fixed cap, bool
+masks → SDPA math backend materializes L·4·h·S² scores = the 15-25 GB peak) + O(L·M·S·d·d_ff) MoE;
+SetJoin = O(2W²d + 2N²d) attention (W=N=128, fast-path SDPA) + O(4·M·(W+N)·d·d_ff) MoE →
+~126× less quadratic work, FFN-dominated. Measured: train step (fwd+bwd) 9.5-9.7 ms/seed MoRE vs
+0.44-0.53 SetJoin-v3 (~20×, ~15× less memory; dense v2 ~30×). Inference forward (eval+no_grad):
+B=1 latency 18-21 ms MoRE vs 10 ms v3 (both launch-overhead-bound); B=128 throughput 291 seeds/s
+MoRE vs 6,395 v3 / 11,456 v2 (~22×/39×). Arm costs: +shared +9%, e8 +38%, axial ~3× (rejected on
+cost AND accuracy). NB: SetJoin training is dataloader-bound (h100 end-to-end gap ~4× ≪ 20× step
+gap) — headroom is in the sampler, not the model.
