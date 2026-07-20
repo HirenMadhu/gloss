@@ -134,6 +134,45 @@ def run_index(index: int, *, seeds: int, epochs: int, num_workers: int, out_dir:
 CFG_KEYS = ("d_model", "n_wide_layers", "n_set_layers", "d_ff", "use_shared", "enc_channels")
 
 
+def pick_backbone(out_dir: Path) -> tuple[int, dict]:
+    """The S10 adoption rule, machine-readable: best mean-rank config with max n_params ≤ 30M
+    (the sweep contains the v3 default as cfg with d128/2+2/ff256, so 'keep the default' is the
+    automatic outcome when nothing bigger out-ranks it). Raises if no records qualify."""
+    PRIMARY = {"binary": "test_roc_auc", "regression": "test_nmae"}
+    recs = [json.loads(p.read_text()) for p in sorted(Path(out_dir).glob("*.json"))]
+    grp: dict[tuple, list[dict]] = defaultdict(list)
+    for r in recs:
+        grp[(r["dataset"], r["task"], r["config_idx"])].append(r)
+    by_task: dict[tuple, list] = defaultdict(list)
+    params_of: dict[int, int] = {}
+    for (ds, tk, ci), rows in grp.items():
+        key = PRIMARY[rows[0]["task_type"]]
+        xs = [r[key] for r in rows
+              if r.get(key) is not None and not (isinstance(r[key], float) and math.isnan(r[key]))]
+        if not xs:
+            continue
+        params_of[ci] = max(params_of.get(ci, 0), int(rows[0].get("n_params", 0)))
+        by_task[(ds, tk)].append((ci, st.mean(xs), rows[0]["task_type"]))
+    n_cfg = len(arch_grid())
+    ranks: dict[int, list[int]] = defaultdict(list)
+    for (ds, tk), cands in by_task.items():
+        lower = cands[0][2] == "regression"
+        ranked = sorted(cands, key=lambda c: (c[1] if lower else -c[1]))
+        seen = set()
+        for pos, c in enumerate(ranked):
+            ranks[c[0]].append(pos + 1)
+            seen.add(c[0])
+        for ci in range(n_cfg):
+            if ci not in seen:
+                ranks[ci].append(len(ranked) + 1)
+    board = sorted((st.mean(rs), ci) for ci, rs in ranks.items()
+                   if rs and params_of.get(ci, 0) <= PARAM_BUDGET)
+    if not board:
+        raise RuntimeError(f"no ≤30M config with records in {out_dir}")
+    ci = board[0][1]
+    return ci, arch_grid()[ci]
+
+
 def _cfg_str(cfg: dict) -> str:
     return (f"d{cfg['d_model']}x{cfg['n_wide_layers']}+{cfg['n_set_layers']} ff{cfg['d_ff']}"
             f"{' +shared' if cfg['use_shared'] else ''}")
