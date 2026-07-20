@@ -387,3 +387,20 @@ B=1 latency 18-21 ms MoRE vs 10 ms v3 (both launch-overhead-bound); B=128 throug
 MoRE vs 6,395 v3 / 11,456 v2 (~22×/39×). Arm costs: +shared +9%, e8 +38%, axial ~3× (rejected on
 cost AND accuracy). NB: SetJoin training is dataloader-bound (h100 end-to-end gap ~4× ≪ 20× step
 gap) — headroom is in the sampler, not the model.
+
+## Phase S10 GATE — backbone sweep result (arrays 29001119 + 29001753 re-runs; 486/486)
+
+**The fairness sweep works: per-task best-of-18 beats RT 6/9 and MoRE's tuned grid best 3/9**
+(user-ignore 90.5 = new best-anywhere number, >v2 90.1; user-repeat 79.69 ≈ RT 79.70 and > MoRE
+79.5; study-outcome 69.3 ≈ MoRE 69.4). The shared expert gets its first real wins at bigger
+backbones (study-outcome 69.3 and user-ignore 90.5 are both +shared configs) after losing
+everywhere at d128/2+2 (v5). site-success still lost by everyone (hop-2 motivation intact).
+**ADOPTED BACKBONE (≤30M mean-rank rule, complete data): cfg#10 = d256 2+2 ff1024, signature e4,
+16.9M params, mean rank 5.67/18** — also the unrestricted winner; old default d128/2+2/ff256 ranks
+in the middle of the top-5. Full table: `results/setjoin_grid/AGGREGATE.txt`. 12 cells hit the
+sporadic MET offset assert → re-run `--num-workers 0` (29001753), all green. Winner's-curse caveat
+applies to per-task bests (best-of-18, 3 seeds each).
+
+Chain: `scripts/chain_gates.{py,sh}` + `grid.pick_backbone` auto-launched the S11/S12 gates on the
+adopted backbone: hop-2 (fanout2=8, set256) = 29001765 → `results/setjoin_p2_hop2/`, control
+(set256) = 29001766 → `results/setjoin_p2_ctrl/`, cap32 = 29001767 → `results/setjoin_p3_cap32/`.
