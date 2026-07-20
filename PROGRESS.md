@@ -404,3 +404,27 @@ applies to per-task bests (best-of-18, 3 seeds each).
 Chain: `scripts/chain_gates.{py,sh}` + `grid.pick_backbone` auto-launched the S11/S12 gates on the
 adopted backbone: hop-2 (fanout2=8, set256) = 29001765 → `results/setjoin_p2_hop2/`, control
 (set256) = 29001766 → `results/setjoin_p2_ctrl/`, cap32 = 29001767 → `results/setjoin_p3_cap32/`.
+
+## Phases S11+S12 GATE — hop-2 union and per-relation cap: both REJECTED (arrays 29001765-67, 81/81)
+
+All arms on the adopted backbone (d256 2+2 ff1024, signature e4). Reference points: base = the
+backbone at default sizes (sweep cfg#10, set 128), ctrl = set_size 256 only.
+
+**S11 hop-2 (fanout2=8, set 256) FAILS its rule** (needed ≥2/3 motivating tasks better than ctrl +
+no beats-RT drop): only site-success improved (0.895 vs 0.924 — still nowhere near RT 0.734);
+user-repeat −2.0 AUROC, study-outcome −2.8, and user-ignore collapsed 87.1→83.5. beats-RT 4/9 vs
+ctrl's 6/9. The 2-hop signal hypothesis is DEAD on this substrate: co-attendees/grandchildren as
+extra set elements hurt more than they help. `fanout2` stays default-off.
+
+**S12 per-relation cap (cap32, set 128) FAILS** (needed driver-top3 +1.0, got −2.1: 85.5 vs base
+87.6; mean AUC 80.15 vs 80.53, mean NMAE 0.491 vs 0.482). Dilution is real but the cap is the wrong
+fix — the base's merged recency sort at set 128 already keeps the golden rows. Default-off. No combo
+arm (rule: both must pass).
+
+**Sidebar worth keeping**: plain set_size=256 (ctrl) is a per-task knob — it flips study-outcome
+above RT (68.9 vs 68.6) and helps driver-dnf (81.1) / user-attendance (0.396), but costs
+driver-top3 −2.9 (dilution). Not adopted globally; note for per-task tuning.
+
+**Standing single-table config after S10-S12: d256 2+2 ff1024, signature e4 k2, fanout 64,
+wide 128, set 128 — no hop-2, no cap.** Per-task sweep bests (PROGRESS S10) remain the headline:
+beats RT 6/9, beats MoRE grid best 3/9, user-ignore 90.5 best-anywhere.
