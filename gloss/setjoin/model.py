@@ -25,15 +25,19 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from ..data.graph import GraphBundle
 from ..model.column_encoder import CellEncoder
 from ..model.moe import MoEFFN
 from .collate import JoinBatch
-from .paths import child_rels, m2o_paths
+from .paths import child_rels, m2o_paths, slot_relations
 from .recency import N_RECENCY_BINS, recency_bins
 
 ROUTE_ARMS = ("signature", "hidden", "dense")
+READOUT_ARMS = ("pma", "measure", "slot")
+SLOT_MODES = ("hard", "soft", "iterative")
+READOUT_CHANNELS = ("mean", "count", "sum", "max")
 
 
 class RowPool(nn.Module):
@@ -299,6 +303,155 @@ class WideEncoder(nn.Module):
         return self.stack.ortho_loss()
 
 
+class SlotReadout(nn.Module):
+    """Cardinality-aware GROUP-BY readout for the union set (spec: ``slot-update.md``).
+
+    Replaces the PMA convex-combination pool (whose weights sum to 1, so it is blind to how many
+    children a seed has) with a **measure pool** that keeps the count instead of normalizing it away
+    (the mean stays recoverable as ``SUM/(COUNT+eps)``). Two arms:
+
+    * ``measure`` — ``n_pma`` learned **sigmoid-gated** queries, no grouping (isolates *counting*).
+    * ``slot``    — one **schema-seeded** slot per ``(table, fk_role)`` relation; elements assigned by
+      key-match softened by content. ``slot_mode``: ``hard`` (deterministic GROUP BY, content ignored),
+      ``soft`` (learned ``gamma`` key-bias + softmax **over slots**), ``iterative`` (GRU refinement).
+
+    Consumes the contextualized set ``H [B, N, d]`` (null token already dropped), the real-element mask
+    ``valid [B, N]``, the per-element slot index ``group_idx [B, N]`` (slot arm), and ``seed_repr
+    [B, d]``. Emits ``context [B, d]`` (head-compatible) and stashes ``slot_vectors [B, K, d]`` +
+    ``last_diag``. Slot table/fk embeddings are the same *family* as the element tags (fresh, so the
+    readout stays isolated and the ``pma`` default path is unperturbed)."""
+
+    def __init__(self, d_model: int, *, readout: str, n_pma: int, num_tables: int, num_roles: int,
+                 slot_meta: list[tuple[int, int]] | None = None, slot_mode: str = "hard",
+                 slot_iters: int = 3, slot_gamma_init: float = 2.0, slot_gamma_learnable: bool = True,
+                 slot_seed_cond: bool = True,
+                 readout_channels: tuple[str, ...] = ("mean", "count", "sum")):
+        super().__init__()
+        assert readout in ("measure", "slot"), readout
+        assert slot_mode in SLOT_MODES, slot_mode
+        d = d_model
+        self.d = d
+        self.readout = readout
+        self.slot_mode = slot_mode
+        self.slot_iters = int(slot_iters)
+        self.slot_seed_cond = bool(slot_seed_cond)
+        self.channels = tuple(readout_channels)
+        assert self.channels and all(c in READOUT_CHANNELS for c in self.channels), self.channels
+        self.eps = 1e-6
+        self.last_diag: dict = {}
+
+        if readout == "slot":
+            assert slot_meta is not None
+            self.K = len(slot_meta)
+            self.register_buffer("slot_table_ids",
+                                 torch.tensor([m[0] for m in slot_meta], dtype=torch.long))
+            self.register_buffer("slot_role_ids",
+                                 torch.tensor([m[1] for m in slot_meta], dtype=torch.long))
+            self.table_emb = nn.Embedding(num_tables, d)
+            self.fk_emb = nn.Embedding(num_roles, d)
+            self.w_slot = nn.Linear(2 * d, d)
+            self.p_slot = nn.Parameter(torch.randn(self.K, d) * 0.02)
+            self.gamma = nn.Parameter(torch.tensor(float(slot_gamma_init)),
+                                      requires_grad=bool(slot_gamma_learnable))
+            self.w_q = nn.Linear(d, d)
+            n_query = self.K
+        else:  # measure
+            self.K = n_pma
+            self.query_emb = nn.Parameter(torch.randn(1, n_pma, d) * 0.02)
+            n_query = n_pma
+
+        self.w_seed = nn.Linear(d, d)
+        self.w_k = nn.Linear(d, d)
+        self.w_v = nn.Linear(d, d)
+        n_vec = sum(1 for c in self.channels if c in ("mean", "sum", "max"))
+        w_o_in = n_vec * d + (1 if "count" in self.channels else 0)
+        self.w_o = nn.Linear(w_o_in, d)
+        if readout == "slot" and slot_mode == "iterative":
+            self.gru = nn.GRUCell(d, d)
+        self.w_ctx = nn.Linear(n_query * d, d)
+
+    def _measure_pool(self, attn: Tensor, V: Tensor, n_real: Tensor) -> tuple[Tensor, Tensor]:
+        """attn [B, Q, N] (already valid-zeroed), V [B, N, d] -> (update [B, Q, d], m [B, Q])."""
+        m = attn.sum(dim=2)                                  # [B, Q]  soft COUNT (unnormalized)
+        S = attn @ V                                         # [B, Q, d] SUM
+        parts: list[Tensor] = []
+        for c in self.channels:                              # build cat in the declared channel order
+            if c == "mean":
+                parts.append(S / (m.unsqueeze(-1) + self.eps))
+            elif c == "sum":                                 # log-compressed by the set cardinality
+                parts.append(S / torch.log1p(n_real).clamp(min=self.eps).view(-1, 1, 1))
+            elif c == "count":
+                parts.append(torch.log1p(m).unsqueeze(-1))
+            elif c == "max":
+                parts.append((attn.unsqueeze(-1) * V.unsqueeze(1)).max(dim=2).values)
+        return self.w_o(torch.cat(parts, dim=-1)), m
+
+    def forward(self, H: Tensor, valid: Tensor, seed_repr: Tensor,
+                group_idx: Tensor | None = None) -> Tensor:
+        B, N, d = H.shape
+        valid_b = valid.unsqueeze(1).float()                 # [B, 1, N] broadcasts over queries/slots
+        n_real = valid.sum(dim=1).to(H.dtype)                # [B] per-seed set cardinality
+        V = self.w_v(H)
+
+        if self.readout == "measure":
+            q = self.query_emb.expand(B, -1, -1) + self.w_seed(seed_repr).unsqueeze(1)  # [B, n_pma, d]
+            content = q @ self.w_k(H).transpose(-1, -2) / (d ** 0.5)                     # [B, n_pma, N]
+            attn = torch.sigmoid(content) * valid_b          # sigmoid GATES (not softmax) -> count-aware
+            update, m = self._measure_pool(attn, V, n_real)
+            self.slot_vectors, self.last_m = update, m.detach()
+            self.last_diag = {"util_mean": float(m.mean().detach())}
+            return self.w_ctx(update.reshape(B, -1))
+
+        # ---- slot arm ----
+        assert group_idx is not None and group_idx.shape[1] == N == valid.shape[1]
+        K = self.K
+        slot0 = self.w_slot(torch.cat([self.table_emb(self.slot_table_ids),
+                                       self.fk_emb(self.slot_role_ids)], dim=-1)) + self.p_slot  # [K, d]
+        slot = slot0.unsqueeze(0).expand(B, -1, -1)
+        if self.slot_seed_cond:
+            slot = slot + self.w_seed(seed_repr).unsqueeze(1)                            # [B, K, d]
+        keymatch = F.one_hot(group_idx.clamp(min=0), K).transpose(-1, -2).float()        # [B, K, N]
+
+        def assign(slot_q: Tensor) -> Tensor:
+            if self.slot_mode == "hard":                     # deterministic GROUP BY (content ignored)
+                return keymatch * valid_b
+            content = self.w_q(slot_q) @ self.w_k(H).transpose(-1, -2) / (d ** 0.5)      # [B, K, N]
+            logits = content + self.gamma * keymatch
+            return torch.softmax(logits, dim=1) * valid_b    # dim=1 = SLOTS (per element); pad zeroed
+
+        if self.slot_mode == "iterative":
+            attn = update = None
+            for _ in range(self.slot_iters):
+                attn = assign(slot)
+                update, m = self._measure_pool(attn, V, n_real)
+                slot = self.gru(update.reshape(B * K, d), slot.reshape(B * K, d)).reshape(B, K, d)
+            slot_vectors = slot                              # GRU-refined (the measure rode through it)
+        else:
+            attn = assign(slot)
+            update, m = self._measure_pool(attn, V, n_real)
+            # residual slot-attention step: the pooled measure `update` reaches the head (so count/sum/
+            # mean are never dropped), while the query `slot` carries the schema identity + seed — a
+            # uniform seed shift cancels inside the over-slot softmax, so without this residual
+            # seed-conditioning would be inert for the one-shot arms.
+            slot_vectors = slot + update
+
+        self.slot_vectors, self.last_m = slot_vectors, m.detach()   # last_m [B, K] = soft group counts
+        self._log_diag(attn, m)
+        return self.w_ctx(slot_vectors.reshape(B, -1))
+
+    def _log_diag(self, attn: Tensor, m: Tensor) -> None:
+        diag = {"gamma": float(self.gamma.detach())}
+        util = m.detach().mean(dim=0)                        # [K] mean assignment mass per slot
+        diag.update(util_mean=float(util.mean()), util_min=float(util.min()),
+                    util_max=float(util.max()), dead_slots=int((util < 1e-4).sum()))
+        if self.slot_mode != "hard":                         # entropy of the over-slots assignment
+            p = attn.detach().clamp(min=0)
+            ent = -(p * (p + self.eps).log()).sum(dim=1)     # [B, N]
+            w = (p.sum(dim=1) > 0).float()                   # elements carrying any mass (excludes pad)
+            diag["assign_entropy"] = float((ent * w).sum() / w.sum().clamp(min=1.0))
+        self.last_diag = diag
+
+
 class SetEncoder(nn.Module):
     """Element set ``[B, N, d]`` (+ mask) -> pooled ``context [B, d]``.
 
@@ -310,25 +463,45 @@ class SetEncoder(nn.Module):
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, n_pma: int, dropout: float, *,
                  route_on: str = "dense", d_ff: int | None = None, d_route: int | None = None,
-                 num_experts: int = 4, k: int = 2, use_shared: bool = False):
+                 num_experts: int = 4, k: int = 2, use_shared: bool = False,
+                 readout: str = "pma", slot_mode: str = "hard", slot_iters: int = 3,
+                 slot_gamma_init: float = 2.0, slot_gamma_learnable: bool = True,
+                 slot_seed_cond: bool = True,
+                 readout_channels: tuple[str, ...] = ("mean", "count", "sum"),
+                 slot_meta: list[tuple[int, int]] | None = None,
+                 num_tables: int = 0, num_roles: int = 0):
         super().__init__()
+        self.readout_arm = readout
         self.null_elem = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.stack = _MoEStack(d_model, n_layers, n_heads, dropout, route_on=route_on,
                                d_ff=d_ff or 2 * d_model, d_route=d_route or d_model,
                                num_experts=num_experts, k=k, use_shared=use_shared)
-        self.pma_emb = nn.Parameter(torch.randn(1, n_pma, d_model) * 0.02)
-        self.w_q = nn.Linear(d_model, d_model)
-        self.pma = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.out = nn.Linear(n_pma * d_model, d_model)
+        # readout=pma builds the original PMA modules in the SAME order (RNG-reproducible default);
+        # measure/slot build a SlotReadout instead (only when != pma, so the default path is untouched).
+        self.readout: SlotReadout | None = None
+        if readout == "pma":
+            self.pma_emb = nn.Parameter(torch.randn(1, n_pma, d_model) * 0.02)
+            self.w_q = nn.Linear(d_model, d_model)
+            self.pma = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.out = nn.Linear(n_pma * d_model, d_model)
+        else:
+            self.readout = SlotReadout(d_model, readout=readout, n_pma=n_pma, num_tables=num_tables,
+                                       num_roles=num_roles, slot_meta=slot_meta, slot_mode=slot_mode,
+                                       slot_iters=slot_iters, slot_gamma_init=slot_gamma_init,
+                                       slot_gamma_learnable=slot_gamma_learnable,
+                                       slot_seed_cond=slot_seed_cond, readout_channels=readout_channels)
 
-    def forward(self, E: Tensor, mask: Tensor, seed_repr: Tensor, z: Tensor | None = None) -> Tensor:
+    def forward(self, E: Tensor, mask: Tensor, seed_repr: Tensor, z: Tensor | None = None,
+                group_idx: Tensor | None = None) -> Tensor:
         B = E.shape[0]
         x = torch.cat([self.null_elem.expand(B, -1, -1), E], dim=1)
         kpm = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=E.device), ~mask], dim=1)
         x = self.stack(x, kpm, z)
-        q = self.pma_emb.expand(B, -1, -1) + self.w_q(seed_repr).unsqueeze(1)
-        ctx, _ = self.pma(q, x, x, key_padding_mask=kpm, need_weights=False)
-        return self.out(ctx.reshape(B, -1))
+        if self.readout_arm == "pma":
+            q = self.pma_emb.expand(B, -1, -1) + self.w_q(seed_repr).unsqueeze(1)
+            ctx, _ = self.pma(q, x, x, key_padding_mask=kpm, need_weights=False)
+            return self.out(ctx.reshape(B, -1))
+        return self.readout(x[:, 1:], mask, seed_repr, group_idx)      # drop the null token (H = x[:,1:])
 
     def ortho_loss(self):
         return self.stack.ortho_loss()
@@ -356,10 +529,24 @@ class SetJoin(nn.Module):
         d_ff: int | None = None,
         n_axial_layers: int = 0,
         use_shared: bool = False,
+        readout: str = "pma",
+        slot_mode: str = "hard",
+        slot_group_key: str = "table_fkrole",
+        slot_iters: int = 3,
+        slot_gamma_init: float = 2.0,
+        slot_gamma_learnable: bool = True,
+        slot_seed_cond: bool = True,
+        readout_channels: tuple[str, ...] = ("mean", "count", "sum"),
     ):
         super().__init__()
         if route_on not in ROUTE_ARMS:
             raise ValueError(f"route_on must be one of {ROUTE_ARMS}, got {route_on!r}")
+        if readout not in READOUT_ARMS:
+            raise ValueError(f"readout must be one of {READOUT_ARMS}, got {readout!r}")
+        if slot_mode not in SLOT_MODES:
+            raise ValueError(f"slot_mode must be one of {SLOT_MODES}, got {slot_mode!r}")
+        if slot_group_key != "table_fkrole":
+            raise NotImplementedError(f"slot_group_key={slot_group_key!r}; only 'table_fkrole' is wired")
         self.d_model = d_model
         self.entity_table = entity_table
         self.route_on = route_on
@@ -388,9 +575,17 @@ class SetJoin(nn.Module):
 
         moe = dict(route_on=route_on, d_ff=d_ff, d_route=d_route, num_experts=num_experts, k=k,
                    use_shared=use_shared)
+        # GROUP-BY readout: one slot per (table, fk_role) relation (None keeps the default PMA path)
+        slot_meta = slot_relations(bundle)[0] if readout != "pma" else None
         self.row_pool = RowPool(d_model)
         self.wide_enc = WideEncoder(d_model, n_wide_layers, n_heads, dropout, **moe)
-        self.set_enc = SetEncoder(d_model, n_set_layers, n_heads, n_pma, dropout, **moe)
+        self.set_enc = SetEncoder(d_model, n_set_layers, n_heads, n_pma, dropout, **moe,
+                                  readout=readout, slot_mode=slot_mode, slot_iters=slot_iters,
+                                  slot_gamma_init=slot_gamma_init,
+                                  slot_gamma_learnable=slot_gamma_learnable,
+                                  slot_seed_cond=slot_seed_cond, readout_channels=readout_channels,
+                                  slot_meta=slot_meta, num_tables=bundle.num_node_types,
+                                  num_roles=bundle.num_fk_roles)
         self.elem_norm = nn.LayerNorm(d_model)
         self.w_cnt = nn.Linear(self.n_child_rels, d_model) if self.n_child_rels else None
         self.head = nn.Sequential(
@@ -457,7 +652,8 @@ class SetJoin(nn.Module):
             + self.recency_emb(elem_rec) + self.hop_emb(jb.elem_hop.clamp(min=0, max=3))
         E = self.elem_norm(E) * jb.elem_mask.unsqueeze(-1).float()
         z_e = self.elem_sig(jb) if self.elem_sig is not None else None
-        context = self.set_enc(E, jb.elem_mask, seed_repr, z_e)         # [B, d]
+        context = self.set_enc(E, jb.elem_mask, seed_repr, z=z_e,       # keyword: keep z distinct from
+                               group_idx=jb.set_group_idx)              # group_idx (H3)   -> [B, d]
 
         # ---- head ----
         if self.w_cnt is not None:

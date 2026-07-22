@@ -81,6 +81,10 @@ class SetJoinLitModule(pl.LightningModule):
         loss = task_loss(logits.squeeze(-1), y, jb.has_target, self.task_type) \
             + self.lambda_ortho * aux                       # router orthogonality (0 on the dense arm)
         self.log("train/loss", loss, prog_bar=True, batch_size=int(jb.num_seeds))
+        readout = getattr(self.model.set_enc, "readout", None)      # SlotReadout (None on the pma arm)
+        if readout is not None:                                     # gamma / assign-entropy / utilization
+            for k, v in getattr(readout, "last_diag", {}).items():
+                self.log(f"train/readout/{k}", float(v), batch_size=int(jb.num_seeds))
         return loss
 
     def on_before_optimizer_step(self, optimizer):

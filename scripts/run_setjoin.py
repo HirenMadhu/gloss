@@ -48,6 +48,19 @@ def main() -> int:
     ap.add_argument("--lambda-ortho", type=float, default=0.5, help="router orthogonality weight")
     ap.add_argument("--n-axial-layers", type=int, default=0,
                     help="row+column cell-attention blocks per node type (0 = off; the three-level arm uses 1)")
+    ap.add_argument("--readout", default="pma", choices=["pma", "measure", "slot"],
+                    help="set-encoder readout arm (pma = current PMA; measure/slot = GROUP-BY pooling)")
+    ap.add_argument("--slot-mode", default="hard", choices=["hard", "soft", "iterative"],
+                    help="slot readout: hard GROUP BY | soft (learned gamma) | iterative (GRU)")
+    ap.add_argument("--slot-group-key", default="table_fkrole", help="slot grouping key")
+    ap.add_argument("--slot-iters", type=int, default=3, help="iterative slot refinement steps")
+    ap.add_argument("--slot-gamma-init", type=float, default=2.0, help="initial key-bias strength")
+    ap.add_argument("--no-slot-gamma-learnable", dest="slot_gamma_learnable", action="store_false",
+                    help="freeze the slot key-bias gamma")
+    ap.add_argument("--no-slot-seed-cond", dest="slot_seed_cond", action="store_false",
+                    help="do not seed-condition the slot init")
+    ap.add_argument("--readout-channels", default="mean,count,sum",
+                    help="comma-separated measure channels ⊆ {mean,count,sum,max}")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--n-wide-layers", type=int, default=2)
@@ -93,6 +106,14 @@ def _build(dataset: str):
     return build_gloss_graph(dataset, cache_dir=str(graph_cache_dir(dataset)))
 
 
+def _readout_kwargs(args) -> dict:
+    """The slot/measure readout model_kwargs (parallel to route_on); readout=pma keeps current behavior."""
+    return dict(readout=args.readout, slot_mode=args.slot_mode, slot_group_key=args.slot_group_key,
+                slot_iters=args.slot_iters, slot_gamma_init=args.slot_gamma_init,
+                slot_gamma_learnable=args.slot_gamma_learnable, slot_seed_cond=args.slot_seed_cond,
+                readout_channels=tuple(c for c in args.readout_channels.split(",") if c))
+
+
 def _dry_run(args) -> int:
     from relbench.tasks import get_task
 
@@ -135,7 +156,8 @@ def _dry_run(args) -> int:
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
                     n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
                     route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                    d_ff=args.d_ff, n_axial_layers=args.n_axial_layers, use_shared=args.use_shared)
+                    d_ff=args.d_ff, n_axial_layers=args.n_axial_layers, use_shared=args.use_shared,
+                    **_readout_kwargs(args))
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
         logits, aux = model(jb)
@@ -161,7 +183,8 @@ def _train(args) -> int:
                           n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
                           n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
                           k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
-                          n_axial_layers=args.n_axial_layers, use_shared=args.use_shared),
+                          n_axial_layers=args.n_axial_layers, use_shared=args.use_shared,
+                          **_readout_kwargs(args)),
         fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
         wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
@@ -196,7 +219,7 @@ def _gate(args) -> int:
                               n_pma=args.n_pma, route_on=args.route_on,
                               num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
                               d_ff=args.d_ff, n_axial_layers=args.n_axial_layers,
-                              use_shared=args.use_shared),
+                              use_shared=args.use_shared, **_readout_kwargs(args)),
             fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
             wide_len=args.wide_len,
             set_size=args.set_size, lambda_ortho=args.lambda_ortho,
@@ -212,7 +235,9 @@ def _gate(args) -> int:
     if args.aggregate:
         print(format_table(records, split="test",
                            baseline=runner.variant_of(dict(route_on=args.route_on,
-                                                           use_shared=args.use_shared),
+                                                           use_shared=args.use_shared,
+                                                           readout=args.readout,
+                                                           slot_mode=args.slot_mode),
                                                       fanout2=args.fanout2,
                                                       per_relation_cap=args.per_relation_cap)))
         return 0

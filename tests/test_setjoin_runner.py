@@ -44,6 +44,20 @@ def test_variant_of_labels_all_arms():
     assert variant_of(dict(route_on="dense"), fanout2=8) == "setjoin-hop2"
 
 
+def test_variant_of_is_readout_aware():
+    # readout=pma keeps the current label (back-compat); measure/slot get distinct suffixes so the
+    # {index}_{variant}.json gate files can't collide and silently reuse another arm's record.
+    assert variant_of(dict(route_on="signature", readout="pma")) == "setjoin-signature"
+    assert variant_of(dict(route_on="signature")) == "setjoin-signature"          # default = pma
+    assert variant_of(dict(route_on="signature", readout="measure")) == "setjoin-signature-measure"
+    assert variant_of(dict(route_on="signature", readout="slot",
+                           slot_mode="hard")) == "setjoin-signature-slothard"
+    assert variant_of(dict(route_on="signature", readout="slot",
+                           slot_mode="soft")) == "setjoin-signature-slotsoft"
+    assert (variant_of(dict(route_on="signature", readout="slot", slot_mode="hard"))
+            != variant_of(dict(route_on="signature", readout="pma")))
+
+
 def test_diff_table_deltas():
     a = [_rec("rel-f1", "driver-dnf", s, task_type="binary", test_roc_auc=0.82) for s in range(3)]
     a += [_rec("rel-f1", "driver-position", s, task_type="regression", test_nmae=0.40)

@@ -27,7 +27,7 @@ from torch import Tensor
 
 from ..data.collate import _seed_time_per_segment, column_vocab, feature_col_names
 from ..data.graph import FK_NONE, GraphBundle, canonical_relation, is_forward_relation
-from .paths import child_rels, m2o_paths, parent_rels, path_target_type
+from .paths import child_rels, m2o_paths, parent_rels, path_target_type, slot_relations
 
 PAD = -1
 
@@ -52,6 +52,7 @@ class JoinBatch:
     elem_row_time: Tensor          # float64
     elem_is_timed: Tensor          # bool
     elem_hop: Tensor               # long; 1 = direct child, 2 = grandchild/sibling/co-child (hop2 arm)
+    set_group_idx: Tensor          # long [B, N]; slot-attention GROUP-BY slot (paths.slot_relations); pad = -1
     # ---- per child relation [B, R] (order = paths.child_rels; post-sampler, PRE-truncation) ----
     child_counts: Tensor           # float32
     # ---- per seed [B] ----
@@ -84,6 +85,7 @@ class JoinBatch:
             elem_mask=mv(self.elem_mask), elem_rel_idxs=mv(self.elem_rel_idxs),
             elem_table_idxs=mv(self.elem_table_idxs), elem_row_time=mv(self.elem_row_time),
             elem_is_timed=mv(self.elem_is_timed), elem_hop=mv(self.elem_hop),
+            set_group_idx=mv(self.set_group_idx),
             child_counts=mv(self.child_counts),
             seed_time=mv(self.seed_time), target=mv(self.target), has_target=mv(self.has_target),
             input_id=mv(self.input_id),
@@ -294,6 +296,7 @@ def to_join_batch(
     crels = child_rels(bundle, entity_table)
     R = len(crels)
     child_counts = torch.zeros(B, R, dtype=torch.float32)
+    _, slot_lookup, _ = slot_relations(bundle)          # (table_id, role_id) -> GROUP-BY slot index
 
     elem_mask = torch.zeros(B, set_size, dtype=torch.bool)
     elem_rel_idxs = torch.zeros(B, set_size, dtype=torch.long)
@@ -301,6 +304,7 @@ def to_join_batch(
     elem_row_time = torch.zeros(B, set_size, dtype=torch.float64)
     elem_is_timed = torch.zeros(B, set_size, dtype=torch.bool)
     elem_hop = torch.ones(B, set_size, dtype=torch.long)
+    set_group_idx = torch.full((B, set_size), -1, dtype=torch.long)
     elem_place: dict[str, list[list[int]]] = {}
     set_truncated = 0
 
@@ -365,12 +369,14 @@ def to_join_batch(
             items = items[:set_size]
         for n, (c, role, hop) in enumerate(items):
             child_nt = node_types[int(typeidx[c])]
+            table_id = bundle.node_type_id[child_nt]
             elem_mask[b, n] = True
             elem_rel_idxs[b, n] = role
-            elem_table_idxs[b, n] = bundle.node_type_id[child_nt]
+            elem_table_idxs[b, n] = table_id
             elem_row_time[b, n] = float(rowt[c])
             elem_is_timed[b, n] = bool(timed[c])
             elem_hop[b, n] = hop
+            set_group_idx[b, n] = slot_lookup[(table_id, role)]
             elem_append(child_nt, b, n, int(intype[c]), FK_NONE)        # the element row itself
             for prk in parent_rels(bundle, child_nt):                   # + its flattened parents
                 p = parent_of.get(prk, {}).get(c)
@@ -397,6 +403,7 @@ def to_join_batch(
         wide_row_time=wide_row_time, wide_is_timed=wide_is_timed,
         elem_mask=elem_mask, elem_rel_idxs=elem_rel_idxs, elem_table_idxs=elem_table_idxs,
         elem_row_time=elem_row_time, elem_is_timed=elem_is_timed, elem_hop=elem_hop,
+        set_group_idx=set_group_idx,
         child_counts=child_counts,
         seed_time=seed_time, target=target, has_target=has_target, input_id=input_id,
         tf_dict={nt: batch[nt].tf for nt in node_types},

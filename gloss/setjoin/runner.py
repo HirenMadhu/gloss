@@ -43,14 +43,22 @@ def variant_of(model_kwargs: dict | None, *, fanout2: int = 0,
                per_relation_cap: int | None = None) -> str:
     """Arm label: ``setjoin`` for the dense arm (back-compat with the v1/v2 records), else
     ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method), with a ``-shared``
-    suffix for the always-on shared expert (the S addition), ``-hop2`` for the hop-2 union arm,
-    and ``-cap<N>`` for the per-relation recency cap."""
+    suffix for the always-on shared expert (the S addition), a readout suffix (``-measure`` or
+    ``-slot<mode>``; ``pma`` = current PMA adds none, so old records keep their label), ``-hop2``
+    for the hop-2 union arm, and ``-cap<N>`` for the per-relation recency cap. The readout suffix is
+    load-bearing: gate records are named ``{index}_{variant}.json`` and skipped-if-present, so two
+    readout arms sharing a label would collide and the second would silently reuse the first's record."""
     mk = model_kwargs or {}
     route_on = mk.get("route_on", "signature")
     if route_on == "dense":
         label = "setjoin"
     else:
         label = f"setjoin-{route_on}" + ("-shared" if mk.get("use_shared") else "")
+    readout = mk.get("readout", "pma")
+    if readout == "measure":
+        label += "-measure"
+    elif readout == "slot":
+        label += f"-slot{mk.get('slot_mode', 'hard')}"
     if fanout2 > 0:
         label += "-hop2"
     if per_relation_cap is not None:
@@ -133,6 +141,7 @@ def run_config(
            "fanout": fanout, "fanout2": fanout2, "per_relation_cap": per_relation_cap,
            "wide_len": wide_len, "set_size": set_size,
            "route_on": mk.get("route_on", "signature"),
+           "readout": mk.get("readout", "pma"), "slot_mode": mk.get("slot_mode", "hard"),
            "num_experts": mk.get("num_experts", 4),
            "n_axial_layers": mk.get("n_axial_layers", 0),
            "use_shared": bool(mk.get("use_shared", False)),

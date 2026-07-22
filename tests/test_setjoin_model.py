@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import torch
 
-from gloss.setjoin.model import (AxialCellEncoder, ElemSignature, MoELayer, RowPool, SetEncoder,
-                                 SetJoin, WideEncoder)
+from gloss.setjoin.model import (SLOT_MODES, AxialCellEncoder, ElemSignature, MoELayer, RowPool,
+                                 SetEncoder, SetJoin, SlotReadout, WideEncoder)
 
 from .conftest import rel_f1_available
 
 D = 16
+_SLOT_META = [(0, 1), (1, 2), (0, 2), (2, 3)]              # 4 (table, fk_role) GROUP-BY slots
 
 
 # ---------- hermetic sub-module contracts ----------
@@ -186,9 +187,155 @@ def test_axial_moe_arm_routes_and_balances():
     assert cell.grad is not None and float(enc.ortho_loss()) >= 0.0
 
 
+# ---------- slot / measure GROUP-BY readout arms (hermetic) ----------
+
+def _slot_batch(B=3, N=8, K=4, empty_last=True):
+    torch.manual_seed(0)
+    H = torch.randn(B, N, D)
+    valid = torch.zeros(B, N, dtype=torch.bool)
+    valid[:, :5] = True
+    if empty_last:
+        valid[-1] = False                                  # one genuinely empty set
+    seed = torch.randn(B, D)
+    gi = torch.randint(0, K, (B, N))
+    gi[~valid] = -1                                        # pad -> sink (-1)
+    return H, valid, seed, gi
+
+
+def _slot_readout(mode="hard", **kw):
+    return SlotReadout(D, readout="slot", n_pma=2, num_tables=3, num_roles=5,
+                       slot_meta=_SLOT_META, slot_mode=mode, **kw)
+
+
+def test_slot_readout_hard_measure_pool_and_grad_scope():
+    """Rung 1: the residual ``slot + update`` feeds context, so the pooled measure reaches the head
+    (kills the silent no-op H2) while the query carries schema identity + seed. Hard assignment ignores
+    the CONTENT dot-product, so only ``w_q`` is out of the graph; ``w_slot``/``w_seed`` still flow."""
+    r = _slot_readout("hard")
+    H, valid, seed, gi = _slot_batch()
+    out = r(H, valid, seed, gi)
+    assert out.shape == (3, D) and torch.isfinite(out).all()
+    out.sum().backward()
+    for name in ("w_v", "w_o", "w_ctx", "w_slot", "w_seed"):   # measure path + identity/seed residual
+        g = getattr(r, name).weight.grad
+        assert g is not None and float(g.abs().sum()) > 0, name
+    assert r.w_q.weight.grad is None                       # content dot-product unused in hard mode
+    r.eval()                                               # seed reaches context through the residual
+    assert not torch.allclose(r(H, valid, seed, gi), r(H, valid, seed + 5.0, gi), atol=1e-6)
+
+
+def test_slot_hard_m_equals_histogram():
+    """The built-in Rung-1 sanity: the hard soft-count m is exactly the per-group element histogram."""
+    r = _slot_readout("hard").eval()
+    H, valid, seed, gi = _slot_batch()
+    r(H, valid, seed, gi)
+    hist = torch.zeros(3, r.K)
+    for b in range(3):
+        for n in range(8):
+            if bool(valid[b, n]):
+                hist[b, int(gi[b, n])] += 1.0
+    assert torch.allclose(r.last_m, hist)
+
+
+def test_softmax_is_over_slots_not_elements():
+    """H1: soft assignment softmaxes over the SLOT axis, so the group count tracks cardinality. Were it
+    over elements, m would be ~1 no matter how many rows fall in the group."""
+    r = _slot_readout("soft", slot_gamma_init=20.0).eval()  # large gamma pins each element to its slot
+    row = torch.randn(1, 1, D)
+    for n_valid in (3, 6):
+        H = row.expand(1, 8, D).contiguous()
+        valid = torch.zeros(1, 8, dtype=torch.bool)
+        valid[:, :n_valid] = True
+        gi = torch.zeros(1, 8, dtype=torch.long)
+        gi[~valid] = -1                                    # all real rows in slot 0
+        r(H, valid, torch.zeros(1, D), gi)
+        assert abs(float(r.last_m[0, 0]) - n_valid) < 0.5  # m ~= count (NOT 1)
+
+
+def test_slot_soft_grad_reaches_content_and_seed_dependent():
+    r = _slot_readout("soft")
+    H, valid, seed, gi = _slot_batch()
+    r(H, valid, seed, gi).sum().backward()
+    for name in ("w_q", "w_seed", "w_slot", "w_v", "w_o", "w_ctx"):
+        g = getattr(r, name).weight.grad
+        assert g is not None and float(g.abs().sum()) > 0, name
+    assert r.gamma.grad is not None
+    r.eval()                                               # soft context DOES depend on the seed
+    assert not torch.allclose(r(H, valid, seed, gi), r(H, valid, seed + 1.0, gi), atol=1e-5)
+
+
+def test_slot_iterative_gru_grad_and_shape():
+    r = _slot_readout("iterative", slot_iters=3)
+    H, valid, seed, gi = _slot_batch()
+    out = r(H, valid, seed, gi)
+    assert out.shape == (3, D) and torch.isfinite(out).all()
+    out.sum().backward()
+    assert r.gru.weight_ih.grad is not None and float(r.gru.weight_ih.grad.abs().sum()) > 0
+
+
+def test_slot_empty_set_finite_all_modes():
+    for mode in SLOT_MODES:
+        r = _slot_readout(mode).eval()
+        empty = torch.zeros(2, 6, dtype=torch.bool)
+        gi = torch.full((2, 6), -1, dtype=torch.long)
+        out = r(torch.randn(2, 6, D), empty, torch.randn(2, D), gi)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(r.last_m, torch.zeros_like(r.last_m))   # empty groups -> zero counts
+
+
+def test_measure_arm_forward_grad_and_empty():
+    r = SlotReadout(D, readout="measure", n_pma=3, num_tables=3, num_roles=5)
+    H = torch.randn(2, 6, D)
+    valid = torch.zeros(2, 6, dtype=torch.bool)
+    valid[:, :4] = True
+    out = r(H, valid, torch.randn(2, D))
+    assert out.shape == (2, D) and torch.isfinite(out).all()
+    out.sum().backward()
+    for name in ("w_v", "w_o", "w_ctx"):
+        assert getattr(r, name).weight.grad is not None, name
+    assert torch.isfinite(r(H, torch.zeros(2, 6, dtype=torch.bool), torch.randn(2, D))).all()
+
+
+def test_readout_channels_subsets_size_w_o():
+    for chans, w_in in [(("count",), 1), (("mean",), D), (("mean", "count", "sum", "max"), 3 * D + 1)]:
+        r = _slot_readout("soft", readout_channels=chans)
+        assert r.w_o.in_features == w_in
+        H, valid, seed, gi = _slot_batch()
+        assert torch.isfinite(r(H, valid, seed, gi)).all()
+
+
+def test_slot_gamma_not_learnable_frozen():
+    r = _slot_readout("soft", slot_gamma_init=3.0, slot_gamma_learnable=False)
+    assert not r.gamma.requires_grad and float(r.gamma) == 3.0
+    H, valid, seed, gi = _slot_batch()
+    r(H, valid, seed, gi).sum().backward()
+    assert r.gamma.grad is None
+
+
+def test_slot_seed_cond_false_is_seed_independent():
+    r = _slot_readout("soft", slot_seed_cond=False).eval()
+    H, valid, seed, gi = _slot_batch()
+    out = r(H, valid, seed, gi)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, r(H, valid, seed + 3.0, gi), atol=1e-6)
+
+
+def test_setencoder_pma_default_and_slot_arm():
+    E = torch.randn(2, 5, D)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    seed = torch.randn(2, D)
+    pma = SetEncoder(D, n_layers=1, n_heads=2, n_pma=2, dropout=0.0).eval()
+    assert pma.readout is None and pma(E, mask, seed).shape == (2, D)   # default path: no group_idx
+    enc = SetEncoder(D, n_layers=1, n_heads=2, n_pma=2, dropout=0.0, readout="slot",
+                     slot_meta=_SLOT_META, num_tables=3, num_roles=5).eval()
+    gi = torch.randint(0, 4, (2, 5))
+    out = enc(E, mask, seed, group_idx=gi)
+    assert out.shape == (2, D) and torch.isfinite(out).all() and enc.readout is not None
+
+
 # ---------- full model on the cached real dataset ----------
 
-def _real_jb_and_model(encoder="hash", route_on="signature"):
+def _real_jb_and_model(encoder="hash", route_on="signature", **model_kw):
     from relbench.tasks import get_task
 
     from gloss.data.graph import build_gloss_graph, make_loader
@@ -206,7 +353,7 @@ def _real_jb_and_model(encoder="hash", route_on="signature"):
     # the CLS readout (no attention follows the FFN), so wide-signature routing would get zero grad.
     model = SetJoin(bundle, name_emb, task.entity_table, d_model=32, n_heads=2,
                     n_wide_layers=2, n_set_layers=1, n_pma=2, dropout=0.0,
-                    route_on=route_on, num_experts=3, k=2, d_sig=16)
+                    route_on=route_on, num_experts=3, k=2, d_sig=16, **model_kw)
     return jb, model
 
 
@@ -294,6 +441,7 @@ def test_end_to_end_set_permutation_invariance():
         elem_mask=jb.elem_mask[:, perm], elem_rel_idxs=jb.elem_rel_idxs[:, perm],
         elem_table_idxs=jb.elem_table_idxs[:, perm], elem_row_time=jb.elem_row_time[:, perm],
         elem_is_timed=jb.elem_is_timed[:, perm], elem_hop=jb.elem_hop[:, perm],
+        set_group_idx=jb.set_group_idx[:, perm],           # permute the GROUP-BY index too (slot arm)
         elem_rows={nt: (b, inv[n], r, p) for nt, (b, n, r, p) in jb.elem_rows.items()},
     )
     logits_p, _ = model(jb_p)
@@ -317,3 +465,38 @@ def test_empty_set_and_missing_marker_paths_are_live():
     wm[0, 0] = True
     logits_m, _ = model(replace(jb, wide_missing=wm))
     assert not torch.allclose(logits[0], logits_m[0], atol=1e-6)
+
+
+@rel_f1_available
+def test_slot_and_measure_arms_full_model_forward_grad_budget():
+    for kw in (dict(readout="measure"), dict(readout="slot", slot_mode="hard"),
+               dict(readout="slot", slot_mode="soft"), dict(readout="slot", slot_mode="iterative")):
+        jb, model = _real_jb_and_model(**kw)
+        logits, aux = model(jb)
+        assert logits.shape == (jb.num_seeds, 1) and torch.isfinite(logits).all(), kw
+        assert float(aux) > 0.0                            # set-encoder MoE routing untouched by readout
+        assert sum(p.numel() for p in model.parameters()) < 30e6, kw
+        (logits.sum() + aux).backward()
+        g = model.set_enc.readout.w_o.weight.grad          # the measure pool reaches the head
+        assert g is not None and float(g.abs().sum()) > 0, kw
+
+
+@rel_f1_available
+def test_slot_arm_set_permutation_invariance():
+    from dataclasses import replace
+
+    jb, model = _real_jb_and_model(readout="slot", slot_mode="soft")
+    model.eval()
+    logits, _ = model(jb)
+    perm = torch.randperm(jb.set_size)
+    inv = torch.argsort(perm)
+    jb_p = replace(
+        jb,
+        elem_mask=jb.elem_mask[:, perm], elem_rel_idxs=jb.elem_rel_idxs[:, perm],
+        elem_table_idxs=jb.elem_table_idxs[:, perm], elem_row_time=jb.elem_row_time[:, perm],
+        elem_is_timed=jb.elem_is_timed[:, perm], elem_hop=jb.elem_hop[:, perm],
+        set_group_idx=jb.set_group_idx[:, perm],
+        elem_rows={nt: (b, inv[n], r, p) for nt, (b, n, r, p) in jb.elem_rows.items()},
+    )
+    logits_p, _ = model(jb_p)
+    assert torch.allclose(logits, logits_p, atol=1e-5)

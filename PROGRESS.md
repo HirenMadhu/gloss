@@ -428,3 +428,38 @@ driver-top3 −2.9 (dilution). Not adopted globally; note for per-task tuning.
 **Standing single-table config after S10-S12: d256 2+2 ff1024, signature e4 k2, fanout 64,
 wide 128, set 128 — no hop-2, no cap.** Per-task sweep bests (PROGRESS S10) remain the headline:
 beats RT 6/9, beats MoRE grid best 3/9, user-ignore 90.5 best-anywhere.
+
+## Phase S13 — Relational Slot Attention readout (a differentiable GROUP BY); ladder built, SWEEP RUNNING
+
+New **`readout` axis parallel to `route_on`** (`slot-update.md`), replacing the union-set PMA
+(a softmax convex combination — blind to #children) with a cardinality-aware **measure pool** that
+keeps the count instead of normalizing it away. Arms: `pma` (default, current PMA — bit-for-bit
+reproducible, verified via git-stash param/output hash), `measure` (`n_pma` sigmoid-gated queries, no
+grouping — isolates counting), `slot` (one schema-seeded slot per `(table, fk_role)` relation; assign
+by key-match softened by content) with `slot_mode ∈ {hard, soft, iterative}` (the §5 rungs).
+
+**Mechanism** (`gloss/setjoin/model.py::SlotReadout`, after the set encoder — touches no routing, head
+unchanged): `m=Σ attn` (soft count), `S=attn@V`, `mu=S/(m+ε)`, `update=W_o[mu, log1p(m), S/log1p(N)]`;
+non-iterative uses the residual `slot_vectors = slot + update` (the pooled measure reaches the head —
+kills the count-blind no-op — while the query carries schema identity + seed); iterative refines with a
+GRU. `K = len(fk_relations)` slots from a new `paths.slot_relations`; collate adds `set_group_idx [B,N]`.
+
+**Hardened against the adversarial review**: softmax is over the SLOT axis `dim=1` (not `dim=K`); no
+`-inf` masking of pad columns (would NaN under over-slot softmax — pads zeroed by `valid`); `variant_of`
+is readout-aware (else gate files collide and silently reuse another arm's record); `one_hot` clamps the
+`-1` pad; `JoinBatch.to()` carries the new field. **Design fix found in testing**: a uniform
+`W_seed(seed)` added to all slots cancels inside the over-slot softmax, so seed-conditioning was inert
+for the one-shot arms — the residual restores it.
+
+**Tests (all green, 155 total)**: `paths.slot_relations` bijection; `set_group_idx` = element
+`(table,role)` slot on chain/dual-FK/hop-2 fixtures; per-arm forward/grad/budget + empty-set finiteness;
+hard-mode `m == group histogram`; the H1 axis guard (3 vs 300 rows → different count); soft grad-scope +
+seed-dependence; iterative GRU grad; slot-arm permutation invariance; per-arm overfit-one-batch (the
+end-to-end proof the measure reaches the head); `variant_of` readout labels; `.to()` device carry.
+
+**Sweep RUNNING** — 6 arms × 27 cells (9 leaderboard tasks × 3 seeds) at the standing config, harrier,
+to `results/setjoin_readout/{pma,measure,slot_hard,slot_soft,slot_iter,pma_matched}` (arrays
+29004569-74; `pma_matched` = `--n-pma 16`, the §7 capacity-matched fairness control). Pre-registered
+(§7): slot/measure should help most on count/magnitude/position tasks, be ~neutral on
+identity-of-one-child tasks; a *uniform* gain = capacity, not counting. Aggregate/compare per dir with
+`run_setjoin.py --compare --out-dir <dir>` and `--diff <other>` when done.

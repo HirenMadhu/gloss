@@ -6,7 +6,8 @@ import torch
 from gloss.data.collate import column_vocab
 from gloss.data.graph import FK_NONE
 from gloss.setjoin.collate import to_join_batch
-from gloss.setjoin.paths import child_rels, m2o_paths, parent_rels, setjoin_neighbors
+from gloss.setjoin.paths import (child_rels, fk_relations, m2o_paths, parent_rels, setjoin_neighbors,
+                                 slot_relations)
 
 from ._join_fixtures import ENTITY as ORDER
 from ._join_fixtures import chain_bundle, make_chain_batch, make_hop2_batch
@@ -32,6 +33,61 @@ def test_schema_maps():
     assert paths[1] == (("order", "customer", "customer"),)
     assert paths[2] == (("order", "customer", "customer"), ("customer", "region", "region"))
     assert len(paths) == 3
+
+
+def test_slot_relations_meta_and_lookup():
+    b = chain_bundle()
+    rels = fk_relations(b)                                  # sorted (child, fk_col, parent) triples
+    slot_meta, lookup, K = slot_relations(b)
+    assert K == len(rels) and len(lookup) == K             # bijection, no (table, role) collisions
+    for g, (child, col, _parent) in enumerate(rels):
+        assert slot_meta[g] == (b.node_type_id[child], b.fk_role_id[col])
+        assert lookup[slot_meta[g]] == g
+    # payments reach the seed (order) via (payment, order, order) — that pair is a valid slot
+    assert (b.node_type_id["payment"], b.fk_role_id["order"]) in lookup
+    assert slot_relations(b) is slot_relations(b)          # cached on the bundle
+
+
+def _assert_group_idx_is_element_pair(jb, bundle):
+    """set_group_idx of every REAL element is the slot of its (table, fk_role) pair; pad slots are -1."""
+    _, lookup, K = slot_relations(bundle)
+    gi, mask = jb.set_group_idx, jb.elem_mask
+    assert gi.dtype == torch.long and gi.shape == mask.shape
+    assert bool((gi[~mask] == -1).all())                   # pad = -1
+    assert bool(((gi[mask] >= 0) & (gi[mask] < K)).all())  # real ∈ [0, K)
+    for b in range(mask.shape[0]):
+        for n in range(mask.shape[1]):
+            if bool(mask[b, n]):
+                key = (int(jb.elem_table_idxs[b, n]), int(jb.elem_rel_idxs[b, n]))
+                assert int(gi[b, n]) == lookup[key]
+
+
+def test_set_group_idx_chain_single_group():
+    b = chain_bundle()
+    jb = _jb()
+    _assert_group_idx_is_element_pair(jb, b)
+    # every element is a payment reaching the seed via (payment, order, order) -> one shared slot
+    pay_slot = slot_relations(b)[1][(b.node_type_id["payment"], b.fk_role_id["order"])]
+    assert bool((jb.set_group_idx[jb.elem_mask] == pay_slot).all())
+
+
+def test_set_group_idx_dualfk_two_groups():
+    b = synthetic_bundle()
+    jb = to_join_batch(make_synth_batch(), b, USER, wide_len=8, set_size=8)
+    _assert_group_idx_is_element_pair(jb, b)
+    buyer = slot_relations(b)[1][(b.node_type_id["event"], b.fk_role_id["buyer"])]
+    seller = slot_relations(b)[1][(b.node_type_id["event"], b.fk_role_id["seller"])]
+    assert buyer != seller
+    for seed in range(int(jb.num_seeds)):                   # each seed: one buyer + one seller event
+        groups = set(jb.set_group_idx[seed][jb.elem_mask[seed]].tolist())
+        assert groups == {buyer, seller}
+
+
+def test_set_group_idx_hop2_mapping():
+    b = chain_bundle()
+    jb = to_join_batch(make_hop2_batch(), b, ORDER, wide_len=16, set_size=8, hop2=True)
+    assert int((jb.elem_mask & (jb.elem_hop == 2)).sum()) > 0   # hop-2 elements are present
+    _assert_group_idx_is_element_pair(jb, b)                    # each maps to a valid slot, no KeyError
 
 
 def test_m2o_paths_self_fk_terminates():

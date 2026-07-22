@@ -4,6 +4,7 @@ encoder/pool/head end to end, and regression standardization round-trips. Guarde
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from gloss.setjoin.train import SetJoinLitModule
@@ -16,12 +17,13 @@ from .conftest import rel_f1_available
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _small_module(bundle, name_emb, entity_table, *, task_type="binary", **kw) -> SetJoinLitModule:
+def _small_module(bundle, name_emb, entity_table, *, task_type="binary", model_kw=None,
+                  **kw) -> SetJoinLitModule:
     seed_everything(0)
+    mk = dict(d_model=64, n_heads=4, n_wide_layers=1, n_set_layers=1, n_pma=2, dropout=0.0)
+    mk.update(model_kw or {})
     module = SetJoinLitModule(
-        bundle, name_emb, entity_table, task_type=task_type,
-        model_kwargs=dict(d_model=64, n_heads=4, n_wide_layers=1, n_set_layers=1, n_pma=2,
-                          dropout=0.0),
+        bundle, name_emb, entity_table, task_type=task_type, model_kwargs=mk,
         lr=5e-3, wide_len=64, set_size=32, **kw,
     )
     return module.to(_DEVICE)
@@ -49,6 +51,41 @@ def test_overfits_single_batch():
 
     assert final < 0.5 * init, f"loss did not drop enough: init={init:.4f} final={final:.4f}"
     assert final < 0.3, f"did not overfit single batch: final={final:.4f}"
+
+
+@rel_f1_available
+@pytest.mark.parametrize("readout_kw", [
+    dict(readout="measure"),
+    dict(readout="slot", slot_mode="hard"),
+    dict(readout="slot", slot_mode="soft"),
+    dict(readout="slot", slot_mode="iterative"),
+], ids=["measure", "slot-hard", "slot-soft", "slot-iterative"])
+def test_readout_arms_overfit_single_batch(readout_kw):
+    """End-to-end proof the measure pool reaches the head: each GROUP-BY arm learns a single batch
+    (a count-blind no-op — the H2 failure mode — would stall near the initial loss)."""
+    bundle, task, jb = sample_join_batch(batch_size=16)
+    jb = jb.to(_DEVICE)
+    module = _small_module(bundle, name_table(), task.entity_table, model_kw=readout_kw)
+    opt = torch.optim.AdamW(module.parameters(), lr=5e-3, weight_decay=0.0)
+    with torch.no_grad():
+        init = masked_bce(module(jb), jb.target, jb.has_target).item()
+    final = init
+    for _ in range(250):
+        opt.zero_grad()
+        loss = masked_bce(module(jb), jb.target, jb.has_target)
+        loss.backward()
+        opt.step()
+        final = loss.item()
+    assert final < 0.6 * init and final < 0.45, f"{readout_kw}: init={init:.4f} final={final:.4f}"
+
+
+@rel_f1_available
+def test_to_device_carries_set_group_idx():
+    """JoinBatch.to() must move AND pass the new field (a forgotten arg TypeErrors on every device move)."""
+    bundle, task, jb = sample_join_batch(batch_size=8)
+    jb2 = jb.to(_DEVICE)
+    assert jb2.set_group_idx.shape == jb.set_group_idx.shape
+    assert str(jb2.set_group_idx.device).split(":")[0] == _DEVICE
 
 
 @rel_f1_available

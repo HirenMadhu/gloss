@@ -33,6 +33,33 @@ def fk_relations(bundle: GraphBundle) -> list[RelKey]:
     return rels
 
 
+def slot_relations(bundle: GraphBundle) -> tuple[list[tuple[int, int]], dict[tuple[int, int], int], int]:
+    """The GROUP-BY slot table for the slot-attention readout: one slot per distinct FK relation.
+
+    Returns ``(slot_meta, lookup, K)`` where ``K = len(fk_relations(bundle))``, ``slot_meta[g] =
+    (node_type_id[child], fk_role_id[fk_col])`` is slot ``g``'s ``(table, fk_role)`` identity (the same
+    pair every union-set element carries as ``(elem_table_idxs, elem_rel_idxs)``), and ``lookup`` is the
+    inverse map. The slot must be keyed by the **pair** — ``fk_role_id`` is keyed by canonical column and
+    collides across tables (``results.driverId`` / ``qualifying.driverId`` share a role id), so the pair,
+    not the bare role, is the unambiguous slot key. Every element (hop-1 and hop-2) reaches the seed via
+    a relation in ``fk_relations``, so its pair is always in ``lookup``; unused relations are harmless
+    empty (true-zero) slots. Computed once and cached on the bundle."""
+    cached = getattr(bundle, "_setjoin_slot_relations", None)
+    if cached is not None:
+        return cached
+    rels = fk_relations(bundle)
+    slot_meta = [(bundle.node_type_id[child], bundle.fk_role_id[col]) for (child, col, _parent) in rels]
+    lookup = {key: g for g, key in enumerate(slot_meta)}
+    K = len(slot_meta)
+    assert len(lookup) == K, f"slot key collision: {K} relations but {len(lookup)} distinct (table, role) pairs"
+    out = (slot_meta, lookup, K)
+    try:
+        bundle._setjoin_slot_relations = out  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return out
+
+
 def parent_rels(bundle: GraphBundle, nt: str) -> list[RelKey]:
     """The many-to-one relations OUT of ``nt`` (``nt`` holds the FK) — safe to flatten (≤1 row each)."""
     return [r for r in fk_relations(bundle) if r[0] == nt]
