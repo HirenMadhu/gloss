@@ -18,8 +18,9 @@ from ..eval.metrics import binary_metrics, regression_metrics
 from ..train.datamodule import MoREDataModule
 from ..train.finetune import _BestValState, target_stats, task_kind
 from ..train.losses import task_loss
-from .collate import to_join_batch
+from .collate import to_join_batch, to_row_set_batch
 from .model import SetJoin
+from .row_model import RowModel
 from .paths import setjoin_neighbors
 
 
@@ -41,6 +42,9 @@ class SetJoinLitModule(pl.LightningModule):
         lambda_ortho: float = 0.5,
         fanout2: int = 0,
         per_relation_cap: int | None = None,
+        model: str = "setjoin",
+        m_rows: int = 128,
+        cells_per_row: int = 48,
     ):
         super().__init__()
         self.bundle = bundle
@@ -55,9 +59,13 @@ class SetJoinLitModule(pl.LightningModule):
         self.lambda_ortho = lambda_ortho
         self.fanout2 = fanout2
         self.per_relation_cap = per_relation_cap
+        self.model_arm = model
+        self.m_rows = m_rows
+        self.cells_per_row = cells_per_row
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
-        self.model = SetJoin(bundle, name_emb, entity_table, **mk)
+        cls = RowModel if model == "rowmodel" else SetJoin
+        self.model = cls(bundle, name_emb, entity_table, **mk)
         self._val: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def forward(self, jb):
@@ -65,6 +73,10 @@ class SetJoinLitModule(pl.LightningModule):
         return logits.squeeze(-1)            # [B] raw output (logit for binary, std-space for regression)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int = 0):
+        if self.model_arm == "rowmodel":
+            rb = to_row_set_batch(batch, self.bundle, self.entity_table,
+                                  m_rows=self.m_rows, cells_per_row=self.cells_per_row)
+            return rb.to(device)
         jb = to_join_batch(batch, self.bundle, self.entity_table,
                            wide_len=self.wide_len, set_size=self.set_size,
                            hop2=self.fanout2 > 0, per_relation_cap=self.per_relation_cap)
@@ -81,7 +93,7 @@ class SetJoinLitModule(pl.LightningModule):
         loss = task_loss(logits.squeeze(-1), y, jb.has_target, self.task_type) \
             + self.lambda_ortho * aux                       # router orthogonality (0 on the dense arm)
         self.log("train/loss", loss, prog_bar=True, batch_size=int(jb.num_seeds))
-        readout = getattr(self.model.set_enc, "readout", None)      # SlotReadout (None on the pma arm)
+        readout = getattr(getattr(self.model, "set_enc", None), "readout", None)  # SlotReadout (None otherwise)
         if readout is not None:                                     # gamma / assign-entropy / utilization
             for k, v in getattr(readout, "last_diag", {}).items():
                 self.log(f"train/readout/{k}", float(v), batch_size=int(jb.num_seeds))
@@ -144,8 +156,16 @@ def train_prebuilt_setjoin(
     limit_val_batches: float | int | None = None,
     early_stop: bool = True,
     patience: int = 3,
+    model: str = "setjoin",
+    m_rows: int = 128,
+    cells_per_row: int = 48,
 ):
-    """Train one SetJoin run on a PREBUILT bundle + name table (mirror of finetune.train_prebuilt)."""
+    """Train one SetJoin/RowModel run on a PREBUILT bundle + name table (mirror of finetune.train_prebuilt).
+
+    ``model="rowmodel"`` builds the unified :class:`RowModel` (collate ``to_row_set_batch``) and trains
+    under bf16 AMP; the standing config leans on the RowModel's opt-in cell-layer gradient checkpointing
+    (set ``checkpoint_cells=True`` in ``model_kwargs``) to hold ``batch_size`` on the heavy cell grid.
+    """
     from ..utils.seeding import seed_everything
 
     seed_everything(seed)
@@ -156,7 +176,7 @@ def train_prebuilt_setjoin(
         task_type=kind, target_mean=mean, target_std=std,
         model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay,
         wide_len=wide_len, set_size=set_size, lambda_ortho=lambda_ortho, fanout2=fanout2,
-        per_relation_cap=per_relation_cap,
+        per_relation_cap=per_relation_cap, model=model, m_rows=m_rows, cells_per_row=cells_per_row,
     )
     dm = MoREDataModule(bundle, task,
                         num_neighbors=setjoin_neighbors(bundle, fanout, fanout2=fanout2),
@@ -169,6 +189,7 @@ def train_prebuilt_setjoin(
                                                     strict=False))
     trainer = pl.Trainer(
         max_epochs=max_epochs, accelerator=accelerator, devices=1,
+        precision=("bf16-mixed" if model == "rowmodel" else "32-true"),
         logger=logger, enable_checkpointing=False, enable_model_summary=False,
         enable_progress_bar=False, log_every_n_steps=20, callbacks=callbacks,
         num_sanity_val_steps=0,

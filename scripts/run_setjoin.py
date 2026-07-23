@@ -68,6 +68,24 @@ def main() -> int:
     ap.add_argument("--n-pma", type=int, default=4)
     ap.add_argument("--wide-len", type=int, default=128)
     ap.add_argument("--set-size", type=int, default=128)
+    # ---- unified RowModel (--model rowmodel): one hierarchical encoder over a set of wide rows ----
+    ap.add_argument("--model", default="setjoin", choices=["setjoin", "rowmodel"],
+                    help="setjoin = two-stream (wide + set); rowmodel = unified hierarchy over wide rows")
+    ap.add_argument("--m-rows", type=int, default=128, help="rowmodel: wide rows per seed (cap)")
+    ap.add_argument("--cells-per-row", type=int, default=48, help="rowmodel: cells per wide row (cap)")
+    ap.add_argument("--n-cell-layers", type=int, default=2, help="rowmodel: cell-encoder MoE layers")
+    ap.add_argument("--n-row-layers", type=int, default=2, help="rowmodel: row-encoder MoE layers")
+    ap.add_argument("--row-aggregate", default="mean", choices=["mean", "slot"],
+                    help="rowmodel: rows->prediction pool (mean default; slot = count-aware measure pool)")
+    ap.add_argument("--use-counts", action="store_true",
+                    help="rowmodel: concat w_cnt(log1p(child_counts)) at the head (count-matched ablation)")
+    ap.add_argument("--agg-slots", type=int, default=4, help="rowmodel: slot-aggregate query count")
+    ap.add_argument("--cell-slots", default="8,2",
+                    help="rowmodel: cell->row cascade widths (C->k1->k2->1), comma-separated")
+    ap.add_argument("--row-pool", default="slot", choices=["slot", "gated"],
+                    help="rowmodel: cell->row pool (slot = cascade measure pool; gated = the RowPool control)")
+    ap.add_argument("--checkpoint-cells", action="store_true",
+                    help="rowmodel: gradient-checkpoint the cell MoE layers (memory; SLURM path)")
     ap.add_argument("--fanout", type=int, default=64, help="children sampled per o2m relation at hop 1")
     ap.add_argument("--fanout2", type=int, default=0,
                     help="hop-2 o2m fanout (0 = off; >0 adds grandchild/sibling/co-child elements)")
@@ -114,11 +132,30 @@ def _readout_kwargs(args) -> dict:
                 readout_channels=tuple(c for c in args.readout_channels.split(",") if c))
 
 
+def _cell_slots(spec: str) -> tuple[int, ...]:
+    return tuple(int(w) for w in spec.split(",") if w.strip())
+
+
+def _model_kwargs(args) -> dict:
+    """The constructor kwargs for the chosen model (SetJoin vs RowModel have disjoint knobs)."""
+    if args.model == "rowmodel":
+        return dict(d_model=args.d_model, n_cell_layers=args.n_cell_layers,
+                    n_row_layers=args.n_row_layers, n_heads=args.n_heads, route_on=args.route_on,
+                    num_experts=args.num_experts, k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
+                    use_shared=args.use_shared, aggregate=args.row_aggregate, use_counts=args.use_counts,
+                    agg_slots=args.agg_slots, row_pool=args.row_pool,
+                    cell_slots=_cell_slots(args.cell_slots), checkpoint_cells=args.checkpoint_cells)
+    return dict(d_model=args.d_model, n_heads=args.n_heads, n_wide_layers=args.n_wide_layers,
+                n_set_layers=args.n_set_layers, n_pma=args.n_pma, route_on=args.route_on,
+                num_experts=args.num_experts, k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
+                n_axial_layers=args.n_axial_layers, use_shared=args.use_shared, **_readout_kwargs(args))
+
+
 def _dry_run(args) -> int:
     from relbench.tasks import get_task
 
     from gloss.data.graph import make_loader
-    from gloss.setjoin.collate import to_join_batch
+    from gloss.setjoin.collate import to_join_batch, to_row_set_batch
     from gloss.setjoin.paths import setjoin_neighbors
 
     log.info(f"building {args.dataset} graph ...")
@@ -134,14 +171,23 @@ def _dry_run(args) -> int:
         loader = make_loader(bundle, task, "train", num_neighbors=[args.fanout, 8],
                              batch_size=8, shuffle=False)
         raw = next(iter(loader))
-    jb = to_join_batch(raw, bundle, task.entity_table, wide_len=args.wide_len,
-                       set_size=args.set_size, hop2=args.fanout2 > 0,
-                       per_relation_cap=args.per_relation_cap)
-    print(jb.pretty_shapes())
 
-    st = jb.seed_time.unsqueeze(1)
-    leaks = int(((jb.wide_row_time > st) & jb.wide_is_timed & ~jb.wide_is_pad).sum()) + \
-        int(((jb.elem_row_time > st) & jb.elem_is_timed & jb.elem_mask).sum())
+    if args.model == "rowmodel":
+        rb = to_row_set_batch(raw, bundle, task.entity_table, m_rows=args.m_rows,
+                              cells_per_row=args.cells_per_row)
+        print(rb.pretty_shapes())
+        leaks = int(((rb.cell_row_time > rb.seed_time[:, None, None]) & rb.cell_is_timed
+                     & rb.cell_mask).sum())
+        batch = rb
+    else:
+        jb = to_join_batch(raw, bundle, task.entity_table, wide_len=args.wide_len,
+                           set_size=args.set_size, hop2=args.fanout2 > 0,
+                           per_relation_cap=args.per_relation_cap)
+        print(jb.pretty_shapes())
+        st = jb.seed_time.unsqueeze(1)
+        leaks = int(((jb.wide_row_time > st) & jb.wide_is_timed & ~jb.wide_is_pad).sum()) + \
+            int(((jb.elem_row_time > st) & jb.elem_is_timed & jb.elem_mask).sum())
+        batch = jb
     print(f"leakage check (row_time > seed_time): {leaks}")
 
     if args.collate_only:
@@ -149,18 +195,20 @@ def _dry_run(args) -> int:
 
     import torch
 
-    from gloss.setjoin.model import SetJoin
     from gloss.train.finetune import name_embeddings
 
     name_emb = name_embeddings(bundle, args.dataset, encoder=args.encoder, d_text=64)
-    model = SetJoin(bundle, name_emb, task.entity_table, d_model=args.d_model, n_heads=args.n_heads,
-                    n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers, n_pma=args.n_pma,
-                    route_on=args.route_on, num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                    d_ff=args.d_ff, n_axial_layers=args.n_axial_layers, use_shared=args.use_shared,
-                    **_readout_kwargs(args))
+    if args.model == "rowmodel":
+        from gloss.setjoin.row_model import RowModel
+
+        model = RowModel(bundle, name_emb, task.entity_table, **_model_kwargs(args))
+    else:
+        from gloss.setjoin.model import SetJoin
+
+        model = SetJoin(bundle, name_emb, task.entity_table, **_model_kwargs(args))
     n_params = sum(p.numel() for p in model.parameters())
     with torch.no_grad():
-        logits, aux = model(jb)
+        logits, aux = model(batch)
     print(f"forward OK: logits {tuple(logits.shape)}  finite={bool(torch.isfinite(logits).all())}  "
           f"aux={float(aux):.4f}  params={n_params/1e6:.2f}M")
     assert n_params < 30e6, "param budget exceeded"
@@ -178,19 +226,14 @@ def _train(args) -> int:
     d_text = 2560 if args.encoder != "hash" else 64
     name_emb = name_embeddings(bundle, args.dataset, encoder=args.encoder, d_text=d_text)
     module, metrics = train_prebuilt_setjoin(
-        bundle, task, name_emb,
-        model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
-                          n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
-                          n_pma=args.n_pma, route_on=args.route_on, num_experts=args.num_experts,
-                          k=args.k, d_sig=args.d_sig, d_ff=args.d_ff,
-                          n_axial_layers=args.n_axial_layers, use_shared=args.use_shared,
-                          **_readout_kwargs(args)),
+        bundle, task, name_emb, model_kwargs=_model_kwargs(args),
         fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
         wide_len=args.wide_len, set_size=args.set_size,
         lambda_ortho=args.lambda_ortho,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         max_epochs=args.epochs, seed=args.seed, num_workers=args.num_workers,
         limit_train_batches=args.limit_train_batches, limit_val_batches=args.limit_val_batches,
+        model=args.model, m_rows=args.m_rows, cells_per_row=args.cells_per_row,
     )
     print("[setjoin] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if "val" in k))
     if args.test:
@@ -214,12 +257,7 @@ def _gate(args) -> int:
     if args.index is not None:
         runner.run_config(
             args.index, seeds=args.seeds, encoder=args.encoder,
-            model_kwargs=dict(d_model=args.d_model, n_heads=args.n_heads,
-                              n_wide_layers=args.n_wide_layers, n_set_layers=args.n_set_layers,
-                              n_pma=args.n_pma, route_on=args.route_on,
-                              num_experts=args.num_experts, k=args.k, d_sig=args.d_sig,
-                              d_ff=args.d_ff, n_axial_layers=args.n_axial_layers,
-                              use_shared=args.use_shared, **_readout_kwargs(args)),
+            model_kwargs=_model_kwargs(args),
             fanout=args.fanout, fanout2=args.fanout2, per_relation_cap=args.per_relation_cap,
             wide_len=args.wide_len,
             set_size=args.set_size, lambda_ortho=args.lambda_ortho,
@@ -227,6 +265,7 @@ def _gate(args) -> int:
             max_epochs=args.epochs, num_workers=args.num_workers,
             limit_train_batches=args.limit_train_batches, limit_val_batches=args.limit_val_batches,
             out_dir=out_dir, test=True,
+            model=args.model, m_rows=args.m_rows, cells_per_row=args.cells_per_row,
         )
         return 0
     from gloss.eval.ablation import format_table, load_records
@@ -234,12 +273,9 @@ def _gate(args) -> int:
     records = load_records(out_dir)
     if args.aggregate:
         print(format_table(records, split="test",
-                           baseline=runner.variant_of(dict(route_on=args.route_on,
-                                                           use_shared=args.use_shared,
-                                                           readout=args.readout,
-                                                           slot_mode=args.slot_mode),
-                                                      fanout2=args.fanout2,
-                                                      per_relation_cap=args.per_relation_cap)))
+                           baseline=runner.variant_of(_model_kwargs(args), fanout2=args.fanout2,
+                                                      per_relation_cap=args.per_relation_cap,
+                                                      model=args.model)))
         return 0
     if args.compare:
         print(runner.compare_table(records))

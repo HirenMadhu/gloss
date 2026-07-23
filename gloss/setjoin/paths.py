@@ -13,6 +13,8 @@ children arrive via ``rev_*``), which is `collate.to_join_batch`'s job.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ..data.graph import GraphBundle, canonical_relation, is_forward_relation
 
 # A schema relation key: (child_type, canonical fk column, parent_type).
@@ -105,6 +107,54 @@ def m2o_paths(bundle: GraphBundle, entity_table: str, depth: int = 2) -> list[tu
 def path_target_type(entity_table: str, path: tuple[RelKey, ...]) -> str:
     """The table a wide-row path lands on (used to tag missing-parent marker slots)."""
     return path[-1][2] if path else entity_table
+
+
+@dataclass
+class RowPaths:
+    """The GLOBAL path-id namespace for the unified :class:`~gloss.setjoin.collate.RowSetBatch` grid.
+
+    Every cell in the ``[B, M_rows, C]`` grid is tagged with one id in ``[0, n_row_paths)`` so the
+    router / ``path_emb`` can tell the seed's own row from a parent from the child's own row. Three
+    disjoint id blocks (total by construction — no schema-level seed exclusion, unlike a naive
+    'non-seed parent relations' subset which drops the *second* FK-to-entity of a dual-FK child such
+    as rel-event ``user_friends.friend``):
+
+    * **block A** — ``m2o`` (``m2o_paths(entity_table, depth)``): ids ``0..len(m2o)-1``. Row 0 AND the
+      seed-closure cells spliced into every child row carry these, so "the seed's amount" has the same
+      id everywhere. Id = the path's index in ``m2o`` (matching the wide-row convention).
+    * **block B** — ``self_id`` (``= len(m2o)``): a child row's own anchor cells.
+    * **block C** — ``parent_lookup``: one id per ``(child_type, fk_col, parent_type)`` in
+      ``parent_rels`` of EVERY direct child type, INCLUDING relations whose ``parent_type ==
+      entity_table``. The seed is dropped at RUNTIME by global n_id, never here.
+    """
+
+    m2o: list[tuple[RelKey, ...]]
+    self_id: int
+    parent_lookup: dict[RelKey, int]
+    n_row_paths: int
+
+
+def row_paths(bundle: GraphBundle, entity_table: str, depth: int = 2) -> RowPaths:
+    """Build (and cache) the global :class:`RowPaths` id table for ``entity_table``."""
+    cache = getattr(bundle, "_setjoin_row_paths", None)
+    if cache is None:
+        cache = {}
+        try:
+            bundle._setjoin_row_paths = cache  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    key = (entity_table, depth)
+    if key in cache:
+        return cache[key]
+    m2o = m2o_paths(bundle, entity_table, depth=depth)
+    self_id = len(m2o)
+    child_types = sorted({r[0] for r in child_rels(bundle, entity_table)})
+    prks = sorted({pr for ct in child_types for pr in parent_rels(bundle, ct)})
+    parent_lookup = {rk: self_id + 1 + i for i, rk in enumerate(prks)}
+    out = RowPaths(m2o=m2o, self_id=self_id, parent_lookup=parent_lookup,
+                   n_row_paths=self_id + 1 + len(prks))
+    cache[key] = out
+    return out
 
 
 def setjoin_neighbors(bundle: GraphBundle, fanout: int = 64, depth: int = 2,

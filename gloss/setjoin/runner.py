@@ -40,16 +40,33 @@ def attach_nmae(rec: dict, train_std: float) -> dict:
 
 
 def variant_of(model_kwargs: dict | None, *, fanout2: int = 0,
-               per_relation_cap: int | None = None) -> str:
-    """Arm label: ``setjoin`` for the dense arm (back-compat with the v1/v2 records), else
-    ``setjoin-<route_on>`` (e.g. ``setjoin-signature`` — the MoE method), with a ``-shared``
-    suffix for the always-on shared expert (the S addition), a readout suffix (``-measure`` or
-    ``-slot<mode>``; ``pma`` = current PMA adds none, so old records keep their label), ``-hop2``
-    for the hop-2 union arm, and ``-cap<N>`` for the per-relation recency cap. The readout suffix is
-    load-bearing: gate records are named ``{index}_{variant}.json`` and skipped-if-present, so two
-    readout arms sharing a label would collide and the second would silently reuse the first's record."""
+               per_relation_cap: int | None = None, model: str = "setjoin") -> str:
+    """Arm label. For the two-stream **SetJoin**: ``setjoin`` (dense, back-compat) else
+    ``setjoin-<route_on>`` with ``-shared`` / readout (``-measure`` / ``-slot<mode>``) / ``-hop2`` /
+    ``-cap<N>`` suffixes. For the unified **RowModel**: ``rowmodel-<route_on>`` with suffixes for the
+    NON-default arms — ``-agg<slot>`` (aggregate≠mean), ``-counts`` (use_counts), ``-rp<gated>``
+    (row_pool≠slot), ``-cs<k1>x<k2>`` (cell_slots≠(8,2)), ``-shared``.
+
+    The suffixes are load-bearing: gate records are named ``{index}_{variant}.json`` and skipped-if-
+    present, so two arms sharing a label would collide and the second would silently reuse the first's
+    record (corrupting an A/B). ``model="rowmodel"`` keys on ``aggregate``/``use_counts`` — NOT
+    ``readout`` — because RowModel has no ``readout`` axis, so mean/slot arms must not both read as pma."""
     mk = model_kwargs or {}
     route_on = mk.get("route_on", "signature")
+    if model == "rowmodel":
+        label = f"rowmodel-{route_on}"
+        if mk.get("aggregate", "mean") != "mean":
+            label += f"-agg{mk['aggregate']}"
+        if mk.get("use_counts"):
+            label += "-counts"
+        if mk.get("row_pool", "slot") != "slot":
+            label += f"-rp{mk['row_pool']}"
+        cs = mk.get("cell_slots")
+        if cs is not None and tuple(cs) != (8, 2):
+            label += "-cs" + "x".join(str(int(w)) for w in cs)
+        if mk.get("use_shared"):
+            label += "-shared"
+        return label
     if route_on == "dense":
         label = "setjoin"
     else:
@@ -87,6 +104,9 @@ def run_config(
     test: bool = True,
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
+    model: str = "setjoin",
+    m_rows: int = 128,
+    cells_per_row: int = 48,
 ) -> dict:
     """Train the single (dataset, task, seed) gate cell at ``index`` and persist its metrics."""
     import torch
@@ -103,7 +123,7 @@ def run_config(
         print(f"index {index} >= grid size {len(grid)}; nothing to do")
         return {}
     c = grid[index]
-    variant = variant_of(model_kwargs, fanout2=fanout2, per_relation_cap=per_relation_cap)
+    variant = variant_of(model_kwargs, fanout2=fanout2, per_relation_cap=per_relation_cap, model=model)
     out_dir = out_dir or RESULTS
     out_path = out_dir / f"{index:04d}_{variant}.json"
     if out_path.exists():                                  # idempotent resubmits (gridsearch precedent)
@@ -127,6 +147,7 @@ def run_config(
                 batch_size=bs, lr=lr, weight_decay=weight_decay, max_epochs=max_epochs,
                 seed=c["seed"], num_workers=num_workers,
                 limit_train_batches=limit_train_batches, limit_val_batches=limit_val_batches,
+                model=model, m_rows=m_rows, cells_per_row=cells_per_row,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -137,10 +158,12 @@ def run_config(
             print(f"CUDA OOM -> retry with batch_size={bs}", flush=True)
 
     mk = model_kwargs or {}
-    rec = {**c, "variant": variant, "task_type": kind, "batch_size": bs,
+    rec = {**c, "variant": variant, "task_type": kind, "batch_size": bs, "model": model,
            "fanout": fanout, "fanout2": fanout2, "per_relation_cap": per_relation_cap,
-           "wide_len": wide_len, "set_size": set_size,
+           "wide_len": wide_len, "set_size": set_size, "m_rows": m_rows, "cells_per_row": cells_per_row,
            "route_on": mk.get("route_on", "signature"),
+           "aggregate": mk.get("aggregate", "mean"), "use_counts": bool(mk.get("use_counts", False)),
+           "row_pool": mk.get("row_pool", "slot"), "cell_slots": list(mk.get("cell_slots", (8, 2))),
            "readout": mk.get("readout", "pma"), "slot_mode": mk.get("slot_mode", "hard"),
            "num_experts": mk.get("num_experts", 4),
            "n_axial_layers": mk.get("n_axial_layers", 0),

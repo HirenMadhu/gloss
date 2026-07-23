@@ -48,3 +48,18 @@ def sample_join_batch(wide_len: int = 64, set_size: int = 32, batch_size: int = 
     raw = next(iter(loader))
     jb = to_join_batch(raw, bundle, task.entity_table, wide_len=wide_len, set_size=set_size)
     return bundle, task, jb
+
+
+def sample_row_set_batch(m_rows: int = 32, cells_per_row: int = 48, batch_size: int = 8,
+                         fanout: int = 8):
+    from gloss.setjoin.collate import to_row_set_batch
+    from gloss.setjoin.paths import setjoin_neighbors
+
+    from gloss.data.graph import make_loader
+
+    bundle, task = bundle_and_task()
+    loader = make_loader(bundle, task, "train", num_neighbors=setjoin_neighbors(bundle, fanout),
+                         batch_size=batch_size, shuffle=False)
+    raw = next(iter(loader))
+    rb = to_row_set_batch(raw, bundle, task.entity_table, m_rows=m_rows, cells_per_row=cells_per_row)
+    return bundle, task, rb

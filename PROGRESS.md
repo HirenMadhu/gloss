@@ -5,6 +5,70 @@ value-free relational signature); see the 2026-06-25 entry. The earlier **DOC-RT
 documentation via FiLM) is retired to `archive/doc-rt/` but its log is kept below as history. The retired
 HALOS log is at `archive/halos/PROGRESS_halos.md`. Design: `CLAUDE.md`, `idea.md`, `implementation.md`.
 
+## Phase R (setjoin) — Unified `RowModel`: ONE hierarchy over a set of denormalized wide rows [BUILT, gate PENDING]
+
+Retires SetJoin's wide/set split for a single hierarchical encoder over a per-seed SET of "one big table"
+(OBT) wide rows — Row 0 = the seed's m2o closure; Rows 1..K = each direct child with the seed's closure
+**repeated in** — so the signature-routed `MoEFFN` is the one mechanism at two granularities (cells-within-
+a-row, rows-within-a-seed). Additive: `SetJoin`/`to_join_batch` are byte-for-byte intact; `--model
+{setjoin,rowmodel}` switches everything. Plan (approved, adversarially stress-tested — 14 findings, 2
+blockers, all folded in): `~/.claude/plans/look-at-the-unified-row-model-plan-md-gentle-codd.md`.
+
+- **R1 collate** (`gloss/setjoin/collate.py` `to_row_set_batch`/`RowSetBatch`, `paths.py` `row_paths`): the
+  `[B, M_rows, C]` cell grid; seed closure spliced (byte-identical) into every child row; the seed excluded
+  from a child's parents **at runtime by n_id** (mirror of `to_join_batch:385`) — and `row_paths` gives a
+  global path id to EVERY parent relation of every child type, so a dual-FK-to-entity child's second FK
+  (rel-event `user_friends.friend`) is kept, not dropped (stress-test **blocker 1**). Temporal-leakage,
+  marker-slot, n_id-dedup, cap invariants carried over. `tests/test_row_collate.py`.
+- **R2 model** (`gloss/setjoin/row_model.py`): `RowModel` (Steps A–F) + `RowCellSignature` (cell sig WITH
+  the path term) + `RowSignature` (row sig, no null token) + `CascadeCellPool` (a standalone measure-pool
+  reimplementation, `C→k1→k2→1`, cardinality-aware only at stage 1). Cell encoder = `_MoEStack` (dense arm
+  → `aux==0` via its TransformerEncoder branch, the stress-test fix) with a new opt-in `checkpoint` flag
+  (compaction to real rows + per-layer `torch.utils.checkpoint(use_reentrant=False)`). `tests/test_row_model.py`.
+- **R3 arms**: `aggregate ∈ {mean(default), slot}`, `--use-counts` (free count-matched ablation),
+  `--agg-slots` (decoupled from out_dim), `--cell-slots`, `--row-pool {slot,gated}`.
+- **R4 wiring**: `--model` threaded through `train.py` (bf16 AMP + opt-in cell checkpointing for rowmodel),
+  `eval.py`, `runner.py` (`variant_of` → `rowmodel-*` prefix + per-axis suffixes so mean/slot/gated arms
+  can't collide on `{index}_{variant}.json` — stress-test blocker), `run_setjoin.py`; `run_rowmodel.sh`
+  staged (h100:1, `--checkpoint-cells`, `--batch-size 64`). `tests/test_row_runner.py`.
+
+**Standing config** d256 2+2 ff1024 signature e4/k2, M_rows 128, C 48, mean aggregate, no counts (the
+count-blind default is user-chosen — an honest-negative stance; `--use-counts`/`--aggregate slot` are the
+ready disambiguating ablations, see the plan's "Documented limitation").
+
+**Verified locally:** all **190 tests green**; `--dry-run --model rowmodel` on rel-f1 → grid `B=8 M_rows=128
+C=48`, 933 real cells, **leakage 0**, params **14.86M** (<30M); bf16 + cell gradient-checkpointing at batch
+64 held on H100 with **0 OOM-retries**.
+
+### GATE RESULT (job 29008179 + count-aware arms 29008573/4; 3 seeds, TEST) — NEGATIVE, one standout
+
+Three arms at the standing backbone (harrier): `mean` (default, count-blind) → `results/rowmodel/`;
+`--use-counts` → `results/rowmodel_counts/`; `--row-aggregate slot` → `results/rowmodel_slot/`.
+
+**Beats RT on 1/9** in every arm (vs the two-stream **SetJoin's 6/9**) — collapsing the wide/set split into
+one hierarchy over denormalized rows is a **net negative**. Best arm = `--use-counts`. AUROC×100 / NMAE:
+
+| task | mean | +counts | slot | RT | MoRE |
+|---|--:|--:|--:|--:|--:|
+| user-ignore (AUROC↑) | 90.1 | 89.6 | 87.2 | 85.1 | 87.3 |  ← **best of any model in repo** (all arms > RT) |
+| driver-top3 | 77.0 | 80.2 | 76.0 | 82.7 | 90.6 |
+| driver-dnf | 67.5 | 69.8 | 66.0 | 78.7 | 82.9 |
+| user-repeat | 64.3 | 67.8 | 65.6 | 79.7 | 79.5 |
+| study-outcome | 54.9 | 56.5 | 52.8 | 68.6 | 69.4 |
+| driver-position (NMAE↓) | 0.581 | 0.526 | 0.587 | 0.477 | 0.395 |
+| study-adverse | 0.164 | 0.159 | 0.161 | 0.131 | 0.161 |
+| user-attendance | 0.545 | 0.564 | 0.581 | 0.504 | 0.399 |
+| site-success | 0.916 | 0.951 | 0.981ⁿ⁼² | 0.734 | 0.840 |
+
+**Two clean findings.** (1) **Count-blindness confirmed** — `+counts` recovers exactly the count/rate tasks
+the stress test flagged (`user-repeat +3.4, driver-top3 +3.2, driver-dnf +2.3, study-outcome +1.6` AUROC;
+`driver-position −0.055` NMAE), the free `child_counts` feature being the right fix. (2) **The slot aggregate
+is a dead end** — `slot−mean` is net-negative (loses user-ignore −2.9, study-outcome −2.1) — the row-level
+measure pool is capacity, not cardinality, on this substrate. **`user-ignore` ≈ 90 across all arms is the one
+robust win** (beats RT/GelGT/MoRE), worth a follow-up. Caveat: SetJoin's 6/9 was best-of-18-configs, RowModel
+here is 3 readout arms on one backbone. **Standing single-table method stays the two-stream SetJoin**
+(d256 2+2 ff1024 signature); the unified RowModel is retained (additive) as a documented negative.
+
 ## 2026-06-24 — Pivot HALOS → DOC-RT; P0–P4 scaffold green; headline gate launched
 
 **Pivot.** Retired the HALOS geometry stack (Gaussian-in-τ kernels, `g_θ` geometry generator, dimensionless

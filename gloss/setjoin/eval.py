@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from ..data.graph import coerce_binary_target, make_loader
-from .collate import to_join_batch
+from .collate import to_join_batch, to_row_set_batch
 from .paths import setjoin_neighbors
 
 
@@ -40,10 +40,15 @@ def predict_split(
     )
     n = len(task.get_table(split).df)
     pred = np.full(n, np.nan, dtype=np.float64)
+    row_model = getattr(module, "model_arm", "setjoin") == "rowmodel"
     for raw in loader:
-        jb = to_join_batch(raw, bundle, task.entity_table,
-                           wide_len=wide_len, set_size=set_size, hop2=fanout2 > 0,
-                           per_relation_cap=per_relation_cap).to(device)
+        if row_model:
+            jb = to_row_set_batch(raw, bundle, task.entity_table,
+                                  m_rows=module.m_rows, cells_per_row=module.cells_per_row).to(device)
+        else:
+            jb = to_join_batch(raw, bundle, task.entity_table,
+                               wide_len=wide_len, set_size=set_size, hop2=fanout2 > 0,
+                               per_relation_cap=per_relation_cap).to(device)
         out = module(jb).float().cpu()                        # [B] one prediction per seed
         if getattr(module, "task_type", "binary") == "regression":
             pred_b = out * module.target_std + module.target_mean

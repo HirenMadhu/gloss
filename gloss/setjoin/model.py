@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from ..data.graph import GraphBundle
 from ..model.column_encoder import CellEncoder
@@ -92,9 +93,10 @@ class _MoEStack(nn.Module):
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, dropout: float, *,
                  route_on: str, d_ff: int, d_route: int, num_experts: int, k: int,
-                 use_shared: bool = False):
+                 use_shared: bool = False, checkpoint: bool = False):
         super().__init__()
         self.route_on = route_on
+        self.checkpoint = bool(checkpoint)          # opt-in gradient checkpointing (RowModel cell stack)
         if route_on == "dense":
             self.layers = nn.TransformerEncoder(_encoder_layer(d_model, n_heads, dropout), n_layers,
                                                 enable_nested_tensor=False)
@@ -108,7 +110,10 @@ class _MoEStack(nn.Module):
         if self.route_on == "dense":
             return self.layers(x, src_key_padding_mask=pad)
         for lyr in self.layers:
-            x = lyr(x, z, pad)
+            if self.checkpoint and self.training and x.requires_grad:
+                x = _ckpt(lyr, x, z, pad, use_reentrant=False)   # recompute in backward (memory)
+            else:
+                x = lyr(x, z, pad)
         return x
 
     def ortho_loss(self) -> Tensor | float:

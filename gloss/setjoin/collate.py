@@ -27,7 +27,7 @@ from torch import Tensor
 
 from ..data.collate import _seed_time_per_segment, column_vocab, feature_col_names
 from ..data.graph import FK_NONE, GraphBundle, canonical_relation, is_forward_relation
-from .paths import child_rels, m2o_paths, parent_rels, path_target_type, slot_relations
+from .paths import child_rels, m2o_paths, parent_rels, path_target_type, row_paths, slot_relations
 
 PAD = -1
 
@@ -410,4 +410,345 @@ def to_join_batch(
         wide_placement=pack(wide_place), elem_rows=pack(elem_place),
         row_seg=row_seg, row_times=row_times, row_timed=row_timed,
         wide_truncated=wide_truncated, set_truncated=set_truncated,
+    )
+
+
+# ======================================================================================
+# Unified RowModel collate: one SET of denormalized wide rows per seed (see row_model.py)
+# ======================================================================================
+
+
+@dataclass
+class RowSetBatch:
+    """A per-seed SET of denormalized "one big table" (OBT) wide rows for :class:`RowModel`.
+
+    Per seed: **Row 0** = the seed's own many-to-one closure; **Rows 1..K** = each *direct* (hop-1)
+    child, each denormalized by repeating the seed + the seed's full m2o closure into the row (so a
+    child cell can attend to the seed's cells within its own row). Every cell is a token tagged by its
+    ``(column, table, join-path, recency)`` identity, so heterogeneous wide rows coexist in one grid.
+
+    The seed-closure cells occupy the SAME leading slots of every row and are byte-identical across a
+    seed's rows by construction (Row 0's cells are emitted first in each row). The seed is excluded
+    from a child's flattened parents at RUNTIME by global n_id (``disjoint=True`` samples a tree, so
+    the seed can reappear as a duplicate node copy) — never at schema enumeration, so a child's SECOND
+    FK-to-entity (e.g. rel-event ``user_friends.friend``) is kept.
+    """
+
+    num_seeds: int                 # B
+    m_rows: int                    # M_rows (fixed cap on wide rows / seed)
+    cells_per_row: int             # C (fixed cap on cells / wide row)
+    # ---- cell grid [B, M_rows, C] ----
+    cell_col_id: Tensor            # long; global (table, column) id via column_vocab (pad/marker = -1)
+    cell_table_id: Tensor          # long; node-type id (markers: the MISSING table's id; pad = -1)
+    cell_path_id: Tensor           # long; RowPaths global path id (pad = -1)
+    cell_missing: Tensor           # bool; True = absent-parent marker slot
+    cell_row_time: Tensor          # float64; 0 where untimed/pad (gate with cell_is_timed)
+    cell_is_timed: Tensor          # bool
+    cell_mask: Tensor              # bool; True = real cell (marker counts as real, not pad)
+    # ---- per wide row [B, M_rows] ----
+    row_mask: Tensor               # bool; True = real wide row (Row 0 always True)
+    row_table_id: Tensor           # long; row anchor's table (Row 0 = entity table; pad = -1)
+    row_fk_role: Tensor            # long; child->seed fk_role_id (Row 0 = FK_NONE = 0)
+    row_hop: Tensor                # long; 0 = seed's own row, 1 = direct child
+    row_row_time: Tensor           # float64; anchor node time (Row 0 = seed's own row time)
+    row_is_timed: Tensor           # bool
+    # ---- per child relation [B, R] (order = paths.child_rels; post-sampler, PRE-truncation) ----
+    child_counts: Tensor           # float32
+    # ---- per seed [B] ----
+    seed_time: Tensor              # float64
+    target: Tensor                 # float32
+    has_target: Tensor             # bool
+    input_id: Tensor               # long; split-table row index (-1 when absent, e.g. fixtures)
+    # ---- value encoding ----
+    tf_dict: dict                  # node_type -> torch_frame.TensorFrame (as sampled)
+    cell_placement: dict           # node_type -> (b, mrow, cpos, row_in_tf, col_pos) CELL scatter
+    cell_truncated: int = 0        # rows whose cells hit the C cap with cells left over
+    row_truncated: int = 0         # seeds whose row set hit the M_rows cap with children left over
+
+    def to(self, device) -> "RowSetBatch":
+        def mv(x):
+            return x.to(device) if torch.is_tensor(x) else x
+
+        return RowSetBatch(
+            num_seeds=self.num_seeds, m_rows=self.m_rows, cells_per_row=self.cells_per_row,
+            cell_col_id=mv(self.cell_col_id), cell_table_id=mv(self.cell_table_id),
+            cell_path_id=mv(self.cell_path_id), cell_missing=mv(self.cell_missing),
+            cell_row_time=mv(self.cell_row_time), cell_is_timed=mv(self.cell_is_timed),
+            cell_mask=mv(self.cell_mask),
+            row_mask=mv(self.row_mask), row_table_id=mv(self.row_table_id),
+            row_fk_role=mv(self.row_fk_role), row_hop=mv(self.row_hop),
+            row_row_time=mv(self.row_row_time), row_is_timed=mv(self.row_is_timed),
+            child_counts=mv(self.child_counts),
+            seed_time=mv(self.seed_time), target=mv(self.target), has_target=mv(self.has_target),
+            input_id=mv(self.input_id),
+            tf_dict={k: v.to(device) for k, v in self.tf_dict.items()},
+            cell_placement={k: tuple(t.to(device) for t in v) for k, v in self.cell_placement.items()},
+            cell_truncated=self.cell_truncated, row_truncated=self.row_truncated,
+        )
+
+    def pretty_shapes(self) -> str:
+        n_cells = int((self.cell_mask & ~self.cell_missing).sum())
+        n_markers = int(self.cell_missing.sum())
+        per_seed = self.row_mask.sum(dim=1)
+        lines = [
+            f"RowSetBatch: B={self.num_seeds} M_rows={self.m_rows} C={self.cells_per_row}",
+            f"  rows: total={int(per_seed.sum())}  min/seed={int(per_seed.min())}  "
+            f"max/seed={int(per_seed.max())}  truncated seeds={self.row_truncated}",
+            f"  cells: real={n_cells}  missing markers={n_markers}  "
+            f"truncated rows={self.cell_truncated}",
+            f"  child_counts {tuple(self.child_counts.shape)}  targets={int(self.has_target.sum())}",
+            f"  tf_dict types: {sorted(self.tf_dict)}  placement types: {sorted(self.cell_placement)}",
+        ]
+        return "\n".join(lines)
+
+
+def to_row_set_batch(
+    batch,
+    bundle: GraphBundle,
+    entity_table: str,
+    *,
+    m_rows: int = 128,
+    cells_per_row: int = 48,
+) -> RowSetBatch:
+    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`RowSetBatch`.
+
+    The sampler / temporal cutoff / adjacency are IDENTICAL to :func:`to_join_batch` (this duplicates
+    that setup so ``to_join_batch`` stays byte-for-byte intact). The one behavioral change is the
+    packing: instead of (one wide row) + (a pre-pooled union set), emit a SET of denormalized wide
+    rows, repeating the seed's m2o closure into every child row (the OBT denormalization).
+    """
+    vocab = column_vocab(bundle)
+    node_types = [nt for nt in bundle.node_types if nt in batch.node_types and batch[nt].num_nodes > 0]
+
+    # ---- flatten nodes across types (stable order) — duplicated from to_join_batch ----
+    type_slice: dict[str, slice] = {}
+    seg_list, rowt_list, timed_list, nid_list, intype_list, typeidx_list = [], [], [], [], [], []
+    offset = 0
+    for ti, nt in enumerate(node_types):
+        st = batch[nt]
+        n = st.num_nodes
+        type_slice[nt] = slice(offset, offset + n)
+        offset += n
+        seg_list.append(st.batch.to(torch.long))
+        if "time" in st:
+            rowt_list.append(st.time.to(torch.float64))
+            timed_list.append(torch.ones(n, dtype=torch.bool))
+        else:
+            rowt_list.append(torch.zeros(n, dtype=torch.float64))
+            timed_list.append(torch.zeros(n, dtype=torch.bool))
+        nid_list.append(st.n_id.to(torch.long) if "n_id" in st else torch.arange(n))
+        intype_list.append(torch.arange(n, dtype=torch.long))
+        typeidx_list.append(torch.full((n,), ti, dtype=torch.long))
+
+    seg = torch.cat(seg_list)
+    rowt = torch.cat(rowt_list)
+    timed = torch.cat(timed_list)
+    nid = torch.cat(nid_list)
+    intype = torch.cat(intype_list)
+    typeidx = torch.cat(typeidx_list)
+
+    B = int(seg.max().item()) + 1
+    ent = batch[entity_table]
+    seed_time = _seed_time_per_segment(ent, B)
+
+    n_seeds = ent.seed_time.numel()
+    ent_start = type_slice[entity_table].start
+    seed_flat = torch.full((B,), -1, dtype=torch.long)
+    seed_flat[ent.batch[:n_seeds].to(torch.long)] = torch.arange(n_seeds) + ent_start
+    assert int((seed_flat < 0).sum()) == 0, "could not locate a seed node for every segment"
+    seed_nid = nid[seed_flat]                                             # [B]
+
+    target = torch.zeros(B, dtype=torch.float32)
+    has_target = torch.zeros(B, dtype=torch.bool)
+    if "y" in ent:
+        y = ent.y.to(torch.float32)
+        yb = ent.batch[: y.numel()] if y.numel() != ent.batch.numel() else ent.batch
+        target[yb] = y
+        has_target[yb] = True
+    if "input_id" in ent:
+        input_id = ent.input_id.to(torch.long)[:B]
+    else:
+        input_id = torch.full((B,), -1, dtype=torch.long)
+
+    # ---- adjacency over ALL edge types (children arrive via rev_*) — duplicated ----
+    parent_of: dict[tuple, dict[int, int]] = {}
+    children_of: dict[tuple, dict[int, list[int]]] = {}
+    seen: set[tuple] = set()
+    for (src, rel, dst) in batch.edge_types:
+        ei = batch[(src, rel, dst)].edge_index
+        if ei.numel() == 0:
+            continue
+        if is_forward_relation(rel):
+            child_nt, parent_nt, c_loc, p_loc = src, dst, ei[0], ei[1]
+        else:
+            child_nt, parent_nt, c_loc, p_loc = dst, src, ei[1], ei[0]
+        if child_nt not in type_slice or parent_nt not in type_slice:
+            continue
+        rk = (child_nt, canonical_relation(rel), parent_nt)
+        gc = (c_loc.to(torch.long) + type_slice[child_nt].start).tolist()
+        gp = (p_loc.to(torch.long) + type_slice[parent_nt].start).tolist()
+        p_of = parent_of.setdefault(rk, {})
+        c_of = children_of.setdefault(rk, {})
+        for c, p in zip(gc, gp):
+            if int(seg[c]) != int(seg[p]):
+                continue
+            key = (rk, c, p)
+            if key in seen:
+                continue
+            seen.add(key)
+            p_of[c] = p
+            c_of.setdefault(p, []).append(c)
+
+    # ---- schema maps ----
+    rp = row_paths(bundle, entity_table, depth=2)
+    feat_cols = {nt: feature_col_names(batch[nt].tf) for nt in node_types}
+    crels = child_rels(bundle, entity_table)
+    R = len(crels)
+    C = cells_per_row
+
+    # A cell record: (col_id, table_id, path_id, missing, row_time, is_timed, nt|None, row_in_tf, col_pos)
+    def node_cells(node: int, path_id: int) -> list[tuple]:
+        nt = node_types[int(typeidx[node])]
+        cols = feat_cols[nt]
+        rt, tm, rit = float(rowt[node]), bool(timed[node]), int(intype[node])
+        tid = bundle.node_type_id[nt]
+        return [(vocab[(nt, cname)], tid, path_id, False, rt, tm, nt, rit, cp)
+                for cp, cname in enumerate(cols)]
+
+    def marker_cell(miss_nt: str, path_id: int) -> tuple:
+        return (PAD, bundle.node_type_id[miss_nt], path_id, True, 0.0, False, None, -1, -1)
+
+    def seed_closure(b: int) -> tuple[list[tuple], set[int]]:
+        """Row 0 = the seed's m2o closure (block-A path ids); returns (cells, emitted n_ids)."""
+        cells: list[tuple] = []
+        nids: set[int] = set()
+        for path_id, path in enumerate(rp.m2o):
+            node = int(seed_flat[b])
+            dead = False
+            for rk in path:
+                nxt = parent_of.get(rk, {}).get(node)
+                if nxt is None:
+                    dead = True
+                    break
+                node = nxt
+            if dead:
+                cells.append(marker_cell(path_target_type(entity_table, path), path_id))
+                continue
+            key = int(nid[node])
+            if key in nids:                                   # diamond/self-FK: same row via two paths
+                continue
+            nids.add(key)
+            if not feat_cols[node_types[int(typeidx[node])]]:
+                continue
+            cells.extend(node_cells(node, path_id))
+        return cells, nids
+
+    def child_cells(child: int, closure_nids: set[int], seed_nid_b: int) -> list[tuple]:
+        """A child's own anchor (SELF id) + its non-seed flattened parents (block-C ids)."""
+        cells: list[tuple] = []
+        emitted = set(closure_nids)                           # per-row dedup spans the spliced closure
+        ck = int(nid[child])
+        if ck not in emitted:
+            emitted.add(ck)
+            cells.extend(node_cells(child, rp.self_id))
+        child_nt = node_types[int(typeidx[child])]
+        for prk in parent_rels(bundle, child_nt):
+            p = parent_of.get(prk, {}).get(child)
+            if p is None:
+                continue
+            if int(nid[p]) == seed_nid_b:                     # never re-inject the seed (runtime n_id)
+                continue
+            pk = int(nid[p])
+            if pk in emitted:
+                continue
+            emitted.add(pk)
+            cells.extend(node_cells(p, rp.parent_lookup[prk]))
+        return cells
+
+    def _key(flat_idx: int):                                  # most-recent-first, untimed last, stable
+        return (0 if timed[flat_idx] else 1,
+                -float(rowt[flat_idx]) if timed[flat_idx] else 0.0, flat_idx)
+
+    # ---- allocate grid tensors ----
+    cell_col_id = torch.full((B, m_rows, C), PAD, dtype=torch.long)
+    cell_table_id = torch.full((B, m_rows, C), PAD, dtype=torch.long)
+    cell_path_id = torch.full((B, m_rows, C), PAD, dtype=torch.long)
+    cell_missing = torch.zeros(B, m_rows, C, dtype=torch.bool)
+    cell_row_time = torch.zeros(B, m_rows, C, dtype=torch.float64)
+    cell_is_timed = torch.zeros(B, m_rows, C, dtype=torch.bool)
+    cell_mask = torch.zeros(B, m_rows, C, dtype=torch.bool)
+    row_mask = torch.zeros(B, m_rows, dtype=torch.bool)
+    row_table_id = torch.full((B, m_rows), PAD, dtype=torch.long)
+    row_fk_role = torch.zeros(B, m_rows, dtype=torch.long)
+    row_hop = torch.zeros(B, m_rows, dtype=torch.long)
+    row_row_time = torch.zeros(B, m_rows, dtype=torch.float64)
+    row_is_timed = torch.zeros(B, m_rows, dtype=torch.bool)
+    child_counts = torch.zeros(B, R, dtype=torch.float32)
+    place: dict[str, list[list[int]]] = {nt: [[], [], [], [], []] for nt in node_types}
+    cell_truncated = 0
+    row_truncated = 0
+
+    def write_row(b: int, mrow: int, anchor: int, hop: int, fk_role: int, cells: list[tuple]) -> None:
+        nonlocal cell_truncated
+        row_mask[b, mrow] = True
+        row_hop[b, mrow] = hop
+        row_fk_role[b, mrow] = fk_role
+        row_table_id[b, mrow] = bundle.node_type_id[node_types[int(typeidx[anchor])]]
+        row_row_time[b, mrow] = float(rowt[anchor])
+        row_is_timed[b, mrow] = bool(timed[anchor])
+        if len(cells) > C:
+            cell_truncated += 1
+            cells = cells[:C]
+        for cpos, (col_id, tid, pid, miss, rt, tm, nt, rit, cp) in enumerate(cells):
+            cell_col_id[b, mrow, cpos] = col_id
+            cell_table_id[b, mrow, cpos] = tid
+            cell_path_id[b, mrow, cpos] = pid
+            cell_missing[b, mrow, cpos] = miss
+            cell_row_time[b, mrow, cpos] = rt
+            cell_is_timed[b, mrow, cpos] = tm
+            cell_mask[b, mrow, cpos] = True
+            if nt is not None:
+                place[nt][0].append(b)
+                place[nt][1].append(mrow)
+                place[nt][2].append(cpos)
+                place[nt][3].append(rit)
+                place[nt][4].append(cp)
+
+    for b in range(B):
+        sf = int(seed_flat[b])
+        s_cells, s_nids = seed_closure(b)
+        # Row 0 = the seed's own wide row (its m2o closure)
+        write_row(b, 0, sf, hop=0, fk_role=FK_NONE, cells=s_cells)
+        # Rows 1..K = direct children, most-recent-first, capped
+        items: list[tuple[int, int]] = []                     # (child flat idx, fk role id)
+        for r_idx, rk in enumerate(crels):
+            kids = children_of.get(rk, {}).get(sf, [])
+            child_counts[b, r_idx] = len(kids)                # PRE-truncation
+            role = bundle.fk_role_id.get(rk[1], FK_NONE)
+            items.extend((c, role) for c in kids)
+        items.sort(key=lambda it: _key(it[0]))
+        cap = m_rows - 1
+        if len(items) > cap:
+            row_truncated += 1
+            items = items[:cap]
+        for j, (child, role) in enumerate(items):
+            row = s_cells + child_cells(child, s_nids, int(seed_nid[b]))
+            write_row(b, j + 1, child, hop=1, fk_role=role, cells=row)
+
+    def pack(p: dict[str, list[list[int]]]) -> dict[str, tuple[Tensor, ...]]:
+        return {nt: tuple(torch.tensor(x, dtype=torch.long) for x in lists)
+                for nt, lists in p.items() if lists[0]}
+
+    return RowSetBatch(
+        num_seeds=B, m_rows=m_rows, cells_per_row=C,
+        cell_col_id=cell_col_id, cell_table_id=cell_table_id, cell_path_id=cell_path_id,
+        cell_missing=cell_missing, cell_row_time=cell_row_time, cell_is_timed=cell_is_timed,
+        cell_mask=cell_mask,
+        row_mask=row_mask, row_table_id=row_table_id, row_fk_role=row_fk_role, row_hop=row_hop,
+        row_row_time=row_row_time, row_is_timed=row_is_timed,
+        child_counts=child_counts,
+        seed_time=seed_time, target=target, has_target=has_target, input_id=input_id,
+        tf_dict={nt: batch[nt].tf for nt in node_types},
+        cell_placement=pack(place),
+        cell_truncated=cell_truncated, row_truncated=row_truncated,
     )
