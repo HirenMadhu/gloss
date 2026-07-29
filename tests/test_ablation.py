@@ -66,3 +66,69 @@ def test_format_table_regression_lift_is_lower_is_better():
     out = format_table(records, split="test")
     assert "regression" in out
     assert "Δvs dense=+1.0000" in out          # dense MAE 5.0 - signature 4.0 (lower MAE is better)
+
+
+# ---- arch must never merge with rt in the variant / grouping key ----
+
+
+def test_two_level_and_rt_do_not_share_a_variant_or_filename():
+    """`variant` is BOTH the output filename key and the aggregate grouping key.
+
+    If `arch` did not enter it, a `two_level` run and an `rt` run at the same (index, router) would
+    collide on disk and — worse — be averaged into one mean by `aggregate`. Two architectures
+    silently merging produces a confident wrong table, so this is a correctness guard, not cosmetics.
+    """
+    from gloss.eval.ablation import variant_label
+
+    rt = variant_label("signature")
+    two = f"{variant_label('signature')}@two_level"
+    assert rt != two
+    assert f"{0:04d}_{rt}.json" != f"{0:04d}_{two}.json"
+
+
+def test_aggregate_keeps_architectures_separate():
+    """Same dataset/task/router, different arch -> two distinct rows, not one blended mean."""
+    records = [
+        _rec("rel-f1", "driver-dnf", "signature", 0, test_roc_auc=0.70, variant="signature"),
+        _rec("rel-f1", "driver-dnf", "signature", 1, test_roc_auc=0.72, variant="signature"),
+        _rec("rel-f1", "driver-dnf", "signature", 0, test_roc_auc=0.90,
+             variant="signature@two_level"),
+        _rec("rel-f1", "driver-dnf", "signature", 1, test_roc_auc=0.92,
+             variant="signature@two_level"),
+    ]
+    agg = aggregate(records, ("test_roc_auc",))
+    keys = {k[-1] for k in agg}
+    assert keys == {"signature", "signature@two_level"}, f"architectures merged: {keys}"
+
+    rt_mean = agg[("rel-f1", "driver-dnf", "signature")]["test_roc_auc"][0]
+    tl_mean = agg[("rel-f1", "driver-dnf", "signature@two_level")]["test_roc_auc"][0]
+    assert math.isclose(rt_mean, 0.71, abs_tol=1e-9)
+    assert math.isclose(tl_mean, 0.91, abs_tol=1e-9)
+    # the blended mean (0.81) must appear NOWHERE — that is the failure this guards
+    assert not math.isclose(rt_mean, 0.81, abs_tol=1e-9)
+    assert not math.isclose(tl_mean, 0.81, abs_tol=1e-9)
+
+
+def test_phase_presets_differ_and_cover_the_gate():
+    """changes.md §5: phase0a must keep the CELL level RT-like; full must turn the design on."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "_ra", Path(__file__).resolve().parents[1] / "scripts" / "run_ablation.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    P = mod.TWO_LEVEL_PHASES
+
+    assert set(P) == {"phase0a", "phase0b", "full"}
+    # phase0a isolates the row-token addition: cell level behaves exactly like RT
+    assert P["phase0a"]["cell_attention"] == "four_mask"
+    assert P["phase0a"]["cell_rope_time"] is False
+    assert P["phase0a"]["time_mode"] == "buckets"      # Phase 0a REQUIRES buckets
+    assert P["phase0a"]["row_ffn"] == "dense"
+    # phase0b changes exactly ONE thing vs phase0a — the cell attention collapse
+    diff = {k for k in P["phase0a"] if P["phase0a"][k] != P["phase0b"][k]}
+    assert diff == {"cell_attention"}, f"phase0b should differ in one switch, differs in {diff}"
+    # full is the proposed design, MoE at BOTH levels with the row experts shared+routed
+    assert P["full"]["row_ffn"] == "moe" and P["full"]["row_use_shared"] is True
+    assert P["full"]["role_bias"] == "name_derived" and P["full"]["time_bias"] == "rope"
