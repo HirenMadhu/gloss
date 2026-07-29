@@ -15,27 +15,30 @@ Scripts that produce these numbers:
 
 ## 0. Status at a glance
 
-**Built:** the P0 prerequisites layer (minus P0.4/P0.5), a standalone time-encoding module, a
-bit-for-bit parity guard, and leaderboard comparison against RT + GelGT. **124 tests green.**
+**Built:** all of `changes.md` §1–§4 — the P0 prerequisites, the time ladder, the row level, the
+two-level substrate, the row-token head, the config, and the `MoRE(arch=two_level)` wiring, with a
+bit-for-bit parity guard and leaderboard comparison against RT + GelGT. **208 tests green**, and the
+two-level forward passes on real rel-f1 data.
 
-**Not built:** the two-level architecture itself. No phase has run. No model consumes any of the
-new row-level fields, and `TimeLadder` is imported nowhere.
+**Not built:** no phase has been *run*. The 27-run qwen baseline that Phase 0a's gate compares
+against is in flight.
 
 | item | state |
 |---|---|
 | P0.1 role vocabulary (triple-keyed) | ✅ done, tested |
 | P0.2 `adj_role` row adjacency | ✅ done, tested |
 | P0.3 hop (BFS) | ✅ done, tested |
-| P0.4 table/role name embeddings | ❌ **not started** |
-| P0.5 pinned stype enum | ❌ **not started** (unblocked now — see §7) |
-| `gloss/model/time_encoding.py` | ✅ exists, 21 tests — **wired into nothing** |
-| `gloss/model/row_level.py` | ❌ missing |
-| `gloss/model/two_level.py` | ❌ missing |
-| §3.2–3.9 (cell RoPE, single attention, RowPool, RowAttention, Broadcast, row MoE, row-token head) | ❌ missing |
-| §9.7 parity baseline | ✅ done, guard proven to fail on init-order change |
+| P0.4 table/role name embeddings | ✅ done, qwen-cached for all 3 DBs |
+| P0.5 pinned stype enum | ✅ done (`N_STYPES = 10`, bundle-independent) |
+| `gloss/model/time_encoding.py` | ✅ wired into both levels |
+| `gloss/model/row_level.py` | ✅ done, 32 tests |
+| `gloss/model/two_level.py` | ✅ done, 35 tests |
+| §3.2–3.9 (cell RoPE, single attention, RowPool, RowAttention, Broadcast, row MoE, row-token head) | ✅ done |
+| §4 config, `MoRE(arch=two_level)`, `run_train --arch` | ✅ done, real-data dry run passes |
+| §9.7 parity baseline | ✅ done, fired on P0.5 and re-captured deliberately |
 | Leaderboard comparison (RT + GelGT) | ✅ done |
 | Phases 0a–5 | ❌ none run |
-| 27-run qwen baseline | ❌ not launched (qwen caches now built) |
+| 27-run qwen baseline | 🟡 **RUNNING** — array `29029474`, 27 tasks, %8, h100 |
 
 ---
 
@@ -355,3 +358,81 @@ frozen name tables, both recomputable on an unseen schema.
 - **P0.4 is the next real blocker for the foundation-model claim.** Without `table_name_emb` /
   `role_name_emb` there is no way to represent an unseen table or role at all. The NaT fix (2.1)
   removes a silent-failure hazard on new schemas but is **not** a generalisation mechanism.
+
+
+---
+
+## 8. Later corrections (after the first pass)
+
+### 8.1 The clamped-Δ flag — promoted from nicety to correctness
+
+§4.1 recorded seed-row clamping as an open design question. Measuring the re-derived ladder band
+promoted it: the τ = 0 mass created by `Δ = max(0, t* − t_r)` is the **sole cause** of the wraparound
+check firing. rel-f1's τ *bulk* spans 11.4 → 19.66 (8.2, `ω·span = 2.47 rad < π`, clean), but its
+observed *range* is 0 → 19.66 (19.7, `5.90 rad`, wraps). So the lowest channel aliased **τ ≈ 0 against
+τ ≈ 21** — the query row against an ancient row.
+
+Fixed on both paths, because neither alone is sufficient:
+
+- **`b_clamped`**, a learned scalar on the attention logit. The rotation *structurally cannot* express
+  it: a clamped row has `θ = 0` exactly like a genuine `Δ = 0`, so its relative angle to every other
+  row is identical in both cases. Same argument §3.1 makes for `b_untimed`.
+- **An indicator channel** in `feats()` (width → `feat_dim = 2·n_freq + 1`), because `b_clamped` is an
+  attention-logit term that never reaches the §3.3 row signature.
+
+`was_clamped()` reads the **raw** times; after the clamp the information is gone. Three states must now
+stay mutually distinct — timed/`Δ>0`, untimed (all-zero), clamped (sinusoids identical to `Δ=0`, flag
+set) — and a test asserts all three pairwise differ, since the natural implementation collapses two.
+
+### 8.2 Row experts are shared + routed; the two levels deliberately differ
+
+User decision. The row MoE gains an always-on **ungated** SwiGLU, on by default, so the routed experts
+only model what is *specific* to a row's signature. The **cell** MoE keeps `use_shared=False` — its
+`+S` arm measured as only mildly positive, on regression alone (`recap.md`). That asymmetry is
+intentional; do not "harmonise" it. `use_shared=False` stays available at the row level as a Phase 4
+arm.
+
+Consequence for Phase 4: `r1` now differs from `r0` in **two** ways — the row level exists *and* it is
+shared+routed. Isolating the shared expert needs its own arm.
+
+### 8.3 The §6 artifact guard got teeth
+
+The `state_dict` check now also asserts both time flags are **scalars** (`ndim == 0`). That catches
+someone later "improving" `b_clamped` into a per-table or per-role vector — a dataset-shaped parameter
+that would silently break cross-schema loading, exactly what §0 exists to prevent.
+
+### 8.4 Parity scoping, verified rather than assumed
+
+I predicted the guard would fire on `b_clamped` and it did **not**. Correct: the fingerprinted model is
+`arch='rt'` with `time_mode='buckets'`, so it never constructs a `TimeLadder` and `b_clamped` does not
+exist there. The guard fires on changes to the **rt baseline** (P0.5 resizing `stype_emb`) and stays
+quiet on changes confined to the two-level path. Both behaviours are right.
+
+### 8.5 `run_ablation.sh` and `prep.sh` could never have scheduled
+
+Both requested `--partition=gpu_h200 --gpus=h200:1`, and `run_ablation.sh`'s own comment asserted "this
+cluster has no h100". Both false: `sinfo` shows **no `gpu_h200` partition at all**, while `gpu` carries
+a40:4 **and** h100:4. Any array submitted with those scripts would have sat pending forever. Now
+`--partition=gpu --gpus=h100:1`.
+
+`run_ablation.sh` also pinned `--encoder harrier` *before* `"$@"`, so `--encoder qwen` only won by
+argparse last-wins — a reader would reasonably conclude it ran harrier. Removed; the encoder is now
+explicit at the call site.
+
+### 8.6 Two test bugs worth remembering
+
+Both were tests that would have "verified" working code forever without exercising it:
+
+- The shared stub batch gave every cell the **same** timestamp. Then `θᵢ − θⱼ = 0`, a uniform rotation
+  preserves inner products, and RoPE is *provably* inert — so any test of it passed vacuously. (That
+  inertness **is** the §6 relative-only property; it just makes a constant-time fixture useless.)
+- `test_row_token_head` perturbed the root row **uniformly** (`+= 10.0`), which the head's leading
+  `LayerNorm` removes by mean subtraction. It now perturbs the *direction*.
+
+### 8.7 Corrections to earlier claims in this file
+
+- The band is **not** over-constrained at `n_freq = 8`. That conclusion assumed a symmetric ±3σ bulk;
+  τ is **truncated on the right** (it cannot exceed the database's age), so the real bulk span is 8.2
+  and both constraints hold comfortably at `ω_min = 0.3`.
+- An earlier encoder-coverage table was read from the repo-relative `data/schema_cache/` fallback
+  rather than the scratch60 path SLURM reads. The real cache held **harrier only, zero qwen**.
