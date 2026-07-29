@@ -146,12 +146,21 @@ def test_input_fixture_is_unchanged(baseline, current):
 # ------------------------------------------------------------------------------------------------
 # Tier 1 — init. THIS is the tier §9.7 is about.
 # ------------------------------------------------------------------------------------------------
-def test_stype_id_space_is_unpinned(baseline, current):
+def test_stype_id_space_matches_baseline(baseline, current):
     """The §9.7 tripwire, isolated so it names itself.
 
-    ``build_column_modality_ids`` currently sizes the stype id space to the bundle. P0.5 pins it to the
-    full pytorch-frame enum. That single change resizes ``stype_emb`` and shifts every subsequent init
-    draw — so it must trip *this* assertion first, with an unambiguous message.
+    **P0.5 has landed.** ``build_column_modality_ids`` now pins the id space to the fixed
+    ``schema.STYPE_ORDER`` enum, so ``n_stypes`` is the constant ``N_STYPES = 10`` rather than
+    however many stypes a bundle happened to contain. This assertion did exactly its job when that
+    change went in — it tripped first, with ``2 -> 10``, ahead of the 6 downstream bitwise failures —
+    and the baseline was then re-captured deliberately.
+
+    It stays as a guard: from here on, a change in this number means something resized the modality
+    embedding *again*, which is a real bug unless someone intentionally edited ``STYPE_ORDER``
+    (appending is safe; reordering silently invalidates every checkpoint).
+
+    That the id space is genuinely pinned — same ids across datasets, constant width — is asserted
+    separately in ``tests/test_schema_pinning.py``; this test only compares against the fingerprint.
     """
     b = baseline["init"]["stype_emb_num_embeddings"]
     c = current["init"]["stype_emb_num_embeddings"]

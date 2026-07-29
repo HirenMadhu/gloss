@@ -1,9 +1,9 @@
 {
  "_doc": "Bit-for-bit parity baseline of the pre-refactor `arch: rt` MoRE (changes.md \u00a76 / \u00a79.7). Captured on a frozen, self-contained synthetic fixture (tests/fixtures/parity_fixture.py) that deliberately does NOT depend on tests/conftest.py, because the fingerprint is exact and any unrelated fixture edit would otherwise read as a parity regression. Regenerate ONLY deliberately: scripts/capture_parity_baseline.py --force.",
- "captured_utc": "2026-07-29T19:25:52+00:00",
+ "captured_utc": "2026-07-29T21:02:07+00:00",
  "env": {
   "fixture_version": "parity-fixture-v1",
-  "git_commit": "83c0d8f55e5459d2f29f77baa871f0fe0abd4229",
+  "git_commit": "9ee72b7f4f286d96907b02ff3a2e406cdc7c6115",
   "seed": 0,
   "torch": "2.8.0+cu128",
   "torch_frame": "0.3.0"
@@ -23,7 +23,7 @@
     "out_dim": 1,
     "route_on": "signature"
    },
-   "n_params": 86113,
+   "n_params": 86241,
    "param_order": [
     "encoder.cell_encoders.customer.encoder_dict.numerical.weight",
     "encoder.cell_encoders.customer.encoder_dict.numerical.bias",
@@ -252,14 +252,14 @@
     },
     "head.mlp.1.bias": {
      "dtype": "torch.float32",
-     "hash": "8c0bdae4c0044c8e",
+     "hash": "df559d5fbe741981",
      "shape": [
       32
      ]
     },
     "head.mlp.1.weight": {
      "dtype": "torch.float32",
-     "hash": "78245472281cd9af",
+     "hash": "f3752268733e5b59",
      "shape": [
       32,
       32
@@ -267,14 +267,14 @@
     },
     "head.mlp.3.bias": {
      "dtype": "torch.float32",
-     "hash": "1e0809c0808072e4",
+     "hash": "a1d748a9a9c81368",
      "shape": [
       1
      ]
     },
     "head.mlp.3.weight": {
      "dtype": "torch.float32",
-     "hash": "5966a33102f70775",
+     "hash": "a5177b1dec21fe52",
      "shape": [
       1,
       32
@@ -289,7 +289,7 @@
     },
     "signature.recency_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "1fcdd6175e35f576",
+     "hash": "5e069334cafe5408",
      "shape": [
       21,
       16
@@ -305,15 +305,15 @@
     },
     "signature.stype_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "47e2d7fdc2415db1",
+     "hash": "106da04952aeb686",
      "shape": [
-      2,
+      10,
       16
      ]
     },
     "substrate.blocks.0.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "73f4e7d0a30492a0",
+     "hash": "b0c7927cca56796f",
      "shape": [
       32,
       32
@@ -321,7 +321,7 @@
     },
     "substrate.blocks.0.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "1af6677bc0064c9e",
+     "hash": "b3b7a5bf7c8bf85d",
      "shape": [
       32,
       32
@@ -329,7 +329,7 @@
     },
     "substrate.blocks.0.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "e5bbd2a02c06ef9c",
+     "hash": "f31c6ecaea127932",
      "shape": [
       32,
       32
@@ -337,7 +337,7 @@
     },
     "substrate.blocks.0.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "3e66011809473912",
+     "hash": "a0f907948c71b0b0",
      "shape": [
       32,
       32
@@ -345,7 +345,7 @@
     },
     "substrate.blocks.0.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "1855792b08b20c15",
+     "hash": "973248d51a10f6fe",
      "shape": [
       32,
       32
@@ -353,7 +353,7 @@
     },
     "substrate.blocks.0.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "bddf651851a51e9d",
+     "hash": "f70a6a075f13aa63",
      "shape": [
       32,
       32
@@ -361,7 +361,7 @@
     },
     "substrate.blocks.0.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "c51bdb44d44559a1",
+     "hash": "d4f68a18164248ea",
      "shape": [
       32,
       32
@@ -369,7 +369,7 @@
     },
     "substrate.blocks.0.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "283743404c8c709a",
+     "hash": "08dbf560002f571f",
      "shape": [
       32,
       32
@@ -377,7 +377,7 @@
     },
     "substrate.blocks.0.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "d5251893eaa331e9",
+     "hash": "ce74eb4d034424da",
      "shape": [
       32,
       32
@@ -385,7 +385,7 @@
     },
     "substrate.blocks.0.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "518ea7e71726a537",
+     "hash": "a9100c2ed4f64d37",
      "shape": [
       32,
       32
@@ -393,7 +393,7 @@
     },
     "substrate.blocks.0.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "380159934850d144",
+     "hash": "04a7ecdc262bc6aa",
      "shape": [
       32,
       32
@@ -401,7 +401,7 @@
     },
     "substrate.blocks.0.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "01e3ef9b39a257ed",
+     "hash": "2f5ef19a7cf28500",
      "shape": [
       32,
       32
@@ -409,7 +409,7 @@
     },
     "substrate.blocks.0.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "72534ba0d0406002",
+     "hash": "05d99d7c5f497481",
      "shape": [
       32,
       32
@@ -417,7 +417,7 @@
     },
     "substrate.blocks.0.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "9d11d956da51ae61",
+     "hash": "d0131caaebf60349",
      "shape": [
       32,
       32
@@ -425,7 +425,7 @@
     },
     "substrate.blocks.0.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "a0d3b03f9287e5c5",
+     "hash": "4e1de45dcdee458a",
      "shape": [
       32,
       32
@@ -433,7 +433,7 @@
     },
     "substrate.blocks.0.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "3915437cde9b92d0",
+     "hash": "d6790916793d5c7d",
      "shape": [
       32,
       32
@@ -441,7 +441,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "0826957307ef5e8d",
+     "hash": "f9cf995b980d9e33",
      "shape": [
       64,
       32
@@ -449,7 +449,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "630ec271124470aa",
+     "hash": "e5f09262d31989a7",
      "shape": [
       32,
       64
@@ -457,7 +457,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "581f51f5010b2dd5",
+     "hash": "363a8a85e81e054d",
      "shape": [
       64,
       32
@@ -465,7 +465,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "d1cb544b221a6d25",
+     "hash": "627be7d573d566b9",
      "shape": [
       64,
       32
@@ -473,7 +473,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "28b971ace2ce83b3",
+     "hash": "fad7a7091cebdcd3",
      "shape": [
       32,
       64
@@ -481,7 +481,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "f195bd25dcc652a0",
+     "hash": "0ced7b89a5bdeb54",
      "shape": [
       64,
       32
@@ -489,7 +489,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "ca9dfefbc2bb0dfe",
+     "hash": "a019e1e8dc1b2421",
      "shape": [
       64,
       32
@@ -497,7 +497,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "6f352696ba2ee944",
+     "hash": "2e4a667b8ecb3bfe",
      "shape": [
       32,
       64
@@ -505,7 +505,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "cb4a162dc05ccc4d",
+     "hash": "5ff5d11e322125be",
      "shape": [
       64,
       32
@@ -513,7 +513,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "7c3b830a7312fe5c",
+     "hash": "bf68343ff9eeb4ab",
      "shape": [
       64,
       32
@@ -521,7 +521,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "f9c5bbadce68d878",
+     "hash": "a58a6c140dcf368b",
      "shape": [
       32,
       64
@@ -529,7 +529,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "037bbfed72823eec",
+     "hash": "0188686df771acb5",
      "shape": [
       64,
       32
@@ -537,7 +537,7 @@
     },
     "substrate.blocks.0.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "673daeeca240b2bf",
+     "hash": "efb584e99e4e2cae",
      "shape": [
       4,
       16
@@ -580,7 +580,7 @@
     },
     "substrate.blocks.1.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "f5926cffc886a2bb",
+     "hash": "38cdc7155b5211a2",
      "shape": [
       32,
       32
@@ -588,7 +588,7 @@
     },
     "substrate.blocks.1.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "417799ce5bf1304c",
+     "hash": "f1d334e819bceceb",
      "shape": [
       32,
       32
@@ -596,7 +596,7 @@
     },
     "substrate.blocks.1.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "337c010e42f987aa",
+     "hash": "b3c8f4fd7b9115f9",
      "shape": [
       32,
       32
@@ -604,7 +604,7 @@
     },
     "substrate.blocks.1.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "3937653286aeae82",
+     "hash": "7be5eec266cf4438",
      "shape": [
       32,
       32
@@ -612,7 +612,7 @@
     },
     "substrate.blocks.1.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "49c2ce4ccd90294a",
+     "hash": "6476be589f96ab1b",
      "shape": [
       32,
       32
@@ -620,7 +620,7 @@
     },
     "substrate.blocks.1.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "acaa792b8736b6bd",
+     "hash": "7f05e11c541dacff",
      "shape": [
       32,
       32
@@ -628,7 +628,7 @@
     },
     "substrate.blocks.1.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "31d7e8398d595c91",
+     "hash": "ecd706162cbf4d9f",
      "shape": [
       32,
       32
@@ -636,7 +636,7 @@
     },
     "substrate.blocks.1.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "f6ae2d16fc527814",
+     "hash": "204b1faebe583f1b",
      "shape": [
       32,
       32
@@ -644,7 +644,7 @@
     },
     "substrate.blocks.1.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "d465a410e1c49656",
+     "hash": "e31b74519abe6a4f",
      "shape": [
       32,
       32
@@ -652,7 +652,7 @@
     },
     "substrate.blocks.1.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "399c761b62827773",
+     "hash": "acb95939d82cea18",
      "shape": [
       32,
       32
@@ -660,7 +660,7 @@
     },
     "substrate.blocks.1.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "3c0dd82e544a7033",
+     "hash": "dc632fb24747e27c",
      "shape": [
       32,
       32
@@ -668,7 +668,7 @@
     },
     "substrate.blocks.1.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "fca84da947e05130",
+     "hash": "6e153c39740916eb",
      "shape": [
       32,
       32
@@ -676,7 +676,7 @@
     },
     "substrate.blocks.1.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "2c3d817be488a3dc",
+     "hash": "18726d4e148a9fa1",
      "shape": [
       32,
       32
@@ -684,7 +684,7 @@
     },
     "substrate.blocks.1.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "2648bdc5f9dd6d4d",
+     "hash": "b1dca24a13b36302",
      "shape": [
       32,
       32
@@ -692,7 +692,7 @@
     },
     "substrate.blocks.1.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "ec7fc467e44a2c2b",
+     "hash": "757ca8638b6ba855",
      "shape": [
       32,
       32
@@ -700,7 +700,7 @@
     },
     "substrate.blocks.1.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "8471794f0f4bce7b",
+     "hash": "53ebdd8b6172a465",
      "shape": [
       32,
       32
@@ -708,7 +708,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "c27373704d38dfca",
+     "hash": "4a7e284f036de502",
      "shape": [
       64,
       32
@@ -716,7 +716,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "518d324324a4311c",
+     "hash": "c85dc741c762eea9",
      "shape": [
       32,
       64
@@ -724,7 +724,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "b3ca038f45f2f1fa",
+     "hash": "42c7ece16974d003",
      "shape": [
       64,
       32
@@ -732,7 +732,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "73cf08353c91ddfb",
+     "hash": "ce16f3178cdbab57",
      "shape": [
       64,
       32
@@ -740,7 +740,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "f855438d62f5cee7",
+     "hash": "1369b4ac250372d9",
      "shape": [
       32,
       64
@@ -748,7 +748,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "b2e8c1156c002f81",
+     "hash": "d5a695f9017741c0",
      "shape": [
       64,
       32
@@ -756,7 +756,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "0b8c82fd0b3f8d87",
+     "hash": "5aa0398cbda89a02",
      "shape": [
       64,
       32
@@ -764,7 +764,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "8fd2c47158e46bd9",
+     "hash": "36174ced5bb22fa6",
      "shape": [
       32,
       64
@@ -772,7 +772,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "392f1d77994a0ed3",
+     "hash": "ae2303d239a58ed4",
      "shape": [
       64,
       32
@@ -780,7 +780,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "33b073d1d2605d1f",
+     "hash": "a1f491c35fe33f06",
      "shape": [
       64,
       32
@@ -788,7 +788,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "ceee5a668fd17a19",
+     "hash": "8084ad15510db483",
      "shape": [
       32,
       64
@@ -796,7 +796,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "1775500aa231b8a0",
+     "hash": "594ff44346121a79",
      "shape": [
       64,
       32
@@ -804,7 +804,7 @@
     },
     "substrate.blocks.1.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "453d71340d4ca2de",
+     "hash": "a4cd9115a8f2cc91",
      "shape": [
       4,
       16
@@ -855,16 +855,16 @@
    },
    "rng": {
     "post_init_probe": [
-     "-0x1.321f060000000p-3",
-     "-0x1.3ec6760000000p-2",
-     "0x1.0086540000000p-5",
-     "-0x1.31731a0000000p+0",
-     "0x1.ded1c60000000p-1",
-     "0x1.3e3cf20000000p-1",
-     "-0x1.681e360000000p-2",
-     "-0x1.2d625c0000000p-1"
+     "-0x1.1d54ce0000000p-2",
+     "-0x1.0675540000000p+0",
+     "0x1.0fee660000000p+1",
+     "0x1.7c9f2e0000000p+0",
+     "-0x1.f45d9c0000000p-1",
+     "-0x1.7d325a0000000p-2",
+     "-0x1.724a180000000p+0",
+     "-0x1.d2636e0000000p-3"
     ],
-    "state_after_init": "1ffcb8c95faed54d",
+    "state_after_init": "80cff5589ec8d2fa",
     "state_before_init": "1ccf17250133dec5"
    },
    "seed": 0,
@@ -965,7 +965,7 @@
     "head.mlp.3.weight",
     "head.mlp.3.bias"
    ],
-   "stype_emb_num_embeddings": 2
+   "stype_emb_num_embeddings": 10
   },
   "input": {
    "cell_batch": {
@@ -1085,12 +1085,12 @@
    "fixture_version": "parity-fixture-v1",
    "modality_id": {
     "dtype": "torch.int64",
-    "hash": "01c84f606ffe38ee",
+    "hash": "f2d63a605d8c1033",
     "shape": [
      4
     ]
    },
-   "n_stypes": 2,
+   "n_stypes": 10,
    "name_emb": {
     "dtype": "torch.float32",
     "hash": "9bfc2b032f291dac",
@@ -1101,26 +1101,26 @@
    }
   },
   "numerics": {
-   "backward_loss": "0x1.8db1100000000p+0",
+   "backward_loss": "0x1.8ea46c0000000p+0",
    "forward": {
-    "aux": "0x1.bf4fce0000000p-1",
+    "aux": "0x1.c1fcd40000000p-1",
     "logits": {
      "dtype": "torch.float32",
-     "hash": "161f279f5f7a5a8e",
+     "hash": "595b56a3d8ca00ae",
      "shape": [
       2,
       1
      ]
     },
     "logits_exact": [
-     "-0x1.0f13120000000p-3",
-     "-0x1.9999ac0000000p-3"
+     "0x1.a317c00000000p-3",
+     "0x1.0b74260000000p-3"
     ]
    },
    "grads": {
     "encoder.cell_encoders.customer.encoder_dict.categorical.emb.weight": {
      "dtype": "torch.float32",
-     "hash": "40da1d7b5825d6ca",
+     "hash": "914d7bd3d7e2de3e",
      "shape": [
       3,
       32
@@ -1128,7 +1128,7 @@
     },
     "encoder.cell_encoders.customer.encoder_dict.numerical.bias": {
      "dtype": "torch.float32",
-     "hash": "5801f0c3e6e10c4d",
+     "hash": "4bb2df460d3ad226",
      "shape": [
       1,
       32
@@ -1136,7 +1136,7 @@
     },
     "encoder.cell_encoders.customer.encoder_dict.numerical.weight": {
      "dtype": "torch.float32",
-     "hash": "5269477af11800aa",
+     "hash": "f25ba4bf7bd46942",
      "shape": [
       1,
       32
@@ -1144,7 +1144,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.categorical.emb.weight": {
      "dtype": "torch.float32",
-     "hash": "e250b5fb1ed04c37",
+     "hash": "f6c43b77a71f4ecb",
      "shape": [
       3,
       32
@@ -1152,7 +1152,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.numerical.bias": {
      "dtype": "torch.float32",
-     "hash": "d43353b15088b675",
+     "hash": "19e939d7001e485f",
      "shape": [
       1,
       32
@@ -1160,7 +1160,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.numerical.weight": {
      "dtype": "torch.float32",
-     "hash": "ebd12bbe889abbb0",
+     "hash": "535b6891cd664684",
      "shape": [
       1,
       32
@@ -1168,14 +1168,14 @@
     },
     "encoder.name_proj.bias": {
      "dtype": "torch.float32",
-     "hash": "b42f061d628c33e1",
+     "hash": "dcec07524fbbaae7",
      "shape": [
       32
      ]
     },
     "encoder.name_proj.weight": {
      "dtype": "torch.float32",
-     "hash": "7a4261d5a2f81433",
+     "hash": "1db708deff3f037f",
      "shape": [
       32,
       16
@@ -1183,14 +1183,14 @@
     },
     "encoder.w_v.bias": {
      "dtype": "torch.float32",
-     "hash": "6346b9f962819cd0",
+     "hash": "e6e3b5808f07ff31",
      "shape": [
       32
      ]
     },
     "encoder.w_v.weight": {
      "dtype": "torch.float32",
-     "hash": "789f8fef66f1a784",
+     "hash": "fe2abf04336c412f",
      "shape": [
       32,
       32
@@ -1198,28 +1198,28 @@
     },
     "head.mlp.0.bias": {
      "dtype": "torch.float32",
-     "hash": "008ce75ce402dc56",
+     "hash": "9dfc235ee8fa55e3",
      "shape": [
       32
      ]
     },
     "head.mlp.0.weight": {
      "dtype": "torch.float32",
-     "hash": "a6231fe917132363",
+     "hash": "54b61e1f7acc5e53",
      "shape": [
       32
      ]
     },
     "head.mlp.1.bias": {
      "dtype": "torch.float32",
-     "hash": "054a812f48f1f22e",
+     "hash": "4271de53ffb56671",
      "shape": [
       32
      ]
     },
     "head.mlp.1.weight": {
      "dtype": "torch.float32",
-     "hash": "3c6d84792b5288ec",
+     "hash": "b55dfd551f9ea0c7",
      "shape": [
       32,
       32
@@ -1227,14 +1227,14 @@
     },
     "head.mlp.3.bias": {
      "dtype": "torch.float32",
-     "hash": "69d646fca34e3515",
+     "hash": "719da99bb2e2beb6",
      "shape": [
       1
      ]
     },
     "head.mlp.3.weight": {
      "dtype": "torch.float32",
-     "hash": "6009bd0509624e0c",
+     "hash": "40eb003bf80c5a0d",
      "shape": [
       1,
       32
@@ -1242,14 +1242,14 @@
     },
     "signature.norm.weight": {
      "dtype": "torch.float32",
-     "hash": "c9368a9da0fd2e13",
+     "hash": "15831b7068d156c2",
      "shape": [
       16
      ]
     },
     "signature.recency_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "c38c8ef51ab2dbf2",
+     "hash": "a7dd80a8d2569bf1",
      "shape": [
       21,
       16
@@ -1257,7 +1257,7 @@
     },
     "signature.schema_proj.weight": {
      "dtype": "torch.float32",
-     "hash": "279a91a0d6cd1ca7",
+     "hash": "be73f6c698ffcaf3",
      "shape": [
       16,
       16
@@ -1265,15 +1265,15 @@
     },
     "signature.stype_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "f8ed990619baccb2",
+     "hash": "d855d4f9583f4b99",
      "shape": [
-      2,
+      10,
       16
      ]
     },
     "substrate.blocks.0.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "dbcb5f238a98ff16",
+     "hash": "1d45485aa65583eb",
      "shape": [
       32,
       32
@@ -1281,7 +1281,7 @@
     },
     "substrate.blocks.0.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "7cf80e754f54723f",
+     "hash": "363d31f22347bb0c",
      "shape": [
       32,
       32
@@ -1289,7 +1289,7 @@
     },
     "substrate.blocks.0.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "470a84d2068e2392",
+     "hash": "372c931b03017f67",
      "shape": [
       32,
       32
@@ -1297,7 +1297,7 @@
     },
     "substrate.blocks.0.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "e63ef6ad2f563ca5",
+     "hash": "c8194b64427be19d",
      "shape": [
       32,
       32
@@ -1305,7 +1305,7 @@
     },
     "substrate.blocks.0.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "5f98463a735c21b2",
+     "hash": "53e01f5f732cfe48",
      "shape": [
       32,
       32
@@ -1313,7 +1313,7 @@
     },
     "substrate.blocks.0.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "3174c48d8fcfc657",
+     "hash": "15654b0a937b0973",
      "shape": [
       32,
       32
@@ -1321,7 +1321,7 @@
     },
     "substrate.blocks.0.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "d781d5e6318bc8a9",
+     "hash": "54ce2473cd67a9ce",
      "shape": [
       32,
       32
@@ -1329,7 +1329,7 @@
     },
     "substrate.blocks.0.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "a505ee7186d731cd",
+     "hash": "b53502ce6ec5f506",
      "shape": [
       32,
       32
@@ -1337,7 +1337,7 @@
     },
     "substrate.blocks.0.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "90beb20ca841257d",
+     "hash": "6d1e9f6bf8410dc1",
      "shape": [
       32,
       32
@@ -1345,7 +1345,7 @@
     },
     "substrate.blocks.0.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "72358f0c32e563c2",
+     "hash": "b897fe44c9851977",
      "shape": [
       32,
       32
@@ -1353,7 +1353,7 @@
     },
     "substrate.blocks.0.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "e99083d027591e1d",
+     "hash": "dfe541535c5c3e31",
      "shape": [
       32,
       32
@@ -1361,7 +1361,7 @@
     },
     "substrate.blocks.0.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "ccfa89d2e85bc3c1",
+     "hash": "bb3a5d688a7b98fe",
      "shape": [
       32,
       32
@@ -1369,7 +1369,7 @@
     },
     "substrate.blocks.0.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "9b2626eade89b727",
+     "hash": "ab71caf67e74b9c8",
      "shape": [
       32,
       32
@@ -1377,7 +1377,7 @@
     },
     "substrate.blocks.0.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "536099850ef44dab",
+     "hash": "4e2e76f379d163e9",
      "shape": [
       32,
       32
@@ -1385,7 +1385,7 @@
     },
     "substrate.blocks.0.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "4b9fb79807f8e669",
+     "hash": "74f4423af9119175",
      "shape": [
       32,
       32
@@ -1393,7 +1393,7 @@
     },
     "substrate.blocks.0.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "6713e37abe3a0269",
+     "hash": "cd5fca1fa139c7ce",
      "shape": [
       32,
       32
@@ -1401,7 +1401,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "5f68f78b30241f4f",
+     "hash": "9bd873b9d42baac6",
      "shape": [
       64,
       32
@@ -1409,7 +1409,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "e491fc20695ce0ec",
+     "hash": "e185d144af8be36b",
      "shape": [
       32,
       64
@@ -1417,7 +1417,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "34305e1543add2f7",
+     "hash": "96d0dd51d80006c4",
      "shape": [
       64,
       32
@@ -1425,7 +1425,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "a9c9d606a33187e5",
+     "hash": "40f37ce6888129d9",
      "shape": [
       64,
       32
@@ -1433,7 +1433,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "daaac9ee5c6a6e10",
+     "hash": "e2677ad538bbbbae",
      "shape": [
       32,
       64
@@ -1441,7 +1441,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "7dec247cf556cc81",
+     "hash": "a9c43ca833145a89",
      "shape": [
       64,
       32
@@ -1449,7 +1449,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "a8ce185c7cde4051",
+     "hash": "05cbf306526631f8",
      "shape": [
       64,
       32
@@ -1457,7 +1457,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "e777e02888d36f83",
+     "hash": "8892e7a64bb8a742",
      "shape": [
       32,
       64
@@ -1465,7 +1465,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "2d6a3e835d7ac469",
+     "hash": "0648db7e1c19f521",
      "shape": [
       64,
       32
@@ -1473,7 +1473,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "8db784f3726b2009",
+     "hash": "cfdd2f3f8b9712db",
      "shape": [
       64,
       32
@@ -1481,7 +1481,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "c8195f36cf10ef56",
+     "hash": "63fa7da7414ca45e",
      "shape": [
       32,
       64
@@ -1489,7 +1489,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "973eb7d193c81580",
+     "hash": "43d76f8fdb60d680",
      "shape": [
       64,
       32
@@ -1497,7 +1497,7 @@
     },
     "substrate.blocks.0.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "882b79988ec66423",
+     "hash": "ac3240c50542a838",
      "shape": [
       4,
       16
@@ -1505,42 +1505,42 @@
     },
     "substrate.blocks.0.norms.col.weight": {
      "dtype": "torch.float32",
-     "hash": "7f40c32e8b5042e2",
+     "hash": "7fa80195f79d8537",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.feat.weight": {
      "dtype": "torch.float32",
-     "hash": "e49096b5d0e4f8d1",
+     "hash": "dcb9a687113d4bff",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.ffn.weight": {
      "dtype": "torch.float32",
-     "hash": "76c81e011d5180a6",
+     "hash": "d72977af1605ffa4",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.full.weight": {
      "dtype": "torch.float32",
-     "hash": "db57e419ce911bae",
+     "hash": "a79538099c61494a",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.nbr.weight": {
      "dtype": "torch.float32",
-     "hash": "e754386573222197",
+     "hash": "73653e5c3f0284e5",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "e5e24a93f6d4115f",
+     "hash": "bf60ffba02d181a8",
      "shape": [
       32,
       32
@@ -1548,7 +1548,7 @@
     },
     "substrate.blocks.1.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "c394386ccfd0e77c",
+     "hash": "465b9a87ffa048fd",
      "shape": [
       32,
       32
@@ -1556,7 +1556,7 @@
     },
     "substrate.blocks.1.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "e3a0c998923aa097",
+     "hash": "f73d9d438866bdb1",
      "shape": [
       32,
       32
@@ -1564,7 +1564,7 @@
     },
     "substrate.blocks.1.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "efe3df0935dfb600",
+     "hash": "50e75592df193ca3",
      "shape": [
       32,
       32
@@ -1572,7 +1572,7 @@
     },
     "substrate.blocks.1.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "0ea0723c23a5db28",
+     "hash": "674a0b4abdd4c685",
      "shape": [
       32,
       32
@@ -1580,7 +1580,7 @@
     },
     "substrate.blocks.1.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "a17e75cffc0cd43b",
+     "hash": "40fef1d7ecbbdabe",
      "shape": [
       32,
       32
@@ -1588,7 +1588,7 @@
     },
     "substrate.blocks.1.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "ff8f45eb96a186e7",
+     "hash": "368407c976237bc0",
      "shape": [
       32,
       32
@@ -1596,7 +1596,7 @@
     },
     "substrate.blocks.1.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "94fd55c02764afab",
+     "hash": "7361ec73a04df837",
      "shape": [
       32,
       32
@@ -1604,7 +1604,7 @@
     },
     "substrate.blocks.1.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "10e011b8dc2350a6",
+     "hash": "4330b02fe3b6f104",
      "shape": [
       32,
       32
@@ -1612,7 +1612,7 @@
     },
     "substrate.blocks.1.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "8ae7933f98ce47a3",
+     "hash": "a448b62aa60fb0ed",
      "shape": [
       32,
       32
@@ -1620,7 +1620,7 @@
     },
     "substrate.blocks.1.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "740c55d0e7ad523e",
+     "hash": "b8a8b7375674b400",
      "shape": [
       32,
       32
@@ -1628,7 +1628,7 @@
     },
     "substrate.blocks.1.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "5aef803ed1906419",
+     "hash": "24416b92205bacca",
      "shape": [
       32,
       32
@@ -1636,7 +1636,7 @@
     },
     "substrate.blocks.1.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "6fb79b52e494036d",
+     "hash": "5b9807714642f986",
      "shape": [
       32,
       32
@@ -1644,7 +1644,7 @@
     },
     "substrate.blocks.1.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "34dec49c170ffc49",
+     "hash": "80ba8be293e4c0c3",
      "shape": [
       32,
       32
@@ -1652,7 +1652,7 @@
     },
     "substrate.blocks.1.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "12f56e05863499ec",
+     "hash": "f6cb25397bd36017",
      "shape": [
       32,
       32
@@ -1660,7 +1660,7 @@
     },
     "substrate.blocks.1.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "a551a400d7167d1f",
+     "hash": "552ece7284abd45b",
      "shape": [
       32,
       32
@@ -1668,7 +1668,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "ff7d3269c176d99e",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       64,
       32
@@ -1676,7 +1676,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "3432e810910c10bc",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       32,
       64
@@ -1684,7 +1684,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "cb54c07912736709",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       64,
       32
@@ -1692,7 +1692,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "8682b401566edcbf",
+     "hash": "8bce9d5164d0fb37",
      "shape": [
       64,
       32
@@ -1700,7 +1700,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "0c44a7d41d78102d",
+     "hash": "e4c706a69f054acb",
      "shape": [
       32,
       64
@@ -1708,7 +1708,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "34a1f66e88a297e7",
+     "hash": "57288a505a4036e1",
      "shape": [
       64,
       32
@@ -1716,7 +1716,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "9f1dcbc35c350d60",
+     "hash": "a3febbf9cf8c6656",
      "shape": [
       64,
       32
@@ -1724,7 +1724,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "9f1dcbc35c350d60",
+     "hash": "eaf8a630fee6fb5f",
      "shape": [
       32,
       64
@@ -1732,7 +1732,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "9f1dcbc35c350d60",
+     "hash": "78e2c682c7c59dd0",
      "shape": [
       64,
       32
@@ -1740,7 +1740,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "792c0cf668f29023",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       64,
       32
@@ -1748,7 +1748,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "8a02c19fcdee2502",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       32,
       64
@@ -1756,7 +1756,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "af2ddbd506b0e58d",
+     "hash": "9f1dcbc35c350d60",
      "shape": [
       64,
       32
@@ -1764,7 +1764,7 @@
     },
     "substrate.blocks.1.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "44d00b91fdb2af78",
+     "hash": "7b69510b65fe705b",
      "shape": [
       4,
       16
@@ -1772,42 +1772,42 @@
     },
     "substrate.blocks.1.norms.col.weight": {
      "dtype": "torch.float32",
-     "hash": "42ee78181f3131ee",
+     "hash": "192bb5ab563c7968",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.feat.weight": {
      "dtype": "torch.float32",
-     "hash": "180b8ccd995cb4a6",
+     "hash": "824f0534d7016801",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.ffn.weight": {
      "dtype": "torch.float32",
-     "hash": "0b1d71a6275e2109",
+     "hash": "ed75d1a2187c8cb1",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.full.weight": {
      "dtype": "torch.float32",
-     "hash": "96276c253629944e",
+     "hash": "cd311e51c9fa708b",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.nbr.weight": {
      "dtype": "torch.float32",
-     "hash": "504650e570014218",
+     "hash": "bf181b602e96ac70",
      "shape": [
       32
      ]
     },
     "substrate.norm_out.weight": {
      "dtype": "torch.float32",
-     "hash": "afce5d25bb778393",
+     "hash": "12d30f2d20312168",
      "shape": [
       32
      ]
@@ -1816,7 +1816,7 @@
    "params_after_train": {
     "encoder.cell_encoders.customer.encoder_dict.categorical.emb.weight": {
      "dtype": "torch.float32",
-     "hash": "5ad8ae17d08097c9",
+     "hash": "2bebbd32f11e2acf",
      "shape": [
       3,
       32
@@ -1831,7 +1831,7 @@
     },
     "encoder.cell_encoders.customer.encoder_dict.numerical.bias": {
      "dtype": "torch.float32",
-     "hash": "fc882ca0680b4e30",
+     "hash": "879114b0b0471261",
      "shape": [
       1,
       32
@@ -1853,7 +1853,7 @@
     },
     "encoder.cell_encoders.customer.encoder_dict.numerical.weight": {
      "dtype": "torch.float32",
-     "hash": "c73e53190c208580",
+     "hash": "aefa23a4a2b15d0f",
      "shape": [
       1,
       32
@@ -1861,7 +1861,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.categorical.emb.weight": {
      "dtype": "torch.float32",
-     "hash": "7d82e779abbb2c81",
+     "hash": "d51dc2277e6976a7",
      "shape": [
       3,
       32
@@ -1876,7 +1876,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.numerical.bias": {
      "dtype": "torch.float32",
-     "hash": "a6206178f3a419e1",
+     "hash": "629b52bfd048aa9f",
      "shape": [
       1,
       32
@@ -1898,7 +1898,7 @@
     },
     "encoder.cell_encoders.txn.encoder_dict.numerical.weight": {
      "dtype": "torch.float32",
-     "hash": "8d78d610f0be2c59",
+     "hash": "7c3f54632008be24",
      "shape": [
       1,
       32
@@ -1906,14 +1906,14 @@
     },
     "encoder.name_proj.bias": {
      "dtype": "torch.float32",
-     "hash": "be7a2decd29599f2",
+     "hash": "e88f4ba2ca6055b0",
      "shape": [
       32
      ]
     },
     "encoder.name_proj.weight": {
      "dtype": "torch.float32",
-     "hash": "c9ffbda91cc65218",
+     "hash": "f5588a7474d73396",
      "shape": [
       32,
       16
@@ -1921,14 +1921,14 @@
     },
     "encoder.w_v.bias": {
      "dtype": "torch.float32",
-     "hash": "5b4ad6fb3d5e3a12",
+     "hash": "5ce510a502f21c48",
      "shape": [
       32
      ]
     },
     "encoder.w_v.weight": {
      "dtype": "torch.float32",
-     "hash": "261c3e83abbe7b2c",
+     "hash": "54d08de4bf20c3c6",
      "shape": [
       32,
       32
@@ -1936,28 +1936,28 @@
     },
     "head.mlp.0.bias": {
      "dtype": "torch.float32",
-     "hash": "e09a330a284290eb",
+     "hash": "62ab3f84d1b31a69",
      "shape": [
       32
      ]
     },
     "head.mlp.0.weight": {
      "dtype": "torch.float32",
-     "hash": "5e2735375f65762c",
+     "hash": "34f472c605c9ee52",
      "shape": [
       32
      ]
     },
     "head.mlp.1.bias": {
      "dtype": "torch.float32",
-     "hash": "53497b5c89695769",
+     "hash": "94f77777074f0bc8",
      "shape": [
       32
      ]
     },
     "head.mlp.1.weight": {
      "dtype": "torch.float32",
-     "hash": "f311009873ae0ee3",
+     "hash": "d47eca69179633d2",
      "shape": [
       32,
       32
@@ -1965,14 +1965,14 @@
     },
     "head.mlp.3.bias": {
      "dtype": "torch.float32",
-     "hash": "1a2b2cbacd7b5fb2",
+     "hash": "ecd0de32251ec48b",
      "shape": [
       1
      ]
     },
     "head.mlp.3.weight": {
      "dtype": "torch.float32",
-     "hash": "fb39fe09f545a967",
+     "hash": "80783c09fb118f89",
      "shape": [
       1,
       32
@@ -1980,14 +1980,14 @@
     },
     "signature.norm.weight": {
      "dtype": "torch.float32",
-     "hash": "18f128ac19939218",
+     "hash": "8b9630d134dc1e78",
      "shape": [
       16
      ]
     },
     "signature.recency_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "a8976bf38c4df552",
+     "hash": "c0efafe9ec6e59a9",
      "shape": [
       21,
       16
@@ -1995,7 +1995,7 @@
     },
     "signature.schema_proj.weight": {
      "dtype": "torch.float32",
-     "hash": "dbbe2c66e3c3a2ba",
+     "hash": "eb3b98eb26b142c0",
      "shape": [
       16,
       16
@@ -2003,15 +2003,15 @@
     },
     "signature.stype_emb.weight": {
      "dtype": "torch.float32",
-     "hash": "080f4730800ba677",
+     "hash": "25f8ef9b41a252cc",
      "shape": [
-      2,
+      10,
       16
      ]
     },
     "substrate.blocks.0.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "e1ac7fe61e26b10c",
+     "hash": "7d598b6ef985268f",
      "shape": [
       32,
       32
@@ -2019,7 +2019,7 @@
     },
     "substrate.blocks.0.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "0e115ac2880d56c8",
+     "hash": "15a2f05ce7cd9411",
      "shape": [
       32,
       32
@@ -2027,7 +2027,7 @@
     },
     "substrate.blocks.0.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "1ea38f86fab56c9b",
+     "hash": "25dcfa44f00bdfc5",
      "shape": [
       32,
       32
@@ -2035,7 +2035,7 @@
     },
     "substrate.blocks.0.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "ea7258ff91b3e451",
+     "hash": "76d97cb85f7e460f",
      "shape": [
       32,
       32
@@ -2043,7 +2043,7 @@
     },
     "substrate.blocks.0.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "c61ac0a157dc3cf0",
+     "hash": "56bbf836bfd9337a",
      "shape": [
       32,
       32
@@ -2051,7 +2051,7 @@
     },
     "substrate.blocks.0.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "bbca5af3972e54f9",
+     "hash": "4ffbd8e6c7f2e66d",
      "shape": [
       32,
       32
@@ -2059,7 +2059,7 @@
     },
     "substrate.blocks.0.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "a64f11afa2b68264",
+     "hash": "fc25f814a53d5586",
      "shape": [
       32,
       32
@@ -2067,7 +2067,7 @@
     },
     "substrate.blocks.0.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "4ef92684bb99a6f0",
+     "hash": "7edd946ca3be47f7",
      "shape": [
       32,
       32
@@ -2075,7 +2075,7 @@
     },
     "substrate.blocks.0.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "856f954be830e8ba",
+     "hash": "3e6d3520f92465a0",
      "shape": [
       32,
       32
@@ -2083,7 +2083,7 @@
     },
     "substrate.blocks.0.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "4c9831d5bcdb0842",
+     "hash": "d8c8c527461aece9",
      "shape": [
       32,
       32
@@ -2091,7 +2091,7 @@
     },
     "substrate.blocks.0.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "00200629a77282e5",
+     "hash": "260357f596253ee2",
      "shape": [
       32,
       32
@@ -2099,7 +2099,7 @@
     },
     "substrate.blocks.0.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "c1dcbedead5532bd",
+     "hash": "2c66207487c8f89f",
      "shape": [
       32,
       32
@@ -2107,7 +2107,7 @@
     },
     "substrate.blocks.0.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "81775946f9704c47",
+     "hash": "0282205325fc7fbd",
      "shape": [
       32,
       32
@@ -2115,7 +2115,7 @@
     },
     "substrate.blocks.0.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "7d015db770621002",
+     "hash": "7f07111cf704222e",
      "shape": [
       32,
       32
@@ -2123,7 +2123,7 @@
     },
     "substrate.blocks.0.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "d6f31ab34abd0604",
+     "hash": "83b5214017f84f75",
      "shape": [
       32,
       32
@@ -2131,7 +2131,7 @@
     },
     "substrate.blocks.0.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "31db606418571d01",
+     "hash": "eba7b6f7359869ac",
      "shape": [
       32,
       32
@@ -2139,7 +2139,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "27bb2ed09d94efce",
+     "hash": "63528e739c5160e3",
      "shape": [
       64,
       32
@@ -2147,7 +2147,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "ac44ea16ef6a2392",
+     "hash": "148d09f4ce98fc49",
      "shape": [
       32,
       64
@@ -2155,7 +2155,7 @@
     },
     "substrate.blocks.0.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "78294e5bb524d9be",
+     "hash": "18bd05c9fe30d448",
      "shape": [
       64,
       32
@@ -2163,7 +2163,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "a2d1b73d77647264",
+     "hash": "ef1dc88850cde127",
      "shape": [
       64,
       32
@@ -2171,7 +2171,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "bdaa559e0bc67f29",
+     "hash": "25f540277f2cce63",
      "shape": [
       32,
       64
@@ -2179,7 +2179,7 @@
     },
     "substrate.blocks.0.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "e8584e509f5caff4",
+     "hash": "0bad2e103a0295f2",
      "shape": [
       64,
       32
@@ -2187,7 +2187,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "53ac6c8cc8d637cb",
+     "hash": "f707b9011fa2986c",
      "shape": [
       64,
       32
@@ -2195,7 +2195,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "3c4cced3e8a48006",
+     "hash": "153126d9f58dd913",
      "shape": [
       32,
       64
@@ -2203,7 +2203,7 @@
     },
     "substrate.blocks.0.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "0f8f479a3229062c",
+     "hash": "ee53f8189d0dd9b1",
      "shape": [
       64,
       32
@@ -2211,7 +2211,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "44d34a66d06da8db",
+     "hash": "8c88b0186a9c682d",
      "shape": [
       64,
       32
@@ -2219,7 +2219,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "44ed2b2a54efcc5d",
+     "hash": "425f16e4b2e76540",
      "shape": [
       32,
       64
@@ -2227,7 +2227,7 @@
     },
     "substrate.blocks.0.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "89472ef5747be25b",
+     "hash": "bf2944da03cd961b",
      "shape": [
       64,
       32
@@ -2235,7 +2235,7 @@
     },
     "substrate.blocks.0.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "90a81239ebb286db",
+     "hash": "d26acfa927a2cdd8",
      "shape": [
       4,
       16
@@ -2243,42 +2243,42 @@
     },
     "substrate.blocks.0.norms.col.weight": {
      "dtype": "torch.float32",
-     "hash": "b30d3e9b13600b43",
+     "hash": "d39c7311c1ca4375",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.feat.weight": {
      "dtype": "torch.float32",
-     "hash": "4b2b5579baea380a",
+     "hash": "10f676fa1a5bfe30",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.ffn.weight": {
      "dtype": "torch.float32",
-     "hash": "29ddd262cadfd0ae",
+     "hash": "d9aa27871b93125d",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.full.weight": {
      "dtype": "torch.float32",
-     "hash": "69bf564ec21f7bcb",
+     "hash": "67fafef3116e91e3",
      "shape": [
       32
      ]
     },
     "substrate.blocks.0.norms.nbr.weight": {
      "dtype": "torch.float32",
-     "hash": "e862b8cbe0856005",
+     "hash": "f60b3885dac0142e",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.attns.col.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "b2aaebf72fb674fb",
+     "hash": "d14bb20489eb438b",
      "shape": [
       32,
       32
@@ -2286,7 +2286,7 @@
     },
     "substrate.blocks.1.attns.col.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "024943e425d77a0e",
+     "hash": "1e337e5919943dfd",
      "shape": [
       32,
       32
@@ -2294,7 +2294,7 @@
     },
     "substrate.blocks.1.attns.col.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "4f8f6e08637d6c3c",
+     "hash": "e4ae481f732d526b",
      "shape": [
       32,
       32
@@ -2302,7 +2302,7 @@
     },
     "substrate.blocks.1.attns.col.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "297063d32a05f868",
+     "hash": "de47da3f070b338d",
      "shape": [
       32,
       32
@@ -2310,7 +2310,7 @@
     },
     "substrate.blocks.1.attns.feat.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "a6eaaeba307087d3",
+     "hash": "e90c5935624edfd9",
      "shape": [
       32,
       32
@@ -2318,7 +2318,7 @@
     },
     "substrate.blocks.1.attns.feat.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "6cf0536ed81aae8a",
+     "hash": "b8de58b16e56c411",
      "shape": [
       32,
       32
@@ -2326,7 +2326,7 @@
     },
     "substrate.blocks.1.attns.feat.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "5fb96926c170964a",
+     "hash": "19522c3b74f88252",
      "shape": [
       32,
       32
@@ -2334,7 +2334,7 @@
     },
     "substrate.blocks.1.attns.feat.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "ec37b23a48616e51",
+     "hash": "c4f52d8e613caa1d",
      "shape": [
       32,
       32
@@ -2342,7 +2342,7 @@
     },
     "substrate.blocks.1.attns.full.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "eaea68d7295e5b5a",
+     "hash": "90ecac784d17ee22",
      "shape": [
       32,
       32
@@ -2350,7 +2350,7 @@
     },
     "substrate.blocks.1.attns.full.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "b798a1444aab191b",
+     "hash": "b83f008c4439a2cf",
      "shape": [
       32,
       32
@@ -2358,7 +2358,7 @@
     },
     "substrate.blocks.1.attns.full.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "c0225d8f3664aee7",
+     "hash": "753ce620411a7602",
      "shape": [
       32,
       32
@@ -2366,7 +2366,7 @@
     },
     "substrate.blocks.1.attns.full.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "0a2e9d721bd8f38f",
+     "hash": "0b4e9f51f3ff4a23",
      "shape": [
       32,
       32
@@ -2374,7 +2374,7 @@
     },
     "substrate.blocks.1.attns.nbr.wk.weight": {
      "dtype": "torch.float32",
-     "hash": "b38304e579f8a6b2",
+     "hash": "06262a32dbbd1298",
      "shape": [
       32,
       32
@@ -2382,7 +2382,7 @@
     },
     "substrate.blocks.1.attns.nbr.wo.weight": {
      "dtype": "torch.float32",
-     "hash": "0e05f53e324c4dbe",
+     "hash": "36ebb147371645a4",
      "shape": [
       32,
       32
@@ -2390,7 +2390,7 @@
     },
     "substrate.blocks.1.attns.nbr.wq.weight": {
      "dtype": "torch.float32",
-     "hash": "4e32282bd686ebfc",
+     "hash": "0e457423802b105c",
      "shape": [
       32,
       32
@@ -2398,7 +2398,7 @@
     },
     "substrate.blocks.1.attns.nbr.wv.weight": {
      "dtype": "torch.float32",
-     "hash": "598d07e0eff7bb1c",
+     "hash": "24c5458c205564fc",
      "shape": [
       32,
       32
@@ -2406,7 +2406,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "fba7d3b2e2d96ea1",
+     "hash": "4a7e284f036de502",
      "shape": [
       64,
       32
@@ -2414,7 +2414,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "d846c52484b0f1b4",
+     "hash": "c85dc741c762eea9",
      "shape": [
       32,
       64
@@ -2422,7 +2422,7 @@
     },
     "substrate.blocks.1.ffn.experts.0.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "f20f102bb1eb3c19",
+     "hash": "42c7ece16974d003",
      "shape": [
       64,
       32
@@ -2430,7 +2430,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "d3d6732e74dbec84",
+     "hash": "88c3824c84afd0cc",
      "shape": [
       64,
       32
@@ -2438,7 +2438,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "ef483b8d19a9b126",
+     "hash": "e2ff97505f80898f",
      "shape": [
       32,
       64
@@ -2446,7 +2446,7 @@
     },
     "substrate.blocks.1.ffn.experts.1.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "371ca033d74bfd2a",
+     "hash": "23ce6a72765f7288",
      "shape": [
       64,
       32
@@ -2454,7 +2454,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "0b8c82fd0b3f8d87",
+     "hash": "97451306ded0265a",
      "shape": [
       64,
       32
@@ -2462,7 +2462,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "8fd2c47158e46bd9",
+     "hash": "289ecba5c4abe293",
      "shape": [
       32,
       64
@@ -2470,7 +2470,7 @@
     },
     "substrate.blocks.1.ffn.experts.2.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "392f1d77994a0ed3",
+     "hash": "9aa7baa8f45ec310",
      "shape": [
       64,
       32
@@ -2478,7 +2478,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w1.weight": {
      "dtype": "torch.float32",
-     "hash": "f56b9a0b22769c49",
+     "hash": "a1f491c35fe33f06",
      "shape": [
       64,
       32
@@ -2486,7 +2486,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w2.weight": {
      "dtype": "torch.float32",
-     "hash": "f885a368fd2f6e41",
+     "hash": "8084ad15510db483",
      "shape": [
       32,
       64
@@ -2494,7 +2494,7 @@
     },
     "substrate.blocks.1.ffn.experts.3.w3.weight": {
      "dtype": "torch.float32",
-     "hash": "2a5037c5db63846f",
+     "hash": "594ff44346121a79",
      "shape": [
       64,
       32
@@ -2502,7 +2502,7 @@
     },
     "substrate.blocks.1.ffn.router.weight": {
      "dtype": "torch.float32",
-     "hash": "053994f50d242a75",
+     "hash": "7c35ffb543fde971",
      "shape": [
       4,
       16
@@ -2510,51 +2510,51 @@
     },
     "substrate.blocks.1.norms.col.weight": {
      "dtype": "torch.float32",
-     "hash": "4c53cc43a8166d62",
+     "hash": "3933c99a3b2b897f",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.feat.weight": {
      "dtype": "torch.float32",
-     "hash": "c824421df5245879",
+     "hash": "2eea2cc7db1cf141",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.ffn.weight": {
      "dtype": "torch.float32",
-     "hash": "4e693714a791427d",
+     "hash": "2bbc75fda0ee3449",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.full.weight": {
      "dtype": "torch.float32",
-     "hash": "60a6475e6ee0e720",
+     "hash": "b75caf07fc464f63",
      "shape": [
       32
      ]
     },
     "substrate.blocks.1.norms.nbr.weight": {
      "dtype": "torch.float32",
-     "hash": "199f8b0fd7b4bdf8",
+     "hash": "24407e70c34b9338",
      "shape": [
       32
      ]
     },
     "substrate.norm_out.weight": {
      "dtype": "torch.float32",
-     "hash": "d3b7bc6c11cb3fca",
+     "hash": "7c72cb951f2f1dec",
      "shape": [
       32
      ]
     }
    },
    "train_losses": [
-    "0x1.8db1100000000p+0",
-    "0x1.6bc7340000000p+0",
-    "0x1.4e7d940000000p+0"
+    "0x1.8ea46c0000000p+0",
+    "0x1.6a10580000000p+0",
+    "0x1.42fc8c0000000p+0"
    ]
   }
  }

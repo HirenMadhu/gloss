@@ -26,12 +26,27 @@ def main() -> int:
     warnings.filterwarnings("ignore")
 
     from gloss.data.graph import build_gloss_graph
-    from gloss.train.finetune import name_embeddings
+    from gloss.text.schema import (
+        build_column_name_embeddings,
+        build_role_name_embeddings,
+        build_table_name_embeddings,
+    )
+    from gloss.train.finetune import _name_encoder
 
     for ds in args.datasets:
         bundle = build_gloss_graph(ds)
-        emb = name_embeddings(bundle, ds, encoder=args.encoder, d_text=args.d_text)
-        print(f"{ds}: name_emb {tuple(emb.shape)} cached (encoder={args.encoder})")
+        # ONE EmbeddingCache per (dataset, encoder), content-hash keyed per (kind, text) — so the
+        # three tables share a cache file and re-running only encodes strings that are missing.
+        enc = _name_encoder(ds, encoder=args.encoder, d_text=args.d_text)
+
+        col = build_column_name_embeddings(bundle, enc, kind="query")
+        # P0.4: the row level's counterparts. Name-DERIVED so an unseen schema works on day one —
+        # `n_tables` and K index frozen data, never a weight shape (changes.md §0).
+        tab = build_table_name_embeddings(bundle, enc, kind="query")
+        role = build_role_name_embeddings(bundle, enc, kind="query")
+
+        print(f"{ds}: col {tuple(col.shape)}  table {tuple(tab.shape)}  role {tuple(role.shape)}"
+              f"  (encoder={args.encoder}, K={bundle.num_roles})")
     return 0
 
 
