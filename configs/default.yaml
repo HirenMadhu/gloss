@@ -12,6 +12,8 @@ data:
   collate:
     seq_len: 512               # fixed cell-token cap per seed; rel-f1 max≈353 cells/seed -> 0% truncation
     max_fk: 5                  # max foreign-key neighbors per row (RT f2p_nbr width)
+    max_rows: 160              # R — rows per seed (row-graph axis). ASSERTED, never clamped; it is
+                               # fanout-coupled, so re-measure before raising data.sampler.num_neighbors
 
 # MoE FFN. `route_on` picks the router input (the load-bearing ablation axis); the S/C/P/H additions
 # are OFF by default so the base arm == plain RT + top-k MoE. `run_train.py` / `run_ablation.py` flags

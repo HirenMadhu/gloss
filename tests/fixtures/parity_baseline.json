@@ -1,9 +1,9 @@
 {
  "_doc": "Bit-for-bit parity baseline of the pre-refactor `arch: rt` MoRE (changes.md \u00a76 / \u00a79.7). Captured on a frozen, self-contained synthetic fixture (tests/fixtures/parity_fixture.py) that deliberately does NOT depend on tests/conftest.py, because the fingerprint is exact and any unrelated fixture edit would otherwise read as a parity regression. Regenerate ONLY deliberately: scripts/capture_parity_baseline.py --force.",
- "captured_utc": "2026-07-29T19:13:56+00:00",
+ "captured_utc": "2026-07-29T19:25:52+00:00",
  "env": {
   "fixture_version": "parity-fixture-v1",
-  "git_commit": "705d96f5d1a42a7198ef561539e75c0accd2cc4b",
+  "git_commit": "83c0d8f55e5459d2f29f77baa871f0fe0abd4229",
   "seed": 0,
   "torch": "2.8.0+cu128",
   "torch_frame": "0.3.0"

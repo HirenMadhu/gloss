@@ -267,8 +267,19 @@ get an unused row. Cheap now; silently corrupting later.
 - `adj_role` is consistent: `adj_role[b,r,s] in [1,K]` iff
   `adj_role[b,s,r] in [K+1,2K]`.
 - Every non-root valid row has at least one edge.
-- `row_time[b,r] <= seed_time[b]` for all valid `r`. This is the leakage assert;
-  it must never be relaxed.
+- `row_time[b,r] <= seed_time[b]` for all valid **non-root, timed** `r`. This is the
+  leakage assert; it must never be relaxed — but it **must** be scoped, and the
+  earlier unscoped wording was wrong on real data:
+  - gate on `row_is_timed`, because untimed rows carry the sentinel `0` while real
+    UNIX seconds go negative (rel-f1 starts in 1950), so an ungated compare flags
+    every untimed row;
+  - gate on `~row_is_root`, because the root **is** the query entity and RelBench
+    includes its row regardless of its own timestamp. Measured on
+    rel-event/`user-attendance`: **35.0%** of task rows have the `users` row's own
+    time *after* the seed time (median +9.7 d, worst +152 d). Unscoped, this assert
+    fires on a third of rel-event and reads as a bug in our code.
+
+  Neighbour leakage — the thing that would actually be wrong — stays fully covered.
 - Row count from `adj_role` matches `num_rows` matches
   `node_idxs.unique()` per seed.
 - Modality ids are bundle-independent: the id of a given stype is identical
@@ -797,8 +808,14 @@ New tests, all must pass before Phase 0a is declared done.
   `measure_substrate.py` now reports `untimed %` per dataset, so use the measured
   rel-event figure instead of the retired one.)
 - `τ` and the ladder are finite for `Δ = 0` and for `Δ = max` observed, and
-  `τ ∈ [0, 22]` on all three datasets — the universal range of §3.1. A value
-  outside it means Δ is not in seconds.
+  `τ ∈ [0, 22]` on all three datasets — the universal range of §3.1.
+
+  **Keep this assert; widen its rationale.** The earlier wording said a value outside
+  the band "means Δ is not in seconds." It is a broader *validity* alarm than that,
+  and it has already earned its place by catching something else: rel-event measured
+  **τ = 23.08**, not from a unit error but from missing timestamps (see §9.9). Read a
+  breach as "something upstream is wrong with this dataset's time column", then
+  diagnose — do not assume units.
 
 **No dataset-specific artifact** (the standing guard for the FM claim)
 - Walk `state_dict()`: assert no entry's shape depends on `K` (role count), on
@@ -906,6 +923,63 @@ gate rather than running the full cross product.
    the §6 bit-for-bit parity guard. Capture the `arch: rt` parity baseline
    **before** P0.5 lands, or the strongest regression guard in the plan is
    unavailable for the rest of the refactor.
-8. **Ladder constants.** `[0.05, 5.0]` and `n_freq = 8` are derived from the
-   0–22 range, not measured. Check them against the observed Δ histogram per
-   dataset before Phase 1 and adjust if the resolved band misses the mass.
+8. **Ladder constants — MEASURED, and `[0.05, 5.0]` is WRONG.** The band was
+   derived from τ's *range* `[0, 22]`. What the frequencies must resolve is τ's
+   **spread**, and the spread is an order of magnitude smaller:
+
+   | dataset | τ mean | τ **std** | dead channels (`var(sin ωτ) < 0.01`) |
+   |---|---|---|---|
+   | rel-f1 | 16.25 | **1.61** | ω = 0.050, 0.097 |
+   | rel-trial | 17.57 | **1.59** | ω = 0.050, 0.097 |
+   | rel-event | 14.03 | **1.90** | ω = 0.050 |
+
+   Every seed sits at τ ≈ 14–18 with σ ≈ 1.6–1.9, so the two lowest channels vary
+   by < 0.1 rad across the entire corpus — **2 of 8 channels are dead weight** on
+   two of three DBs. Measured-healthy channels begin around ω ≈ 0.35–0.7.
+   Re-derive `ω_min` from σ, not from the range, before Phase 1. Note this does
+   *not* threaten §0: the frequencies stay fixed constants chosen once from
+   corpus-wide statistics, not per-database fitted parameters — but say so
+   explicitly in the write-up, because "chosen by looking at the data" invites
+   exactly that objection.
+
+   §7's per-frequency utilisation logging is what should keep this honest on a
+   transfer DB; it is now known to be load-bearing rather than nice-to-have.
+
+9. **Missing timestamps — RESOLVED, and it was a live bug.** RelBench's
+   `to_unix_time` maps pandas `NaT` to `pd.Timestamp.min.value // 1e9` =
+   **-9223372037**, which reads as 1677-09-21. The sentinel is *finite*, so
+   nothing downstream flagged it, and `collate.py` marked `is_timed = True` for
+   every row of a *timed table* — so a row with no timestamp encoded as "≈336
+   years before the seed" rather than "time unknown". That is the source of
+   rel-event's τ = 23.08.
+
+   Confirmed by exact count match on rel-event: `event_attendees` 64,918 NaT ↔
+   64,918 negative timestamps; `users` 58 ↔ 58; `events` 3 NaT ↔ 4 negatives
+   (one genuinely corrupt row). `events` also reaches **2222-02-02** — future
+   garbage, excluded from neighbour sampling by the `time_attr` filter and
+   clamped to Δ = 0 if it reaches a cell.
+
+   Fixed in `collate.py` with a per-**row** plausibility gate (floor
+   1800-01-01 = `-5364662400`, below rel-f1's genuine 1950 data and above the
+   sentinel): such rows become `is_timed = False`, `row_time = 0`. The row is
+   **reclassified, never dropped**, so what gets sampled is unchanged and
+   comparability with the benchmark is preserved.
+
+   **Consequence for the corpus:** ~65k rel-event rows previously carried a
+   bogus τ ≈ 23. Any pre-existing rel-event number was computed under the buggy
+   handling, so treat the 27-run qwen baseline as the first valid rel-event
+   reference and do not mix it with older rel-event results.
+
+   Related, same family: §9.6 already warns that `to_unix_time`'s integer-dtype
+   branch passes integers through *unconverted*. Both are unit/sentinel
+   assumptions that fail silently; the §6 τ-range assert is the one guard that
+   catches either.
+
+10. **Seed-row Δ clamps to 0 — an open design question, not a bug.** Because 35%
+    of rel-event seeds have the root row dated after the seed time (§P0.6), and
+    `Δ = max(0, t* − t_r)`, those seed cells get **τ = 0 — indistinguishable from
+    "happened right now."** "This is the query row" and "this is maximally
+    recent" are different statements, and the design collapses them. Structurally
+    the same argument §3.1 makes for `b_untimed` (θ = 0 alone being wrong for
+    untimed rows), so the same remedy is available: a learned root flag. Not
+    changed; decide during Phase 1.

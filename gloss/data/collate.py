@@ -32,6 +32,21 @@ from torch import Tensor
 from .graph import FK_NONE, GraphBundle, is_forward_relation
 from .row_graph import build_row_graph
 
+# RelBench's ``to_unix_time`` maps a MISSING timestamp (pandas ``NaT``) to
+# ``pd.Timestamp.min.value // 1e9`` — the exact integer below, which reads as 1677-09-21. It is a
+# sentinel, not a date, and it is *finite*, so nothing downstream flags it: the cell silently
+# encodes as "≈336 years before the seed" instead of "time unknown". Measured on rel-event, where
+# the NaT counts match the negative-timestamp counts exactly (event_attendees 64918, users 58):
+# it drives tau = log1p(Delta) to 23.08, outside the [0, 22] band changes.md §3.1 asserts is
+# universal — which is how it was caught.
+NAT_UNIX_SENTINEL = -9223372037           # == pd.Timestamp.min.value // 10**9
+
+# Plausibility floor for a real relational timestamp: 1800-01-01. Comfortably below the oldest
+# genuine data here (rel-f1 starts in 1950 => -631152000) and comfortably above the NaT sentinel,
+# so it catches that sentinel plus any similarly corrupt far-past value (rel-event's `events`
+# table has one extra negative row beyond its 3 NaTs) without touching real dates.
+UNTIMED_FLOOR = -5364662400.0             # == pd.Timestamp("1800-01-01").value // 10**9
+
 PAD = -1
 MAX_ROWS = 160  # R — default cap on rows per seed (changes.md P0.2; assert, never clamp)
 
@@ -195,8 +210,13 @@ def to_cell_batch(
         seg_list.append(st.batch.to(torch.long))
         ntype_list.append(torch.full((n,), bundle.node_type_id[nt], dtype=torch.long))
         if "time" in st:
-            rowt_list.append(st.time.to(torch.float64))
-            timed_list.append(torch.ones(n, dtype=torch.bool))
+            # A timed TABLE can still hold rows with a MISSING timestamp, and those must be marked
+            # untimed per-row rather than inheriting the table's blanket ``is_timed=True``. See
+            # NAT_UNIX_SENTINEL below: left as-is they arrive as a *finite* date in 1677.
+            t = st.time.to(torch.float64)
+            plausible = t > UNTIMED_FLOOR
+            rowt_list.append(torch.where(plausible, t, torch.zeros_like(t)))
+            timed_list.append(plausible)
         else:
             rowt_list.append(torch.zeros(n, dtype=torch.float64))
             timed_list.append(torch.zeros(n, dtype=torch.bool))

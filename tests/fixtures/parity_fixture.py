@@ -127,14 +127,17 @@ def _materialize(rows: dict) -> tuple[object, dict]:
 def frozen_bundle():
     """The frozen dual-FK ``GraphBundle``.
 
-    The vocabularies are built inline rather than via ``graph._build_vocabs`` so that a P0.1 change to
-    the role vocabulary cannot silently move this baseline. (``fk_role_id`` is consumed nowhere outside
-    ``graph.py``, so it reaches no weight shape either way — but the guard should not depend on that
-    staying true.)
+    The *data* (schema, row values, stats) is frozen here; the FK **role vocabulary** is delegated to
+    ``graph._build_vocabs`` on purpose. The role vocabulary is a library concern that P0.1 is actively
+    reshaping (column key -> ``(child, column, parent)`` triple), and a stale hand-rolled copy would
+    silently desync from the row-graph builder that consumes it. Delegating is safe for a bit-for-bit
+    guard because ``fk_role_id`` / ``metapath_id`` reach **no weight shape and no fingerprinted field**
+    — nothing below hashes them, and §0's no-dataset-artifact rule forbids ``K`` from entering any
+    parameter. If that ever stops being true, this call must be frozen too.
     """
     from torch_geometric.data import HeteroData
 
-    from gloss.data.graph import GraphBundle
+    from gloss.data.graph import GraphBundle, _build_vocabs
 
     cust_tf, cust_stats = _materialize(CUSTOMER_ROWS)
     txn_tf, txn_stats = _materialize(TXN_ROWS)
@@ -143,10 +146,7 @@ def frozen_bundle():
     data["customer"].tf = cust_tf
     data["txn"].tf = txn_tf
 
-    node_type_id = {nt: i for i, nt in enumerate(sorted(NODE_TYPES))}
-    roles = sorted({"buyer", "seller"})
-    fk_role_id = {c: i + 1 for i, c in enumerate(roles)}
-    metapath_id = {c: i + 3 for i, c in enumerate(roles)}
+    node_type_id, fk_role_id, metapath_id = _build_vocabs(list(NODE_TYPES), list(EDGE_TYPES))
 
     bundle = GraphBundle(
         dataset_name="parity-frozen",

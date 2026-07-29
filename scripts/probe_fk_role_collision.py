@@ -1,13 +1,15 @@
 """probe_fk_role_collision.py — is changes.md P0.1 fixing a LIVE bug or a latent one?
 
-`graph.py:_build_vocabs` keys `fk_role_id` on the FK **column name alone**
+The retired vocabulary keyed `fk_role_id` on the FK **column name alone**
 (``cols = sorted({canonical_relation(rel) for (_, rel, _) in edge_types})``). Its docstring's
-claim that "two FKs into one table stay distinct" is true but answers a different question: two
-FK columns that happen to *share a name* in *different child tables* collide onto one role id.
+claim that "two FKs into one table stay distinct" was true but answered a different question: two
+FK columns that happen to *share a name* in *different child tables* collided onto one role id.
 
-changes.md P0.1 specifies role ids over the triple ``(child_table, fk_column, parent_table)``.
-This script reports, per database, how many role ids the two keyings produce — a gap means the
-collision is live and P0.1 changes behaviour rather than merely tightening a definition.
+changes.md P0.1 specifies role ids over the triple ``(child_table, fk_column, parent_table)``, which
+is what `graph.py:_build_vocabs` now builds. This script reports, per database, the role count under
+each keying — the gap is the size of the bug that was fixed — and then **checks the live vocabulary**:
+it rebuilds the PyG edge types the way ``make_pkey_fkey_graph`` names them and asserts
+``_build_vocabs`` yields one id per FK edge.
 
 Reads only the RelBench schema (no graph build, no sampling).
 
@@ -27,23 +29,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def probe(dataset: str) -> None:
     from relbench.datasets import get_dataset
 
+    from gloss.data.graph import _build_vocabs
+
     db = get_dataset(dataset, download=True).get_db(upto_test_timestamp=False)
 
     by_col: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     triples: set[tuple[str, str, str]] = set()
+    node_types: set[str] = set(db.table_dict)
+    edge_types: list[tuple[str, str, str]] = []
     for child, table in db.table_dict.items():
         for fk_col, parent in table.fkey_col_to_pkey_table.items():
             by_col[fk_col].append((child, fk_col, parent))
             triples.add((child, fk_col, parent))
+            # exactly how relbench.modeling.graph.make_pkey_fkey_graph names the two directions
+            edge_types.append((child, f"f2p_{fk_col}", parent))
+            edge_types.append((parent, f"rev_f2p_{fk_col}", child))
 
     n_col_keyed = len(by_col)
     n_triple_keyed = len(triples)
     collisions = {c: v for c, v in by_col.items() if len(v) > 1}
 
+    _, fk_role_id, _ = _build_vocabs(sorted(node_types), edge_types)
+    n_built = len(fk_role_id)
+
     print(f"=== {dataset}")
     print(f"  FK edges (child, col, parent)      {n_triple_keyed}")
-    print(f"  distinct role ids, CURRENT (col)   {n_col_keyed}")
+    print(f"  distinct role ids, RETIRED (col)   {n_col_keyed}")
     print(f"  distinct role ids, P0.1 (triple)   {n_triple_keyed}")
+    print(f"  distinct role ids, _build_vocabs   {n_built}"
+          f"   {'OK' if n_built == n_triple_keyed else 'MISMATCH'}")
+    assert n_built == n_triple_keyed, "graph.py role vocabulary does not match the schema triples"
+    assert set(fk_role_id) == triples, "role keys are not the (child, col, parent) triples"
+    assert sorted(fk_role_id.values()) == list(range(1, n_built + 1)), "role ids are not 1..K"
     if collisions:
         print(f"  LIVE COLLISION — {len(collisions)} column name(s) shared across child tables:")
         for c, v in sorted(collisions.items()):
