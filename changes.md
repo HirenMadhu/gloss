@@ -4,8 +4,14 @@ Target: replace the flat cell-token RT substrate with a two-level (cell, row)
 substrate that carries time and schema structure into attention.
 
 Scope of this document is the **encoder only**. No LLM, no projector, no TabQA.
-Evaluation is RelBench entity tasks on rel-f1, rel-trial, rel-stack via the
+Evaluation is RelBench entity tasks on rel-f1, rel-trial, rel-event via the
 existing linear head.
+
+> **DB3 is rel-event, not rel-stack.** `eval/ablation.py:LEADERBOARD_TASKS` has no rel-stack
+> entry and never did; every run this repo has executed (`recap.md`) used rel-f1 / rel-trial /
+> rel-event. Earlier drafts of this document said rel-stack throughout, and two of its
+> conclusions were derived from that mistake — the P0.4 encoder decision and the §6 untimed-cell
+> test. Both are corrected below.
 
 Read `report.md` (the codebase investigation) before starting. Every file:line
 reference below is from that report against commit `2403be4` on `main`; verify
@@ -105,7 +111,7 @@ New `CellBatch` fields. `R = max_rows_per_seed`, config, assert not exceeded.
 |---|---|---|---|---|---|---|
 | rel-f1 | driver-dnf | 34.0 | 50 | 63 | **65** | 69 |
 | rel-trial | site-success | 11.9 | 25 | 25 | **25** | 63 |
-| rel-stack | — | *pending* | | | | 139 |
+| rel-event | user-repeat | *pending* | | | | — |
 
 `R = 160` stands, with generous margin at this fanout. **But note the assert is
 fanout-coupled**: Phase 5 sweeps `num_neighbors` up to `[32,16]`, which raises
@@ -173,20 +179,38 @@ Two facts this branch inherits, both verified against the cache on disk:
   (2560) and `harrier` (`microsoft/harrier-oss-v1-27b`, 5376) only. The report's
   "hash encoder" environment note is stale or refers to instrumentation runs.
 - **The existing baselines are `harrier`, not qwen** (`recap.md:44`;
-  `run_gridsearch.py` header). Coverage is uneven: rel-f1 has both, rel-trial
-  has harrier only, rel-stack has qwen only — no encoder covers all three.
+  `run_gridsearch.py` header).
 
-Consequences of choosing qwen, both mandatory:
+**Coverage, corrected for DB3 = rel-event:**
 
-1. **Build the rel-trial qwen cache** before any 9-task run.
-   `scripts/build_schema_cache.py` defaults to qwen and is content-hash keyed,
-   so re-running over all three datasets computes only what is missing.
-2. **Every number in `recap.md` is a harrier number and is not a valid
-   reference for this branch.** Phase 0a's acceptance ("within 1 std of the
-   current RT+MoE numbers") therefore needs a **fresh qwen baseline of the
-   current architecture on all 9 tasks × 3 seeds** first. Budget it: without it,
-   Phase 0a's gate compares against a different encoder and means nothing.
-   This baseline doubles as the §6 parity reference — capture it before P0.5.
+| dataset | harrier (5376) | qwen (2560) |
+|---|---|---|
+| rel-f1 | ✅ | ✅ |
+| rel-trial | ✅ | — |
+| rel-event | ✅ | — |
+
+An earlier draft argued "no encoder covers all three, therefore build qwen." That
+was reasoning about **rel-stack**, and it is void: **harrier already covers all
+three leaderboard databases.** The decision was re-put on the corrected coverage
+and **qwen was reaffirmed**, so the two consequences below are real, accepted
+costs — not oversights:
+
+1. **Build the rel-trial and rel-event qwen caches** before any 9-task run.
+   `scripts/build_schema_cache.py` is content-hash keyed and now defaults to the
+   three leaderboard DBs, so rel-f1 is a no-op. Submitted as SLURM `29029232`.
+2. **Every number in `recap.md` is a harrier number and is not a valid reference
+   for this branch.** Phase 0a's acceptance ("within 1 std of the current RT+MoE
+   numbers") therefore needs a **fresh qwen baseline of the current architecture
+   on all 9 tasks × 3 seeds** — 27 runs — before it can be judged. It doubles as
+   the §6 parity reference, so it is not wasted, but it lands before any new code
+   means anything.
+
+   The harrier alternative, recorded because it was declined rather than missed:
+   `results/v2_add_signature/*_signature.json` is **already** exactly those 27
+   records (9 leaderboard tasks × 3 seeds, base `signature` router, current
+   architecture, harrier), so on harrier the Phase 0a gate would have cost zero
+   GPU-hours. Nothing about §0's foundation-model rule distinguishes the two —
+   both are frozen name encoders, both recomputable on an unseen schema.
 
 ### P0.5 Pin the modality (stype) id space
 
@@ -195,7 +219,7 @@ docstring states the id space is *"the set of stypes actually present in this
 bundle (sorted by name for determinism), not a fixed enum — so `stype_emb` is
 sized to the dataset."* That makes both the id *meanings* and `stype_emb`'s
 *shape* dataset-dependent: `numerical` can be id 1 on rel-f1 and id 2 on
-rel-stack, and a checkpoint trained on one bundle silently mis-indexes on
+rel-event, and a checkpoint trained on one bundle silently mis-indexes on
 another.
 
 Pin to the full pytorch-frame stype enum in a fixed, declared order, with
@@ -667,8 +691,9 @@ at `seq_len ∈ {512, 1024}`.
 
 Measure pre-truncation cells per seed **before** committing to a config, and
 report the binding fraction. rel-f1's true p90 1-hop degree is 19.7, so 24
-covers most of the distribution; rel-stack's true degrees reach 32k and nothing
-in this run helps it.
+covers most of the distribution. The "true degrees reach 32k" caveat in earlier
+drafts was about **rel-stack** and does not carry over — re-measure rel-event's
+degree distribution before this phase rather than inheriting the claim.
 
 **Accept:** report the accuracy/fanout curve. This is a strong figure regardless
 of which direction it goes.
@@ -705,7 +730,9 @@ New tests, all must pass before Phase 0a is declared done.
   approximation there is correct behaviour, not a defect.
 - Untimed rows: `θ = 0`, the `b_untimed` path is exercised, and it is *not*
   equivalent to `Δ = 0` (assert the logits differ). rel-trial has 27% untimed
-  cells; rel-stack has 0%, so test on rel-trial.
+  cells, so test on rel-trial. (The old "rel-stack has 0%" contrast is void;
+  `measure_substrate.py` now reports `untimed %` per dataset, so use the measured
+  rel-event figure instead of the retired one.)
 - `τ` and the ladder are finite for `Δ = 0` and for `Δ = max` observed, and
   `τ ∈ [0, 22]` on all three datasets — the universal range of §3.1. A value
   outside it means Δ is not in seconds.
@@ -716,7 +743,7 @@ New tests, all must pass before Phase 0a is declared done.
   a statistic fitted on the data. `ω` is present but constant — assert it is
   byte-identical across two models built on different datasets.
 - Assert `stype_emb.num_embeddings` and every stype id are identical across
-  rel-f1, rel-trial and rel-stack (P0.5).
+  rel-f1, rel-trial and rel-event (P0.5).
 - A model built on rel-f1 loads a rel-trial bundle's schema tables without any
   shape mismatch. This is the cheapest possible proxy for the deferred LODO
   transfer run and it costs seconds.
@@ -761,7 +788,11 @@ release you are pinned to before starting):
 
 - rel-f1: driver-dnf, driver-top3, driver-position
 - rel-trial: study-outcome, study-adverse, site-success
-- rel-stack: user-engagement, user-badge, post-votes
+- rel-event: user-repeat, user-ignore, user-attendance
+
+Taken verbatim from `eval/ablation.py:LEADERBOARD_TASKS`, which is the list every
+existing run used and the only one with an RT baseline to compare against
+(`results/rt_from_scratch_baseline.json`). §9.3 is resolved by this.
 
 Three seeds per config. TEST metrics are the reported result; select on VAL.
 Report mean ± std always. Deltas in this literature are frequently smaller than
@@ -783,10 +814,22 @@ gate rather than running the full cross product.
    against the seed? Determines whether Phase 1 `t4` exists.
 3. **Task list.** Pin the RelBench version and confirm the nine tasks.
 4. **`R = 160`.** Verify against a full epoch of each dataset, not a sample. The
-   report's rel-stack figures are over 2,560 seeds, not the full 1.36M.
-5. **Row-level bias memory.** `[B,H,R,R]` at `B=64, H=8, R=160` is ~52 MB fp32
-   per block. Confirm it fits alongside activations on the A40, or move to fp16
-   / reduce `R`.
+   measured figures below are over 768 seeds per dataset, not a full epoch.
+5. **Row-level bias memory — RESOLVED: a non-issue, and the worry was aimed at
+   the wrong level.** `[B,H,R,R]` at `B=64, H=8, R=160` fp32 is
+   `64·8·160·160·4 = 52.4 MB` per block, so ~0.6–0.9 GB across 6 blocks counting
+   the scores plus the softmax output saved for backward. The **cell** attention
+   at `S=512` is `64·8·512·512·4 = 537 MB` for a *single* score matrix —
+   `(512/160)² = 10.2×` larger per block, and today there are four of them per
+   block. Row attention is ~2% of the block's attention memory; Phase 0b's
+   4-masks-to-1 collapse is where the memory actually moves. No fp16, no reduced
+   `R`.
+
+   Implementation contract that keeps it that way: §3.5's `γ` is name-derived, so
+   compute a per-`(head, role)` scalar table `[H, K]` once per forward from the
+   frozen name embeddings, then **gather** it with `adj_role` and add in place
+   into the score tensor. Never materialise `γ` as a separate `[B,H,R,R]`
+   parameter — `K` must not appear in any weight shape (§0).
 6. **Timestamp units — RESOLVED: already UNIX seconds.** RelBench's
    `to_unix_time` (`relbench/modeling/utils.py:11-27`) floor-divides ns by 1e9,
    and `collate.py:155,230` carries the result through as float64. §3.1's
