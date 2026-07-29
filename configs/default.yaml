@@ -36,11 +36,50 @@ moe:
   k2: 1                        #    HMoE: within-group top-k2
 
 model:
+  arch: rt                     # rt | two_level   (rt = the current substrate; the A/B baseline)
   d_model: 256
   n_heads: 8
   n_blocks: 8                  # RelationalBlocks (each = col/feat/nbr/full attention + SwiGLU FFN)
   d_ff: 1024                   # SwiGLU inner dim (null -> 4*d_model)
   enc_channels: 256            # pytorch-frame stype-encoder out channels
+
+  # --- two-level (cell, row) encoder. Ignored entirely when arch: rt. changes.md §4. ---
+  # Defaults below are PHASE 0a: row tokens added, cell level still behaving exactly like RT
+  # (four_mask + no cell RoPE + bucket recency), row biases off, mean pooling, dense row FFN.
+  # That is what isolates the row-token addition; later phases flip one switch at a time.
+  two_level:
+    d_sig: 128                 # row-signature width (shares the value of moe.d_sig by convention)
+    max_hop: 8                 # row_hop embedding size; a small universal integer, legal under §0
+    cell:
+      attention: four_mask     # four_mask (Phase 0a) | full (Phase 0b: 4 score matrices -> 1)
+      rope_time: false         # Phase 1 t2 turns this on
+      # cell.ffn is NOT a switch here: it follows moe.route_on, because the cell MoE is the EXISTING
+      # mechanism and stays unchanged. The MoE lives at BOTH levels (§3.7).
+    row:
+      pool_query: mean         # mean (Phase 0a) | signature | hidden | hybrid   (Phase 3 sweeps these)
+      pool_slots: 4
+      role_bias: none          # none (Phase 0a) | name_derived (Phase 2 s1). id_lookup is REMOVED (§3.5)
+      time_bias: none          # none (Phase 0a) | rope (t3) | fixed_basis (t3b)
+      ffn: dense               # dense | moe   (Phase 4 r1 turns the ROW MoE on; cell MoE stays on)
+      num_experts: 4
+      top_k: 2
+      lambda_ortho: 0.5
+      lambda_balance: 0.01     # M·Σ_e f_e p_e, over VALID rows only
+    broadcast: additive        # additive | film | none
+    head:
+      mode: row_token          # row_token (§3.8) | seed_cells (kept for the Phase 0 parity check)
+
+time:
+  mode: buckets                # buckets (current, and REQUIRED by Phase 0a) | rope (Phase 1 t1+)
+  unit: seconds                # canonical, not configurable per dataset — §3.1
+  n_freq: 8
+  # MEASURED band, not the [0.05, 5.0] changes.md first specified: tau's SPREAD is sigma≈1.6-1.9
+  # (mean 14-18), so omega=0.05 varied by 0.08 rad across the whole corpus and 2 of 8 channels were
+  # dead. Fixed constants in a non-persistent buffer — never learned.
+  omega: [0.3, 5.0]
+  causal_paths: false          # Phase 1 t4. NOTE: measured to be a SAMPLER change, not a mask change
+                               # (rel-event: 55% of hop-adjacent pairs have the child LATER than its
+                               # parent), so this flag is not yet implementable as written.
 
 train:
   batch_size: 64

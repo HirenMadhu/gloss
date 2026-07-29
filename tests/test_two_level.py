@@ -13,6 +13,7 @@ from gloss.model.heads import EntityHead, RowTokenHead
 from gloss.model.two_level import CellAttention, TwoLevelBlock, TwoLevelSubstrate
 from gloss.model.time_encoding import TimeLadder
 
+from .conftest import rel_f1_available
 from .test_row_level import D_MODEL, D_SIG, D_TEXT, _tables, stub_batch
 
 D_FF, N_HEADS, N_BLOCKS = 2 * D_MODEL, 4, 2
@@ -236,3 +237,94 @@ def test_grad_flows_through_both_levels():
         p = named[key]
         assert p.grad is not None, f"no grad reached {key}"
         assert torch.isfinite(p.grad).all(), f"non-finite grad at {key}"
+
+
+# ---- MoRE wiring: arch='two_level' end to end on real rel-f1 data ----
+
+
+def _two_level_tables(bundle):
+    from gloss.text.cache import HashEncoder
+    from gloss.text.schema import (
+        build_table_name_embeddings,
+        role_name_embeddings_with_none,
+    )
+
+    enc = HashEncoder(dim=32)
+    return (build_table_name_embeddings(bundle, enc),
+            role_name_embeddings_with_none(bundle, enc))
+
+
+@rel_f1_available
+def test_more_two_level_forward_phase0a():
+    """Phase 0a: row tokens added, cell level still RT. The gate config in configs/default.yaml."""
+    from gloss.model.more import MoRE
+
+    from ._relf1 import name_table, sample_cell_batch
+    bundle, _task, cb = sample_cell_batch(seq_len=256, batch_size=8)
+    tab, role = _two_level_tables(bundle)
+    model = MoRE(bundle, name_table(), d_model=64, d_sig=32, n_blocks=2, n_heads=4,
+                 d_ff=128, enc_channels=64, route_on="signature", num_experts=4, k=2,
+                 arch="two_level", table_name_emb=tab, role_name_emb=role,
+                 cell_attention="four_mask", cell_rope_time=False,
+                 pool_query="mean", role_bias="none", time_bias="none", row_ffn="dense")
+    logits, aux = model(cb)
+    assert logits.shape == (cb.num_seeds, 1)
+    assert torch.isfinite(logits).all() and torch.isfinite(aux)
+    assert float(aux) > 0.0, "the CELL MoE should still contribute aux in Phase 0a"
+
+
+@rel_f1_available
+def test_more_two_level_full_design():
+    """The design config: cell RoPE + one full attention + row biases + MoE at BOTH levels."""
+    from gloss.model.more import MoRE
+
+    from ._relf1 import name_table, sample_cell_batch
+
+    bundle, _task, cb = sample_cell_batch(seq_len=256, batch_size=8)
+    tab, role = _two_level_tables(bundle)
+    model = MoRE(bundle, name_table(), d_model=64, d_sig=32, n_blocks=2, n_heads=4,
+                 d_ff=128, enc_channels=64, route_on="signature", num_experts=4, k=2,
+                 arch="two_level", table_name_emb=tab, role_name_emb=role,
+                 time_mode="rope",
+                 cell_attention="full", cell_rope_time=True,
+                 pool_query="hybrid", role_bias="name_derived", time_bias="rope",
+                 row_ffn="moe")
+    logits, aux = model(cb)
+    (logits.squeeze(-1).sum() + aux).backward()
+
+    assert logits.shape == (cb.num_seeds, 1)
+    assert torch.isfinite(logits).all()
+    # grads must reach BOTH routers — cell and row — since the MoE is at both levels
+    cell_router = model.substrate.blocks[0].cell_ffn.router.weight.grad
+    row_router = model.substrate.blocks[0].row_ffn.w_g.grad
+    assert cell_router is not None and cell_router.abs().sum() > 0, "cell router got no grad"
+    assert row_router is not None and row_router.abs().sum() > 0, "row router got no grad"
+
+
+@rel_f1_available
+def test_more_two_level_requires_p04_tables():
+    """arch='two_level' without P0.4's tables must fail loudly, not silently degrade."""
+    from gloss.model.more import MoRE
+
+    from ._relf1 import name_table, sample_cell_batch
+
+    bundle, _task, _cb = sample_cell_batch(seq_len=64, batch_size=2)
+    with pytest.raises(ValueError, match="table_name_emb"):
+        MoRE(bundle, name_table(), d_model=64, d_sig=32, n_blocks=1, n_heads=4,
+             d_ff=128, enc_channels=64, arch="two_level")
+
+
+@rel_f1_available
+def test_more_arch_rt_is_unchanged_by_the_two_level_additions():
+    """The A/B baseline must be untouched — this is what the §6 parity guard protects."""
+    from gloss.model.more import MoRE
+
+    from ._relf1 import name_table, sample_cell_batch
+
+    bundle, _task, cb = sample_cell_batch(seq_len=128, batch_size=4)
+    model = MoRE(bundle, name_table(), d_model=64, d_sig=32, n_blocks=2, n_heads=4,
+                 d_ff=128, enc_channels=64, route_on="signature")
+    assert model.arch == "rt" and model.head_mode == "seed_cells"
+    with torch.no_grad():
+        logits, aux = model(cb)
+    assert logits.shape == (cb.num_seeds, 1) and torch.isfinite(aux)

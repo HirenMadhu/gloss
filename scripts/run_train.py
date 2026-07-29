@@ -45,6 +45,8 @@ def main() -> int:
     ap.add_argument("--train", action="store_true", help="train one arm + report val metrics")
     ap.add_argument("--encoder", default="hash", choices=["qwen", "hash"],
                     help="frozen encoder for the column-name table (hash=dev, qwen=real)")
+    ap.add_argument("--arch", default="rt", choices=["rt", "two_level"],
+                    help="rt = the current substrate (A/B baseline); two_level = changes.md")
     ap.add_argument("--route-on", default="dense",
                     choices=["signature", "hybrid", "hidden", "value", "identity", "dense", "dense_wide"],
                     help="MoE routing arm (dense = plain RT; hybrid = signature+hidden)")
@@ -115,14 +117,85 @@ def _dry_run(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> i
     bad = int(((cb.row_time > st) & cb.is_timed & ~cb.is_padding).sum())
     print(f"leakage check (row_time > seed_time): {bad}")
 
+    if args.arch == "two_level":
+        print(f"row graph: num_rows max {int(cb.num_rows.max())} of R={cb.row_valid.shape[1]}"
+              f"  hop max {int(cb.row_hop.max())}"
+              f"  distinct in-roles {int(cb.row_in_role.unique().numel())}")
+        # the row-level leakage assert must be scoped: untimed rows carry sentinel 0 and real UNIX
+        # seconds go negative, and the ROOT is the query entity, which RelBench includes regardless
+        # of its own timestamp (35% of rel-event task rows are dated after their seed).
+        rbad = int(((cb.row_time_r > cb.seed_time.unsqueeze(1)) & cb.row_is_timed
+                    & cb.row_valid & ~cb.row_is_root).sum())
+        print(f"row leakage check (non-root timed rows after seed): {rbad}")
+
     name_emb = name_embeddings(bundle, dataset, encoder=args.encoder, d_text=64)
+    extra = {}
+    if args.arch == "two_level":
+        from gloss.text.cache import HashEncoder
+        from gloss.text.schema import (
+            build_table_name_embeddings,
+            role_name_embeddings_with_none,
+        )
+
+        enc = HashEncoder(dim=64) if args.encoder == "hash" else _name_enc(dataset, args)
+        extra = {
+            "arch": "two_level",
+            "table_name_emb": build_table_name_embeddings(bundle, enc),
+            "role_name_emb": role_name_embeddings_with_none(bundle, enc),
+            **_two_level_kwargs(cfg),
+        }
+
     model = MoRE(bundle, name_emb, d_model=128, d_sig=64, n_blocks=2, n_heads=4, d_ff=256,
-                 enc_channels=128, route_on="signature")
+                 enc_channels=128, route_on="signature", **extra)
     with torch.no_grad():
         logits, aux = model(cb)
-    print(f"forward OK: logits {tuple(logits.shape)}  finite={bool(torch.isfinite(logits).all())}  "
-          f"aux={float(aux):.4f}")
+    print(f"forward OK ({args.arch}): logits {tuple(logits.shape)}  "
+          f"finite={bool(torch.isfinite(logits).all())}  aux={float(aux):.4f}")
     return 0
+
+
+
+def _name_enc(dataset: str, args):
+    """The frozen encoder for the table/role name tables (P0.4), matching --encoder."""
+    from gloss.train.finetune import _name_encoder
+
+    return _name_encoder(dataset, encoder=args.encoder,
+                         d_text=2560 if args.encoder == "qwen" else 64)
+
+
+def _two_level_kwargs(cfg) -> dict:
+    """Flatten `model.two_level` (changes.md §4) into MoRE/TwoLevelSubstrate kwargs.
+
+    Config keys are grouped by level for readability; the modules take a flat kwarg list. Missing
+    sections fall back to the Phase 0a defaults, which is what makes `--arch two_level` alone
+    reproduce Phase 0a rather than the full design.
+    """
+    tl = getattr(getattr(cfg, "model", object()), "two_level", None)
+    if tl is None:
+        return {}
+    cell = getattr(tl, "cell", None)
+    row = getattr(tl, "row", None)
+    head = getattr(tl, "head", None)
+    out = {
+        "max_hop": int(getattr(tl, "max_hop", 8)),
+        "cell_attention": str(getattr(cell, "attention", "four_mask")),
+        "cell_rope_time": bool(getattr(cell, "rope_time", False)),
+        "pool_query": str(getattr(row, "pool_query", "mean")),
+        "pool_slots": int(getattr(row, "pool_slots", 4)),
+        "role_bias": str(getattr(row, "role_bias", "none")),
+        "time_bias": str(getattr(row, "time_bias", "none")),
+        "row_ffn": str(getattr(row, "ffn", "dense")),
+        "row_num_experts": int(getattr(row, "num_experts", 4)),
+        "row_k": int(getattr(row, "top_k", 2)),
+        "lambda_ortho": float(getattr(row, "lambda_ortho", 0.5)),
+        "lambda_balance": float(getattr(row, "lambda_balance", 0.01)),
+        "broadcast": str(getattr(tl, "broadcast", "additive")),
+        "head_mode": str(getattr(head, "mode", "row_token")),
+    }
+    t = getattr(cfg, "time", None)
+    if t is not None:
+        out["time_mode"] = str(getattr(t, "mode", "buckets"))
+    return out
 
 
 def _train(cfg, dataset, task_name, num_neighbors, seq_len, max_fk, args) -> int:
