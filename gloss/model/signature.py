@@ -28,10 +28,26 @@ _RECENCY_EDGES = [10.0 ** i for i in range(0, 19)]   # 1, 10, ..., 1e18
 
 
 class RelationalSignature(nn.Module):
-    def __init__(self, name_emb: Tensor, modality_id: Tensor, n_stypes: int, *, d_sig: int = 128):
+    """``time_mode`` selects the recency term (changes.md §3.1 / §3.3):
+
+    * ``buckets`` (default) — the 20 fixed log-decade bins above. **Phase 0a requires this**, so it
+      cannot be deleted yet despite §3.1 also saying "delete ``_RECENCY_EDGES``"; the two statements
+      contradict each other and this is the resolution.
+    * ``rope`` — the continuous :class:`~gloss.model.time_encoding.TimeLadder` read out as
+      ``[sin θ ; cos θ]`` behind a learned ``W_τ``. Phase 1 flips to this.
+
+    Both keep the signature **value-free** and invariant to which neighbours were sampled: τ depends
+    only on the cell's own timestamp and the seed time, and ω is a fixed constant.
+    """
+
+    def __init__(self, name_emb: Tensor, modality_id: Tensor, n_stypes: int, *, d_sig: int = 128,
+                 time_mode: str = "buckets", ladder=None):
         super().__init__()
+        if time_mode not in ("buckets", "rope"):
+            raise ValueError(f"unknown time_mode {time_mode!r}")
         d_text = int(name_emb.shape[1])
         self.d_sig = d_sig
+        self.time_mode = time_mode
         self.register_buffer("name_emb", name_emb.detach().to(torch.float32), persistent=False)
         self.register_buffer("modality_id", modality_id.detach().to(torch.long), persistent=False)
         self.register_buffer("recency_edges", torch.tensor(_RECENCY_EDGES, dtype=torch.float32),
@@ -39,7 +55,13 @@ class RelationalSignature(nn.Module):
         self.n_recency = len(_RECENCY_EDGES) + 1                 # timed buckets 0..len(edges)
         self.schema_proj = nn.Linear(d_text, d_sig, bias=False)
         self.stype_emb = nn.Embedding(max(int(n_stypes), 1), d_sig)
-        self.recency_emb = nn.Embedding(self.n_recency + 1, d_sig)   # +1: index 0 == untimed/pad
+        if time_mode == "buckets":
+            self.recency_emb = nn.Embedding(self.n_recency + 1, d_sig)   # +1: index 0 == untimed/pad
+        else:
+            from .time_encoding import TimeLadder
+
+            self.ladder = ladder or TimeLadder()
+            self.w_tau = nn.Linear(2 * self.ladder.n_freq, d_sig, bias=False)
         self.norm = nn.RMSNorm(d_sig)
 
     def recency_bins(self, cb: CellBatch) -> Tensor:
@@ -55,6 +77,13 @@ class RelationalSignature(nn.Module):
         flat = col.reshape(-1)
         name = self.name_emb.index_select(0, flat).view(B, S, -1)           # [B, S, d_text]
         mod = self.modality_id.index_select(0, flat).view(B, S)             # [B, S]
-        rec = self.recency_bins(cb)                                         # [B, S]
-        z = self.schema_proj(name) + self.stype_emb(mod) + self.recency_emb(rec)
+        z = self.schema_proj(name) + self.stype_emb(mod)
+        if self.time_mode == "buckets":
+            z = z + self.recency_emb(self.recency_bins(cb))
+        else:
+            # 14 of the 20 buckets were empty; the ladder spends every channel instead. Untimed cells
+            # get an all-zero feature pair (not [0;1]), so "unknown" stays linearly separable from
+            # "Delta = 0" behind W_tau.
+            tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time)
+            z = z + self.w_tau(self.ladder.feats(tau, cb.is_timed).to(z.dtype))
         return self.norm(z)                                                 # [B, S, d_sig]

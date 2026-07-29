@@ -267,11 +267,24 @@ Task list is now pinned to `LEADERBOARD_TASKS`: rel-event is `user-repeat` / `us
 
 ## 4. Open design questions (deliberately not decided)
 
-1. **Seed-row Δ clamps to τ = 0.** Because 35% of rel-event seeds have the root dated after the seed
-   time and `Δ = max(0, t* − t_r)`, those seed cells get **τ = 0 — indistinguishable from "happened
-   right now."** "This is the query row" and "this is maximally recent" are different statements.
+1. **Seed-row Δ clamps to τ = 0 — and it is COUPLED to the ladder band, which was not obvious.**
+   Because 35% of rel-event seeds have the root dated after the seed time and
+   `Δ = max(0, t* − t_r)`, those seed cells get **τ = 0 — indistinguishable from "happened right
+   now."** "This is the query row" and "this is maximally recent" are different statements.
    Structurally the same argument §3.1 makes for `b_untimed`; same remedy available (a learned root
-   flag). Decide in Phase 1.
+   flag).
+
+   **The coupling.** That τ = 0 mass is the *only* reason the re-derived band `[0.3, 5.0]` still
+   trips a wraparound check. On rel-f1 the τ **bulk** runs 11.4 → 19.66 (span 8.2, `ω·span = 2.47
+   rad < π`, no wrap), but the full observed **range** is 0 → 19.66 (span 19.7, `5.90 rad`, wraps) —
+   entirely because of the clamped seed rows. So while §9.10 is undecided, the lowest ladder channel
+   aliases **τ ≈ 0 against τ ≈ 21** — the query row against an ancient row. Fixing §9.10 removes the
+   outlier mass and the band becomes clean with no further tuning. Decide it in Phase 1, and note it
+   is now a correctness issue for the time encoding, not only a modelling nicety.
+
+   Note also: τ's distribution is **truncated on the right** (τ cannot exceed the database's age), so
+   the bulk is not a symmetric ±3σ interval. An earlier draft of the band derivation assumed symmetry
+   and wrongly concluded `[0.3, 5.0]` was over-constrained; it is not.
 2. **The MoE moves a level.** §3.7 puts the MoE on the **row** FFN and makes the **cell** FFN dense.
    CLAUDE.md's "route on the value-free relational signature" survives; its "the MoE enters at
    exactly one point — RT's SwiGLU FFN inside each `RelationalBlock`" does not. Phase 4's `r2` arm

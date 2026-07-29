@@ -59,9 +59,31 @@ def stub_batch(B=2, R=4, S=8, K=3, *, n_tables=3, empty_row=True, seed=0):
     row_is_timed = torch.ones(B, R, dtype=torch.bool)
     row_is_timed[:, -1] = False       # exercise the b_untimed path
 
+    # Row timestamps must VARY across rows. With a constant timestamp every theta is equal, the
+    # relative angle theta_i - theta_j is 0, and a uniform rotation of all q,k preserves inner
+    # products — so RoPE is provably inert and any test of it passes vacuously. (That inertness is
+    # itself the §6 relative-only property; it just makes a constant-time fixture useless here.)
+    seed_t = 2.0e9
+    row_t = seed_t - (torch.arange(R, dtype=torch.float64) + 1) * 86400.0 * 30
+    row_time_r = row_t.unsqueeze(0).repeat(B, 1)
+
+    # per-CELL fields: the cell level (two_level.CellAttention, build_relational_masks) reads these,
+    # so the stub carries them even though the §3.3-3.7 row modules do not. A cell's time is its
+    # ROW's time, matching the collate contract.
+    max_fk = 2
+    cell_time = torch.gather(row_time_r, 1, cell_row)
+    cell_timed = ~is_padding
+    f2p = torch.full((B, S, max_fk), -1, dtype=torch.long)
+    f2p[:, 2:4, 0] = 0                     # rows 1..2's cells reference row 0 (the root)
+    f2p[:, 4:6, 0] = 0
+
     return types.SimpleNamespace(
-        num_seeds=B, seq_len=S,
+        num_seeds=B, seq_len=S, max_fk=max_fk,
         cell_row=cell_row, is_padding=is_padding,
+        node_idxs=cell_row,                # row slot == node idx, matching the collate contract
+        row_time=cell_time, is_timed=cell_timed,
+        is_seed_cell=(cell_row == 0) & ~is_padding,
+        f2p_nbr_idxs=f2p,
         col_idxs=torch.randint(0, 5, (B, S), generator=g),
         row_valid=row_valid,
         row_table=torch.randint(0, n_tables, (B, R), generator=g),
@@ -69,8 +91,8 @@ def stub_batch(B=2, R=4, S=8, K=3, *, n_tables=3, empty_row=True, seed=0):
         row_hop=torch.randint(0, 3, (B, R), generator=g),
         row_is_root=row_is_root,
         row_is_timed=row_is_timed,
-        row_time_r=torch.full((B, R), 1.0e9, dtype=torch.float64),
-        seed_time=torch.full((B,), 2.0e9, dtype=torch.float64),
+        row_time_r=row_time_r,
+        seed_time=torch.full((B,), seed_t, dtype=torch.float64),
         adj_role=adj,
     ), K
 

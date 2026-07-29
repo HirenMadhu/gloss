@@ -18,14 +18,43 @@ inconvenient:
   resolutions and each database reads whichever channels carry signal for its own spread — the standard
   multi-resolution RoPE argument, and the reason RoPE generalises without per-corpus statistics.
 
-**The ladder.** ``n_freq = 8`` frequencies ``ω_k``, log-spaced over ``[ω_min, ω_max] = [0.05, 5.0]``,
+**The ladder.** ``n_freq = 8`` frequencies ``ω_k``, log-spaced over ``[ω_min, ω_max] = [0.3, 5.0]``,
 held in a **non-persistent buffer, never an** ``nn.Parameter`` **and never learned**:
 
     θ_r^(k) = ω_k · τ_r
 
-The lowest frequency has period ``2π/0.05 ≈ 126`` in τ units, so it is monotonic across the whole 0–22
-range with no wraparound; the highest has period ``≈ 1.26``, resolving recency *ratios* of about
-``e^{1.26} ≈ 3.5×``.
+**Band note — this was MEASURED, and it corrects changes.md.** The original ``[0.05, 5.0]`` was derived
+from τ's *range* ``[0, 22]``. What the frequencies must resolve is τ's **spread**, which is an order of
+magnitude smaller: measured over 768 seeds/dataset, τ has mean 14–18 but **σ ≈ 1.59–1.90**. At
+``ω = 0.05`` that is ``ω·σ = 0.08`` rad of variation across the entire corpus — so the two lowest
+channels were dead weight (``var(sin ωτ) < 0.01`` on rel-f1 and rel-trial). ``ω_min`` is therefore set
+from σ:
+
+* **alive**: want ``ω·σ ≳ 0.5`` rad (the first healthy measured channel sat at 0.58) ⇒ ``ω_min ≳ 0.31``
+* **no wraparound** over the bulk ⇒ ``ω_min·span < π``
+
+Both hold at ``ω_min = 0.3``. The τ distribution is **truncated on the right** — τ cannot exceed the
+database's own age — so the bulk is *not* a symmetric ±3σ interval: on rel-f1 it runs from
+``mean − 3σ = 11.4`` to ``max = 19.66``, a span of 8.2, giving ``ω·span = 2.47 rad < π``. (An earlier
+draft of this note assumed a symmetric ``6σ = 11.4`` span and wrongly concluded the band was
+over-constrained.)
+
+**One coupling to know about, because it is not obvious.** The *measured* wraparound check still fires
+on rel-f1 at ``ω_min = 0.3``, because the full observed range is 19.7, not 8.2 — τ reaches **0**. That
+τ = 0 mass is not the bulk: it is the seed/root rows whose ``Δ = max(0, t* − t_r)`` **clamps to zero**
+because they are dated after their own seed time (35% of rel-event task rows; changes.md §9.10). So the
+ladder band and the seed-row clamp are coupled: flag seed rows instead of clamping them and the range
+collapses to the bulk, where this band has no wraparound at all. Until §9.10 is decided, the lowest
+channel aliases τ ≈ 0 against τ ≈ 21 — i.e. "this is the query row" against "this is ancient".
+
+``ω_max`` stays at 5.0: period ``≈ 1.26`` τ units, resolving recency *ratios* of about
+``e^{1.26} ≈ 3.5×``, where measured ``var(sin) = 0.494`` is already saturated (0.5 is the maximum), so
+going higher only aliases.
+
+The frequencies remain **fixed constants chosen once from corpus-wide statistics**, not per-database
+fitted parameters, so §0 still holds — but say so explicitly in the write-up, because "chosen by
+looking at the data" invites exactly that objection. §7's per-frequency utilisation logging is the
+guard that catches a transfer database whose spread sits outside this band.
 
 **Two readouts of the same ladder.**
 
@@ -65,7 +94,8 @@ class TimeLadder(nn.Module):
 
     Args:
         n_freq: number of frequencies ``ω_k`` (changes.md §4 default 8).
-        omega: ``(ω_min, ω_max)``, log-spaced inclusive band (default ``(0.05, 5.0)``).
+        omega: ``(ω_min, ω_max)``, log-spaced inclusive band (default ``(0.3, 5.0)`` — MEASURED, see
+            the band note below; changes.md's original ``(0.05, 5.0)`` left 2 of 8 channels dead).
 
     Attributes:
         omega: ``[n_freq]`` **non-persistent buffer** of fixed constants — not a parameter, absent from
@@ -73,7 +103,7 @@ class TimeLadder(nn.Module):
         b_untimed: the single learned scalar added to attention logits touching an untimed endpoint.
     """
 
-    def __init__(self, n_freq: int = 8, omega: tuple[float, float] = (0.05, 5.0)):
+    def __init__(self, n_freq: int = 8, omega: tuple[float, float] = (0.3, 5.0)):
         super().__init__()
         omega_min, omega_max = float(omega[0]), float(omega[1])
         if not (0.0 < omega_min <= omega_max):
