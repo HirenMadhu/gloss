@@ -100,6 +100,41 @@ role_id : (child_table, fk_column, parent_table) -> int in [1, K]
 Table-pair granularity is wrong: two FK columns in the same child table can
 reference the same parent table and must stay distinct.
 
+**This is a bigger change than "plumb the role through `collate.py`" — the role
+vocabulary itself is wrong today.** `graph.py:149-151` keys `fk_role_id` on the
+**FK column name alone** (`cols = sorted({canonical_relation(rel) ...})`), so two
+FK columns sharing a name in *different child tables* collapse onto one id.
+Measured over the real schemas (`scripts/probe_fk_role_collision.py`):
+
+| dataset | FK edges | role ids today (col-keyed) | role ids under P0.1 (triple) | worst collision |
+|---|---|---|---|---|
+| rel-f1 | 13 | **4** | 13 | `raceId` merges 5 relations |
+| rel-trial | 15 | **6** | 15 | `nct_id` merges **10** relations |
+| rel-event | 7 | **4** | 7 | 3 names merge 2 each |
+
+rel-trial is the alarming one: every one of the ten child tables that points at
+`studies` reaches it through `nct_id`, so **all ten relations are one id**. A
+role bias built on that vocabulary cannot distinguish `outcomes → studies` from
+`sponsors_studies → studies`, and **Phase 2 `s1` would be a near-guaranteed null
+for a purely mechanical reason** — precisely the failure §7's `|γ|`-per-role
+instrumentation is meant to catch, except it would be baked in before the first
+step. Fix the vocabulary in `_build_vocabs`, not just the plumbing.
+
+Two mitigating facts, so this is scoped correctly:
+
+- **Nothing already run is invalid.** `fk_role_id` is built in `graph.py` and
+  consumed **nowhere** else in `gloss/` — the bug is latent, and P0/Phase 2 are
+  what activate it. No published or in-flight number depends on it.
+- **The existing test passes while missing this.**
+  `tests/test_graph.py:test_dual_fk_relations_get_distinct_ids` asserts
+  `f2p_buyer != f2p_seller` — two *differently named* columns, which the
+  col-keyed scheme already separates. The uncovered case is two *same-named*
+  columns in different child tables. Add it to the P0.6 test list.
+
+Note P0.4 already assumes the triple: its role name string is
+`"table {child} column {fk_col} references table {parent}"`. The document was
+internally consistent; only the code was behind.
+
 ### P0.2 Build the row-level adjacency
 
 New `CellBatch` fields. `R = max_rows_per_seed`, config, assert not exceeded.
@@ -237,6 +272,11 @@ get an unused row. Cheap now; silently corrupting later.
   `node_idxs.unique()` per seed.
 - Modality ids are bundle-independent: the id of a given stype is identical
   across all three datasets, and `n_stypes` is constant.
+- **Role ids separate same-named FK columns in different child tables** — the
+  case the existing `test_dual_fk_relations_get_distinct_ids` does not cover.
+  On rel-trial, assert the ten `nct_id → studies` relations get ten distinct
+  ids; on the synthetic fixture, add a second child table reusing an existing
+  FK column name.
 
 ---
 
