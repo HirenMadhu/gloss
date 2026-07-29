@@ -146,12 +146,13 @@ New `CellBatch` fields. `R = max_rows_per_seed`, config, assert not exceeded.
 |---|---|---|---|---|---|---|
 | rel-f1 | driver-dnf | 34.0 | 50 | 63 | **65** | 69 |
 | rel-trial | site-success | 11.9 | 25 | 25 | **25** | 63 |
-| rel-event | user-repeat | *pending* | | | | — |
+| rel-event | user-attendance | 32.1 | 48 | 65 | **100** | — |
 
-`R = 160` stands, with generous margin at this fanout. **But note the assert is
+`R = 160` stands, but the margin is **1.6×, not generous** — rel-event's max is
+100, not the 25–65 the other two suggested. **The assert is also
 fanout-coupled**: Phase 5 sweeps `num_neighbors` up to `[32,16]`, which raises
-the ceiling roughly in proportion. Re-measure before Phase 5 rather than
-discovering it as a fired assert mid-sweep.
+the ceiling roughly in proportion and would blow through 160 on rel-event.
+Re-measure before Phase 5 rather than discovering it as a fired assert mid-sweep.
 
 **rel-trial saturates the sampler exactly.** p90 = p99 = max = 25 = `1 + 12 + 12`
 — every seed above median degree hits the `[12,12]` cap precisely, so the row
@@ -630,10 +631,13 @@ and the report's figure was taken at the collate *default* of 1024, not at the
 | rel-f1 | 512 | 1.03% | 1.05% | 0.52% | 20.17% | 5.69% | **94.31%** |
 | rel-f1 | 1024 | 0.31% | 0.31% | 0.18% | 5.09% | 1.47% | 98.53% |
 | rel-trial | 512 | 0.66% | 1.44% | 0.21% | 14.10% | 4.10% | **95.90%** |
+| rel-event | 512 | 0.74% | 9.74% | 0.34% | 52.47% | 15.82% | **84.18%** |
 
-**Quote 94–96% at `seq_len=512`, not 97–98%.** Padding is what moves: rel-f1
-averages 209 real cells of 512, so pad-pairs are 20% of the matrix at 512 and 5%
-at 1024.
+**There is no single number to quote — it ranges 84–96% across the three DBs at
+`seq_len=512`.** Padding is what moves it, and rel-event barely pads: it averages
+306 real cells of 512 against rel-f1's 209, so its pad-pair density is 52% where
+rel-f1's is 20%. Report the figure per dataset; a single headline number would be
+wrong on two of three.
 
 Three corrections to how this phase is argued, all forced by the measurement:
 
@@ -644,10 +648,29 @@ Three corrections to how this phase is argued, all forced by the measurement:
 2. **Varlen packing matters more than the mask collapse.** Even after collapsing,
    the single remaining attention is only ~20% useful pairs at 512. §3.2's
    left-packing is where the rest of the win is.
-3. **`seq_len=512` is loose.** rel-f1's max is 353 cells/seed and rel-trial's is
-   317, so truncation binds on **0%** of seeds at `[12,12]` and ~59% of the
-   sequence is padding. That is headroom for Phase 5, and it means the Phase 5
-   fanout sweep can raise fanout before it needs `seq_len=1024`.
+3. **`seq_len=512` is loose on two DBs and BINDING on the third.** Corrected
+   after measuring rel-event:
+
+   | dataset | mean cells/seed | p90 | max | truncated at 512? |
+   |---|---|---|---|---|
+   | rel-f1 | 209 | — | 353 | no — 0% of seeds |
+   | rel-trial | 145 | 317 | 317 | no — 0% of seeds |
+   | rel-event | **306** | **512** | **512** | **yes — ≥10% of seeds** |
+
+   rel-event's **p90 sits exactly on the cap**, so at least a tenth of its seeds
+   are losing cells outright at the config this document specifies. Seed-row
+   cells are emitted first and survive (`collate.py`), so the loss is neighbour
+   context, not the target row — but it is silent information loss on a
+   headline dataset, and it means **rel-event is already running at a different
+   effective fanout than rel-f1 and rel-trial.**
+
+   Two consequences. First, the earlier "truncation binds on 0% of seeds" claim
+   was generalised from the two DBs that happened to be measured; it is false
+   for the corpus as a whole. Second, Phase 5's premise — that Phase 0b's freed
+   FLOPs buy fanout headroom before `seq_len=1024` is needed — **does not hold
+   for rel-event, which needs 1024 before the sweep even starts.** Decide
+   whether Phase 5 sweeps `seq_len` per dataset or fixes 1024 corpus-wide, and
+   report the binding fraction per dataset either way. Do not average it away.
 
 If (a) fails, the `col` mask was load-bearing. Add a cell-level same-column
 attention back as a third operator and record that the decomposition is three
