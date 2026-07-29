@@ -23,6 +23,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gloss.eval import ablation  # noqa: E402
 
 
+
+# changes.md §5 phase presets. Each flips ONE group of switches relative to the previous, so a delta is
+# attributable. `full` is the proposed design: cell RoPE + one full cell attention + name-derived role
+# bias + row RoPE + MoE at BOTH levels (cell routed-only, row shared+routed).
+TWO_LEVEL_PHASES = {
+    "phase0a": dict(cell_attention="four_mask", cell_rope_time=False, time_mode="buckets",
+                    pool_query="mean", role_bias="none", time_bias="none", row_ffn="dense",
+                    broadcast="additive", head_mode="row_token"),
+    "phase0b": dict(cell_attention="full", cell_rope_time=False, time_mode="buckets",
+                    pool_query="mean", role_bias="none", time_bias="none", row_ffn="dense",
+                    broadcast="additive", head_mode="row_token"),
+    "full":    dict(cell_attention="full", cell_rope_time=True, time_mode="rope",
+                    pool_query="hybrid", role_bias="name_derived", time_bias="rope", row_ffn="moe",
+                    row_use_shared=True, broadcast="additive", head_mode="row_token"),
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", type=int, default=None)
@@ -31,6 +48,12 @@ def main() -> int:
     ap.add_argument("--datasets", nargs="+", default=list(ablation.DEFAULT_DATASETS))
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--encoder", default="qwen", help="'qwen' | 'hash' | registry label | HF id")
+    ap.add_argument("--arch", default="rt", choices=["rt", "two_level"],
+                    help="rt = current single-level substrate; two_level = changes.md's (cell,row) encoder")
+    ap.add_argument("--phase", default="full", choices=["phase0a", "phase0b", "full"],
+                    help="two_level switch preset. phase0a = row tokens only, cell level behaves like RT "
+                         "(the isolation gate); phase0b = + collapse the 4 cell masks into 1; "
+                         "full = the whole design (cell RoPE, row biases, MoE at BOTH levels)")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=8)
@@ -94,8 +117,11 @@ def main() -> int:
         use_shared=args.use_shared, cosine=args.cosine, tau=args.tau, top_p=args.top_p,
         hmoe=args.hmoe, n_groups=args.n_groups, experts_per_group=args.experts_per_group, k2=args.k2,
         out_dir=out_dir, limit_train_batches=ltb, limit_val_batches=lvb,
+        arch=args.arch,
+        two_level=TWO_LEVEL_PHASES[args.phase] if args.arch == "two_level" else None,
     )
-    print({kk: rec.get(kk) for kk in ("dataset", "task", "signal", "variant", "seed", "task_type")})
+    print({kk: rec.get(kk) for kk in
+           ("dataset", "task", "signal", "variant", "arch", "seed", "task_type")})
     return 0
 
 

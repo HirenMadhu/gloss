@@ -30,6 +30,16 @@ def install_probe() -> None:
 
     def validate(self):
         off = self.offset
+        # Report EVERY offset[0] != 0, including the degenerate numel() < 2 case that the graph.py
+        # patch's `numel() >= 2` guard excludes — that exclusion is why the assert still fires.
+        if off is not None and off.numel() < 2 and int(off[0]) != 0:
+            rec = {"case": "DEGENERATE numel<2", "numel": int(off.numel()),
+                   "offset": off.tolist(), "values_shape": tuple(self.values.shape),
+                   "n_cols_implied": int(off.numel()) - 1}
+            SEEN.append(rec)
+            print("\n*** DEGENERATE CASE — zero-column MET with nonzero offset base ***")
+            for key, v in rec.items():
+                print(f"    {key:20} {v}")
         if off is not None and off.numel() >= 2 and int(off[0]) != 0:
             k = int(off[0])
             T = int(off[-1]) - k
@@ -63,6 +73,11 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--split", default="train")
+    ap.add_argument("--num-workers", type=int, default=0,
+                    help="the failing run used 8; the collate/slice then happens IN the worker")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="training shuffles, which changes the index sets torch_frame slices with")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
@@ -76,8 +91,11 @@ def main() -> int:
 
     bundle = build_gloss_graph(args.dataset)
     task = get_task(args.dataset, args.task, download=True)
+    from gloss.utils.seeding import seed_everything
+
+    seed_everything(args.seed)
     loader = make_loader(bundle, task, args.split, batch_size=args.batch_size,
-                        num_workers=0, shuffle=False)
+                         num_workers=args.num_workers, shuffle=args.shuffle)
 
     n_ok = 0
     for i, raw in enumerate(loader):
@@ -93,7 +111,8 @@ def main() -> int:
             print(f"\n{type(e).__name__} on batch {i}: {e}")
             break
 
-    print(f"\n=== {args.dataset}/{args.task} [{args.split}]: {n_ok} batches collated OK")
+    print(f"\n=== {args.dataset}/{args.task} [{args.split}] workers={args.num_workers} "
+          f"shuffle={args.shuffle} seed={args.seed}: {n_ok} batches collated OK")
     print(f"=== unrecognised offset layouts seen: {len(SEEN)}")
     if not SEEN:
         print("    (none — this split/task did not reproduce the fall-through)")

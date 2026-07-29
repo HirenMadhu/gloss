@@ -136,6 +136,8 @@ def run_config(
     test: bool = True,
     limit_train_batches: float | int | None = None,
     limit_val_batches: float | int | None = None,
+    arch: str = "rt",
+    two_level: dict | None = None,
 ) -> dict:
     """Train the single ``(dataset, task, signal, seed)`` config at ``index`` and persist its metrics.
 
@@ -160,6 +162,19 @@ def run_config(
     mk = dict(model_kwargs or {})
     mk.update(num_experts=num_experts, k=k, use_shared=use_shared, cosine=cosine, tau=tau, top_p=top_p,
               hmoe=hmoe, n_groups=n_groups, experts_per_group=experts_per_group, k2=k2)
+    if arch == "two_level":
+        # P0.4's table/role name tables come from the SAME frozen encoder + cache as the column table,
+        # so they cost nothing here (content-hash keyed) and stay name-derived => an unseen schema works.
+        from ..text.schema import build_table_name_embeddings, role_name_embeddings_with_none
+        from ..train.finetune import _name_encoder
+
+        enc = _name_encoder(c["dataset"], encoder=encoder, d_text=d_text)
+        mk.update(
+            arch="two_level",
+            table_name_emb=build_table_name_embeddings(bundle, enc, kind="query"),
+            role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
+            **(two_level or {}),
+        )
     module, metrics = train_prebuilt(
         bundle, task, name_emb, model_kwargs=mk, route_on=c["signal"], lambda_ortho=lambda_ortho,
         num_neighbors=num_neighbors, seq_len=seq_len, max_fk=max_fk, batch_size=batch_size,
@@ -169,7 +184,16 @@ def run_config(
     # variant = router arm + S/C/P/H tags, so several addition configs of one router don't collide in a
     # shared out-dir (dense/dense_wide carry no additions -> variant == signal).
     variant = variant_label(c["signal"], use_shared=use_shared, cosine=cosine, top_p=top_p, hmoe=hmoe)
-    rec = {**c, "variant": variant, "task_type": task_kind(task)}
+    if arch != "rt":
+        # arch goes in the VARIANT, not just a field: the variant is the filename key and the aggregate
+        # grouping key, so without this a two_level run would overwrite / be averaged together with an
+        # RT run of the same (index, router). They are different architectures and must never merge.
+        variant = f"{variant}@{arch}"
+    rec = {**c, "variant": variant, "arch": arch, "task_type": task_kind(task)}
+    if arch == "two_level":
+        # self-describing results: which phase switches produced this number
+        rec["two_level"] = {kk: vv for kk, vv in (two_level or {}).items()
+                            if not kk.endswith("_emb")}
     rec.update({f"val_{kk.split('/')[-1]}": v for kk, v in metrics.items() if kk.startswith("val/")})
     if test:
         from .test_eval import evaluate_split
