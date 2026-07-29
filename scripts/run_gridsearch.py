@@ -137,8 +137,8 @@ def aggregate(out_dir: Path) -> str:
     recs = [json.loads(p.read_text()) for p in sorted(out_dir.glob("*.json"))]
     if not recs:
         return "(no records)"
-    rt_path = REPO / "results" / "rt_from_scratch_baseline.json"
-    rt = json.loads(rt_path.read_text())["tasks"] if rt_path.exists() else {}
+    from gloss.eval.leaderboard import METHODS, beats, load as load_baselines
+    base = load_baselines()
 
     grp: dict[tuple, list[dict]] = defaultdict(list)
     for r in recs:
@@ -156,7 +156,8 @@ def aggregate(out_dir: Path) -> str:
         by_task[(ds, tk)].append((ci, st.mean(xs), len(xs), ttype, key, cfg))
 
     lines = [f"{len(recs)} runs over {len(grp)} (task,config) cells.", ""]
-    beats = 0
+    wins = {name: 0 for name in METHODS}          # per-baseline win counts
+    scored = {name: 0 for name in METHODS}        # tasks that baseline actually reports
     for (ds, tk) in TASKS:
         cands = by_task.get((ds, tk))
         if not cands:
@@ -165,30 +166,35 @@ def aggregate(out_dir: Path) -> str:
         lower = key == "test_nmae"
         ranked = sorted(cands, key=lambda c: (c[1] if lower else -c[1]))
         ci, m, n, _, _, cfg = ranked[0]
-        rtv = rt.get(f"{ds}/{tk}", {}).get("value")
-        if ttype == "binary":
-            ours_disp, rt_disp = m * 100, rtv
-            beat = rtv is not None and ours_disp > rtv
-            unit = "AUROC↑"
-        else:
-            ours_disp, rt_disp = m, rtv
-            beat = rtv is not None and m < rtv
-            unit = "NMAE↓"
-        beats += bool(beat)
-        flag = "BEAT ✅" if beat else ("no ❌" if rtv is not None else "(no RT)")
+        entry = base.get(f"{ds}/{tk}", {"type": ttype})
+        # regression records already carry NMAE (test_mae / train-std), so both types are in
+        # leaderboard units after the binary x100.
+        ours_disp = m * 100 if ttype == "binary" else m
+        unit = "AUROC↑" if ttype == "binary" else "NMAE↓"
+        cmp_parts = []
+        for name in METHODS:
+            bv = entry.get(name)
+            won = beats(ours_disp, bv, ttype)
+            if won is None:
+                cmp_parts.append(f"{name}=n/a")
+                continue
+            scored[name] += 1
+            wins[name] += won
+            cmp_parts.append(f"{name}={bv}  {'BEAT ✅' if won else 'no ❌'}")
         lines.append(f"=== {ds}/{tk}  ({unit}) ===")
         lines.append(f"  best cfg#{ci}: d_model={cfg['d_model']} n_blocks={cfg['n_blocks']} "
                      f"n_heads={cfg['n_heads']} d_ff={cfg['d_ff']} enc={cfg['enc_channels']} "
                      f"experts={cfg['num_experts']}")
-        lines.append(f"  ours={ours_disp:.4f} (n={n})   RT={rt_disp}   {flag}")
+        lines.append(f"  ours={ours_disp:.4f} (n={n})   " + "   ".join(cmp_parts))
         for ci2, m2, n2, _, _, cfg2 in ranked[1:3]:
             disp = m2 * 100 if ttype == "binary" else m2
             lines.append(f"    runner-up cfg#{ci2}: {disp:.4f}  "
                          f"(dm{cfg2['d_model']} nb{cfg2['n_blocks']} nh{cfg2['n_heads']} "
                          f"ff{cfg2['d_ff']} enc{cfg2['enc_channels']} e{cfg2['num_experts']})")
         lines.append("")
-    lines.append(f"Best-config beats RT (from scratch) on {beats}/{len([t for t in TASKS if t in by_task])} tasks "
-                 f"(NOTE: best-of-{len(arch_grid())} per task — optimistic; confirm winners with a clean re-run).")
+    for name in METHODS:
+        lines.append(f"Best-config beats {name} on {wins[name]}/{scored[name]} reported tasks.")
+    lines.append(f"(NOTE: best-of-{len(arch_grid())} per task — optimistic; confirm winners with a clean re-run.)")
     return "\n".join(lines)
 
 
