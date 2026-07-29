@@ -1,168 +1,214 @@
-# RECAP — MoRE, 2026-07-02 (user back ~2026-07-04)
+# RECAP — MoRE / `multi-level`, 2026-07-29 (user back 2026-07-30; **may lose this node**)
 
-Self-contained handoff. Picking this up possibly in a fresh conversation. Repo:
-`/gpfs/milgram/project/ying_rex/hm638/gloss` (Milgram cluster). Use `.venv/bin/python`.
+Self-contained handoff, possibly into a fresh conversation. Repo:
+`/gpfs/milgram/project/ying_rex/hm638/gloss` (Milgram). Use `.venv/bin/python`.
+Current node `r818u23n11`. **The user expects to give up this node soon — assume the running array may
+die and that scratch paths need re-checking (§2 symlinks).**
 
----
-
-## 0. What this project is (30-sec version)
-**MoRE** = Relational Transformer (RT) substrate + a **Mixture-of-Experts FFN** whose router reads a
-cell's **value-free relational signature** (frozen LM column-name embedding + modality + recency). Goal:
-**beat `RT (from scratch)`** on the RelBench leaderboard (per task). See `idea.md`, `implementation.md`,
-`CLAUDE.md`, and `moe_ablation.md` (the v2 ablation design).
+Supersedes the 2026-07-02 recap; its still-valid hard rules are preserved in §2. **Read §2.**
 
 ---
 
-## 1. WHAT IS RUNNING RIGHT NOW — GRID SEARCH RESUME (array 28977028)
-Pivoted back to the **architecture grid search** (2026-07-05). Resumed the missing **1,672 of 2,592** grid
-jobs (920 were already done) as array **28977028** (`%8`, `gpu`/h100:1). `run_gridsearch.py` now has an
-**idempotent skip-if-done guard**. Results → `results/gridsearch/NNNNN.json`; aggregate with
-`run_gridsearch.py --aggregate`. rel-event loads fine here (symlink fix §2).
+## 0. What this is, in 30 seconds
 
-**Why the pivot:** the **v2 S/C/P/H additions ablation is COMPLETE and a negative result** — no addition
-consistently beats its base router (`signature`/`hidden`); only `+S` (shared expert) helps regression a
-little (driver-position 0.398, user-attendance 0.408, both < RT). hidden×HMoE trains fine with the NaN
-guard (§2) but doesn't win. Full 16-arm results in `results/v2_add_signature/` + `results/v2_add_hidden/`
-(aggregate: `run_ablation.py --aggregate --out-dir results/v2_add_<router> --baseline <router>`).
-driver-top3 test-AUROC is missing (transient relbench eval SQL glitch — works in isolation; re-run to
-recover). The grid search (best `signature` configs beat RT 6/9, all small `d_model=128`) is the
-productive axis.
+**MoRE** = Relational Transformer substrate + a **Mixture-of-Experts FFN** whose router reads a
+**value-free relational signature** (frozen-LM name embedding ⊕ modality ⊕ recency). Goal: **beat
+`RT (from scratch)` and `GelGT` on the RelBench leaderboard**, per task.
 
---- older detail (the v2 ablation, now finished) ---
-16 SLURM arrays, **432 jobs total**, `%8` (hard 8-GPU cap on this cluster), on **`gpu` partition / h100:1**.
-Submitted 2026-07-02. IDs in `~/scratch60/.gloss_v2_jids`.
+The **`multi-level` branch** (current, 22 commits ahead of `main`) replaces the flat cell-token
+substrate with a **two-level (cell, row)** encoder: row tokens, a row signature, temporal RoPE at both
+levels, name-derived FK-role biases, one full cell attention instead of four masked ones, a
+cross-attention row encoder, and **MoE at BOTH levels**.
 
-**Design:** two routers × the **S/C/P/H additions ladder** (forward select + backward leave-one-out).
-- Routers: **`signature`** (the method) and **`hidden`**. NO `hybrid`, NO `identity`, **NEVER `dense`**.
-- Additions: **S** shared expert (`--use-shared`), **C** cosine router (`--cosine`), **P** Top-P
-  (`--top-p 0.7`), **H** HMoE (`--hmoe`).
-- 8 configs per router (Full−H == R*+S+C+P, so 8 not 9):
-  `base` · `+S` · `+SC` · `+SCP` · `Full(+SCPH)` · `Full−S(+CPH)` · `Full−C(+SPH)` · `Full−P(+SCH)`.
-- **Datasets: rel-f1, rel-trial, rel-event — LEADERBOARD tasks ONLY (9 = 3/dataset), via `--tasks
-  leaderboard`.** (rel-f1: driver-dnf/-top3/-position; rel-trial: study-outcome/-adverse, site-success;
-  rel-event: user-repeat/-ignore, user-attendance.) User rule: only run tasks with an RT/GelGT baseline.
-  3 seeds. `--epochs 30` (a CAP; early stopping patience=3 stops most runs earlier). Encoder `harrier`
-  (schema caches built for all 3 DBs). N per array = 27 (9 tasks × 1 router × 3 seeds), `--array=0-26%8`.
-- Output: `results/v2_add_signature/` (8 arrays) and `results/v2_add_hidden/` (8 arrays). Files named
-  `{index}_{variant}.json` (e.g. `0000_signature+SCP.json`) so variants share a dir without collision.
+**Read in order:** `CLAUDE.md` → `changes.md` (the plan) → **`amendments.md` (where the plan was
+measurably wrong — six falsified claims + five bugs, each with its measurement)**. `report.md`, cited
+throughout `changes.md`, **does not exist in the repo**; every `report X##` citation is unverifiable.
+Never trust a `changes.md` figure that `amendments.md` supersedes.
 
-**ETA ~1.5 days** at 8-wide/30-epoch (9 tasks, early stopping).
+---
 
-### Check progress / aggregate
+## 1. WHAT IS RUNNING RIGHT NOW — two-level full design (array 29029490)
+
+```
+sbatch --array=0-26%8 scripts/run_ablation.sh \
+  --datasets rel-f1 rel-trial rel-event --tasks leaderboard \
+  --signals signature --seeds 3 --encoder qwen \
+  --arch two_level --phase full \
+  --out-dir results/two_level_full
+```
+27 runs = 9 leaderboard tasks × 3 seeds, `signature` router, qwen, `gpu`/h100:1, `%8`.
+`--phase full` = cell RoPE + one full cell attention + name-derived role bias + row RoPE + **MoE at both
+levels** (cell routed-only, row **shared+routed**).
+
+### Check / resume
 ```bash
 cd /gpfs/milgram/project/ying_rex/hm638/gloss
-squeue -u $USER -h -r -t RUNNING -o '%i' | grep -c '_[0-9]'      # GPUs in use (<=8)
-ls results/v2_add_signature/*.json results/v2_add_hidden/*.json | wc -l   # of 864
-# additions Δ vs the BASE ROUTER (never dense):
-.venv/bin/python scripts/run_ablation.py --aggregate --out-dir results/v2_add_signature --baseline signature
-.venv/bin/python scripts/run_ablation.py --aggregate --out-dir results/v2_add_hidden    --baseline hidden
+squeue -j 29029490 -h -o "%T" | sort | uniq -c
+ls results/two_level_full/*.json | wc -l                 # of 27
+for f in logs/slurm/gloss_abl_29029490_*.err; do grep -qE "Traceback" "$f" && echo "FAIL $f"; done
+.venv/bin/python scripts/run_ablation.py --aggregate \
+  --datasets rel-f1 rel-trial rel-event --tasks leaderboard --signals signature --seeds 3 \
+  --out-dir results/two_level_full --baseline signature
 ```
+**If it died, resubmit the identical command** — there is an idempotent skip-if-done guard keyed on the
+output filename, so finished configs are not recomputed.
+
+### Results so far (2 of 27) — DO NOT over-read
+| task | seed | test AUROC | val AUROC |
+|---|---|---|---|
+| rel-f1/driver-top3 | 0 | 0.9100 | 0.8116 |
+| rel-f1/driver-top3 | 1 | 0.9154 | 0.8433 |
+
+Leaderboard driver-top3: `RT (from scratch) = 82.7`, `GelGT = 84.1`.
+
+**One matched-seed comparison exists.** A partial RT baseline (`results/baseline_qwen/`, 6 runs,
+cancelled on the user's instruction) covered driver-top3 **seed 1** at identical encoder/epochs/batch/
+seq_len — only the architecture differs:
+
+| driver-top3, seed 1 | test AUROC |
+|---|---|
+| `arch=rt` | 0.7882 |
+| `arch=two_level` | **0.9154** |
+
+**Why this is NOT yet a result:** 2 seeds of 3, on **1 task of 9**, and driver-top3 is the **noisiest
+task in the set** — RT's own two seeds spanned 7.7 AUROC points (0.788 / 0.865). A jump this size should
+raise suspicion before enthusiasm. The real test is rel-trial and rel-event (different schemas; rel-event
+is where the NaT fix actually changed the data). **Wait for the aggregate.**
 
 ---
 
-## 2. HARD RULES / GOTCHAS (do not violate)
+## 2. HARD RULES / GOTCHAS (preserved — do not violate)
+
 - **NEVER run `dense` or `dense_wide`.** The user was emphatic. RT-from-scratch on the leaderboard IS the
-  dense baseline. Baseline aggregates on the base router (`--baseline signature` / `--baseline hidden`).
-- **Metrics:** binary = **AUROC** (leaderboard shows ×100); regression = **NMAE = MAE / train-std**
-  (lower better). The pipeline (`task.evaluate`) reports **raw MAE**, NOT NMAE — divide by
-  `finetune.target_stats(task)[1]` (the train-std) to compare to the leaderboard. `run_gridsearch.py`
-  already stored `test_nmae`; `run_ablation.py` stores raw `test_mae` — convert at read time.
-- **Uncommitted collation fix in `gloss/data/graph.py`** (`_patch_multiembedding_offset`) — DO NOT lose it.
-  With `num_workers>0`, rel-event embedding columns come back from a DataLoader worker with a shifted
-  `MultiEmbeddingTensor.offset` → torch_frame `assert offset[0]==0` crash. The patch rebases the offset
-  content-preservingly (no-op when offset[0]==0). Verified + tests green (66 passed). It's active for the
-  v2 runs (they use `num_workers=8`). **Not on GitHub yet** (see §5).
-- **8-GPU cap** is a hard QOS limit (`QOSMaxGRESPerUser`) — submitting more just queues (`%8` is fine).
-- **This cluster = Milgram: `gpu` partition, `h100:1`.** The committed `run_ablation.sh`/`prep.sh` have
-  the OTHER cluster's `gpu_h200`/`h200:1` baked in — override at submit with `--partition=gpu --gpus=h100:1`
-  (that's what the 16 arrays did). No h200 here.
-- **rel-event cache paths (2026-07-03 fix).** The pulled `env.sh` repoints all caches to
-  `~/scratch60/gloss/{relbench,graph_cache,schema_cache}`. rel-f1/rel-trial auto-download there, but
-  **rel-event can't** (needs a manual Kaggle file) → every rel-event task failed with `RuntimeError:
-  Dataset not found ... event-recommendation-engine-challenge.zip`. Fix = **symlinks** pointing rel-event
-  in the new roots at the real data:
+  dense baseline. Aggregate against the base router (`--baseline signature`).
+- **Only the 9 RT-reported leaderboard tasks** (`--tasks leaderboard`), never all 18.
+- **Metrics:** binary = **AUROC** (leaderboard ×100); regression = **NMAE = MAE / train-std** (lower
+  better). `run_ablation.py` stores **raw `test_mae`, NOT NMAE** — divide by
+  `finetune.target_stats(task)[1]`. `gloss/eval/leaderboard.py` pins this conversion in code; use it
+  rather than converting by hand.
+- **`gloss/data/graph.py:_patch_multiembedding_offset` — DO NOT lose it.** With `num_workers>0`,
+  embedding columns return from a DataLoader worker with a shifted `MultiEmbeddingTensor.offset` →
+  torch_frame `assert offset[0]==0` crash. The patch rebases content-preservingly and **deliberately
+  falls through** on layouts it cannot verify ("no silent fix" — correct; a wrong rebase corrupts
+  embeddings instead of crashing).
+  **→ KNOWN WORKAROUND: re-run the few affected configs with `--num-workers 0` (bulletproof).**
+  This is sporadic (~6 configs in a previous 432-job study), so it is a per-config retry, not a blocker.
+- **8-GPU cap is a hard QOS limit** (`QOSMaxGRESPerUser`); submitting more just queues. `%8` is right.
+- **`run_ablation.py` has NO OOM-retry** (unlike `run_gridsearch.py`). If a config OOMs on h100 at batch
+  64, it just fails — watch for missing result files and re-run with a smaller batch.
+- **This cluster = Milgram: `gpu` partition, `h100:1`.** `run_ablation.sh` / `prep.sh` used to hardcode
+  another cluster's `gpu_h200`/`h200:1` and **could never schedule**; both are now FIXED in the committed
+  scripts (`fb0ccfb`). `sinfo`: `gpu` = a40:4 + h100:4. No h200 here.
+- **rel-event cache symlinks — fragile, re-check after any scratch cleanup.** `env.sh` repoints caches to
+  `~/scratch60/gloss/{relbench,graph_cache,schema_cache}`. rel-f1/rel-trial auto-download; **rel-event
+  cannot** (manual Kaggle file). Required:
   `~/scratch60/gloss/relbench/rel-event -> ~/scratch60/relbench/rel-event`,
   `.../graph_cache/rel-event -> <repo>/data/graph_cache/rel-event`,
   `.../schema_cache/rel-event -> <repo>/data/schema_cache/rel-event`.
-  **If these symlinks vanish (scratch cleanup) or you re-`prep` rel-event, it'll break again** — re-create
-  the symlinks (do NOT try to auto-download rel-event).
+  If they vanish every rel-event task fails with `RuntimeError: Dataset not found ...
+  event-recommendation-engine-challenge.zip`. **Re-create the symlinks; do NOT auto-download rel-event.**
+- **`data/schema_cache/` is NOT the cache the cluster reads.** `env.sh` sets `GLOSS_SCHEMA_CACHE` to
+  scratch60; the repo-relative dir is a hermetic-test fallback holding stale dev leftovers. An earlier
+  encoder-coverage table was read from the wrong one and was wrong. Always check
+  `~/scratch60/gloss/schema_cache/`.
+- **Milgram has NO working GitHub push auth** (HTTPS no creds, SSH key unregistered; `fetch` works).
+  Commits stay local — the user pushes from an authenticated machine.
+- **`results/` is gitignored.** Regenerate leaderboard numbers with `scripts/fetch_leaderboard.py`.
 
 ---
 
-## 3. RESULTS SO FAR (context) — the arch grid search (CANCELLED, partial)
-Before v2, an **architecture grid search** ran (arrays 28970564 + rerun 28975076, now cancelled). It swept
-`signature`-router × {d_model,n_blocks,n_heads,d_ff,enc_channels,num_experts} × 9 RT tasks × 3 seeds.
-**872/2592 partial results in `results/gridsearch/`.** Headline from that partial run:
+## 3. WHAT IS BUILT — all of `changes.md` §1–§4. **211 tests green.**
 
-**Best MoRE (signature) vs baselines — beats RT (from scratch) on 6/9, GelGT on 3/9:**
-| Task | GelGT | RT(scratch) | MoRE best | >RT | >GelGT |
-|---|---|---|---|---|---|
-| rel-f1/driver-dnf (AUROC↑) | 76.1 | 78.7 | **82.9** | ✅ | ✅ |
-| rel-f1/driver-top3 (AUROC↑) | 84.1 | 82.7 | **90.6** | ✅ | ✅ |
-| rel-trial/study-outcome (AUROC↑) | 72.5 | 68.6 | 69.4 | ✅ | ❌ |
-| rel-event/user-repeat (AUROC↑) | 83.6 | 79.7 | 79.5 | ❌ | ❌ |
-| rel-event/user-ignore (AUROC↑) | 87.8 | 85.1 | 87.3 | ✅ | ❌ |
-| rel-f1/driver-position (NMAE↓) | 0.532 | 0.478 | **0.395** | ✅ | ✅ |
-| rel-trial/study-adverse (NMAE↓) | 0.126 | 0.131 | 0.161 | ❌ | ❌ |
-| rel-trial/site-success (NMAE↓) | 0.732 | 0.734 | 0.840 | ❌ | ❌ |
-| rel-event/user-attendance (NMAE↓) | 0.317 | 0.504 | 0.399 | ✅ | ❌ |
+| item | file |
+|---|---|
+| P0.1 role vocabulary, **triple-keyed** `(child, col, parent)` | `data/graph.py` |
+| P0.2 `adj_role` row adjacency, P0.3 hop (BFS) | `data/row_graph.py`, `data/collate.py` |
+| P0.4 table/role **name** embeddings (qwen-cached, all 3 DBs) | `text/schema.py` |
+| P0.5 **pinned** stype enum (`N_STYPES = 10`, bundle-independent) | `text/schema.py` |
+| Fixed-frequency time ladder + `b_untimed` + `b_clamped` | `model/time_encoding.py` |
+| RowSignature / RowPool / RowAttention / Broadcast / RowMoE | `model/row_level.py` |
+| TwoLevelBlock / TwoLevelSubstrate, cell RoPE, full cell attention | `model/two_level.py` |
+| `RowTokenHead` (§3.8) | `model/heads.py` |
+| `arch ∈ {rt, two_level}` | `model/more.py` |
+| §4 config (`model.two_level`, `time`) | `configs/default.yaml` |
+| `--arch` / `--phase {phase0a,phase0b,full}` | `scripts/run_ablation.py`, `eval/ablation.py` |
+| bit-for-bit parity guard | `tests/test_parity.py`, `tests/fixtures/` |
+| leaderboard comparison (RT + GelGT) | `eval/leaderboard.py`, `scripts/fetch_leaderboard.py` |
 
-Notable: **best configs were all SMALL** (`d_model=128`, ~5–7M active params, top-2 of M experts). The
-256/512 tiers hadn't beaten them when cancelled. Caveat: some winners were 1–2 seeds (winner's curse).
+`rt_substrate.py` is **untouched** so `arch: rt` stays a valid A/B baseline — that is what the parity
+guard protects.
 
-**Baselines saved: `results/leaderboard_baselines.json`** — RT (from scratch) + GelGT for ALL 21 RelBench
-tasks (classification AUROC%, regression NMAE), pulled from HF leaderboard. Cross-checked: GelGT leaderboard
-numbers match the GelGT paper exactly (classification direct; regression = paper-MAE ÷ train-std). RT (from
-scratch) is the **target to beat**.
-
----
-
-## 4. GIT STATE
-- On `main`, HEAD = `2db8f45` ("ablation-v2: hybrid + S/C/P/H"), pulled from GitHub (fast-forward).
-- **Uncommitted (keep all):** `gloss/data/graph.py` (collation fix, §2); `gloss/eval/ablation.py` +
-  `scripts/run_ablation.py` (the **`--tasks leaderboard`** filter + `LEADERBOARD_TASKS`);
-  `gloss/train/finetune.py` (**`gradient_clip_val=1.0`**) + `gloss/train/loop.py` (**non-finite-grad guard**,
-  see below); `recap.md` (this file).
-- **hidden×HMoE NaN (2026-07-04).** The 4 arms combining `hidden` router × `--hmoe`
-  (Full/Full-S/Full-C/Full-P) **diverge to NaN during training** — specifically **NaN *gradients* while the
-  forward stays finite** (so `gradient_clip_val=1.0`, which I also added, does NOT fix it — clipping a NaN
-  grad stays NaN). Crashes at validation on the 5 binary tasks (sklearn rejects NaN preds). `signature`×HMoE
-  and `hidden`×non-HMoE are fine. **Could not reproduce locally** (CPU/hash/1-batch hits a spurious
-  numerical-encoder NaN that even `dense` triggers — unfaithful). This matches `moe_ablation.md`'s own
-  prediction that **H is the highest-variance / most-likely-unstable addition.**
-  - **Mitigation:** a non-finite-gradient guard in `loop.py` (`on_before_optimizer_step` → `nan_to_num_`
-    the grads → 0) so NaN can't poison the weights → the job completes instead of crashing. Re-running the
-    4 arms as **28976714–717**. **CAVEAT: if their AUROC comes out ~0.5 (init-level), the arm genuinely
-    doesn't train under `hidden` routing — report hidden×HMoE as unstable rather than trusting the number.**
-- **sporadic collation `offset[0]` asserts** (~6) slip past the graph.py patch (a 3rd layout). Re-run those
-  few with `--num-workers 0` (bulletproof; arrays 28976701–703).
-- Earlier session commits (`2bd515f`, `617aad9`: gitignore fix that TRACKS `gloss/data/graph.py`, the
-  't'/'f' boolean-target fix, prep OOM fix, grid-search runner) are on GitHub via the user's push.
+**Diagnostic scripts (all reusable):** `measure_substrate.py` (R, mask density, τ stats, ladder audit) ·
+`probe_sampler_causality.py` (does `t4` exist) · `probe_fk_role_collision.py` (role-vocabulary regression
+check) · `probe_relevent_time.py` (NaT / clamped-Δ) · `probe_met_offset.py` (the offset assert) ·
+`capture_parity_baseline.py`.
 
 ---
 
-## 5. OPEN THREADS / TODO when you return
-1. **v2 ablation results** — aggregate both dirs (§1). Look for: does **S (shared expert)** help
-   (predicted robust win)? Do C/P/H help on complex `rel-trial` but hurt simple `rel-f1`? signature vs
-   hidden router (the M0/base rows). Compare abs numbers to RT/GelGT in `leaderboard_baselines.json`.
-2. **Commit the graph.py collation fix + push.** Push from an authenticated machine — **Milgram has NO
-   working GitHub push auth** (HTTPS no creds, SSH key not registered; `git fetch` works so repo is public).
-3. **Arch grid search** was cancelled at 34% (best small configs beat RT 6/9). Decide: resume, or fold the
-   winning small-config insight into v2. `results/gridsearch/` has 872 partial JSONs +
-   `scripts/run_gridsearch.py --aggregate`.
-4. **run_ablation.py has NO OOM-retry** (unlike run_gridsearch.py). If HMoE (8 experts) OOMs at batch 64 on
-   rel-event/h100, those arms fail — watch `results/v2_add_*/` for missing HMoE variants; reduce batch or
-   add retry if so.
+## 4. THE FINDINGS THAT MATTER (full detail + measurements in `amendments.md`)
+
+1. **P0.1 was a vocabulary bug, not plumbing.** Role ids were keyed on the FK **column name alone**:
+   rel-f1 had 4 roles instead of 13, rel-trial **6 instead of 15** (all ten `nct_id → studies` relations
+   collapsed to one), rel-event 4 instead of 7. **Phase 2's role bias would have been a guaranteed null
+   for a mechanical reason.** Fixed; `probe_fk_role_collision.py` asserts 13/15/7.
+2. **NaT timestamps encoded as the year 1677.** `to_unix_time` maps `NaT` to `pd.Timestamp.min//1e9` =
+   `-9223372037` — a *finite* sentinel — and `collate.py` marked whole timed *tables* as timed. ~65k
+   rel-event rows read as "336 years before the seed" (τ = 23.08). Fixed with a per-**row** plausibility
+   floor (1800-01-01). **Every pre-existing rel-event number was computed under this bug.**
+3. **`seq_len=512` BINDS on rel-event** (p90 = max = 512, ≥10% of seeds truncated). The "0% truncation"
+   claim was generalised from the only two DBs then measured. Phase 5's headroom premise fails there.
+4. **`t4` (path-causal masking) is a SAMPLER change, not a mask change.** rel-event: 55% of hop-adjacent
+   pairs have the child dated LATER than its parent (worst +197.6 d). Masking cannot impose an ordering
+   the sample never had. **Not implementable as `changes.md` specifies.**
+5. **The ladder band `[0.05, 5.0]` was wrong** — derived from τ's *range* (22) when what matters is its
+   *spread* (σ ≈ 1.6–1.9), leaving 2 of 8 channels dead. Now `[0.3, 5.0]`, measured.
+6. **Seed rows had Δ clamped to 0** (35% of rel-event task rows are dated after their own seed), making
+   "the query row" identical to "maximally recent" — and that τ=0 mass was the *sole* cause of the
+   ladder's wraparound. Fixed with `b_clamped` + an indicator channel in `feats()`.
+7. **The parity guard works and is correctly scoped.** It fired on P0.5 (7 failures, `stype_emb 2→10`,
+   64/95 params differing) and was re-captured deliberately; it stayed correctly quiet on `b_clamped`,
+   which exists only on the two-level path.
+8. **val ≪ test is expected here, not a bug.** RelBench splits are temporal and *disjoint eras* — rel-f1
+   train 1994–2004, val 2005–2008, **test 2010–2013**. With ~600-row splits, ±0.03–0.04 AUROC noise, and
+   val being a *selected* max over epochs, per-task gaps under ~0.05 are indistinguishable from noise.
+   **Weight the 9-task aggregate, never a single task.**
+
+---
+
+## 5. OPEN THREADS / TODO
+
+1. **[watch] the array.** Aggregate when it fills (§1). Expect driver-top3 to be noisy.
+2. **[bug, sporadic] the offset assert.** RT baseline index 6 (rel-f1/driver-top3 seed 0) died on it; the
+   two-level run of the *same index* **succeeded** → nondeterministic. Reproduces **only with
+   `num_workers>0`**; all 3 splits collate cleanly at `workers=0`; the patch's own `off.numel() >= 2`
+   guard **excludes** the failing case, so the hypothesis is a **zero-column** MET with nonzero offset
+   base — **UNCONFIRMED**, because worker `print()` does not survive. To confirm, make
+   `probe_met_offset.py` **write the record to a file** from inside the worker. **Do not widen the patch
+   on inference.** Practical fix meanwhile: re-run that config with `--num-workers 0`.
+3. **[decision] no RT baseline was run** (user cancelled; 6 partial runs kept). Consequence: a null
+   two-level result is **not bisectable** — run `--phase phase0a` then `phase0b` to attribute. `phase0b`
+   differs from `phase0a` in exactly one switch (test-enforced).
+4. **[open, §3.7] Phase 4 arm design.** `r1` (both levels) differs from `r0` in **two** ways: the row
+   level exists *and* its experts are shared+routed. Isolating the shared expert needs its own arm.
+5. **[open] `PROGRESS.md` not appended** for this work (CLAUDE.md asks for it per phase).
+6. **[deferred, unchanged]** LODO zero-shot transfer (`signature ≫ identity`), masked-cell pretraining,
+   true sparse MoE dispatch, recommendation/link tasks, the recency-axis ablation.
 
 ---
 
 ## 6. KEY FILES
-- `moe_ablation.md` — the v2 ablation design (routers, S/C/P/H, tiers, predictions). **Read this first.**
-- `gloss/eval/ablation.py` — `run_config` (one array task), `variant_label`, `format_table` (aggregate).
-- `scripts/run_ablation.py` / `.sh` — the array runner + CLI flags (`--use-shared/--cosine/--top-p/--hmoe/
-  --baseline/--signals`).
-- `gloss/model/moe.py` — `MoEFFN` (+ shared/cosine/top-p), `HMoEFFN`, `ortho_loss`.
-- `gloss/model/more.py`, `rt_substrate.py` — model + relational blocks (`route_feat` incl. `hybrid`).
-- `gloss/data/graph.py` — graph build + `make_loader` + the collation fix.
-- `results/leaderboard_baselines.json` — RT (from scratch) + GelGT, all tasks.
-- Memory: `~/.claude/projects/.../memory/` (never-run-dense, leaderboard-metric-nmae, gridsearch-inflight).
+
+- `CLAUDE.md` — normative rules. Updated: MoE is now at **two granularities**; cell experts routed-only,
+  row experts shared+routed (intentional asymmetry, commented so it is not "harmonised" away).
+- `changes.md` — the two-level plan (§1 P0, §3 math, §4 config, §5 phases, §6 tests, §9 resolve-first).
+- **`amendments.md`** — what was wrong with it, measured. **Read before trusting `changes.md`.**
+- `gloss/eval/ablation.py` — `run_config` (one array task), `variant_label`, `aggregate`, `format_table`.
+  **`arch` is part of the `variant`**, so `two_level` and `rt` never share a filename or get averaged
+  together (test-enforced).
+- `results/leaderboard_baselines.json` — RT-from-scratch + GelGT, all 9 tasks (re-scraped, zero drift).
+- `results/two_level_full/` — the run in flight. `results/baseline_qwen/` — 6 partial RT runs.
+
+```bash
+.venv/bin/python -m pytest tests/ -q                                # 211 passed; must stay green
+.venv/bin/python scripts/run_train.py --dry-run --arch two_level    # real-data forward + row-graph summary
+```
