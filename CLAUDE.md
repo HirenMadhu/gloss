@@ -26,6 +26,12 @@ RT's frozen-LM token may already let a single shared FFN absorb every column.
 > no grounding, no FiLM `γ/β`, no `d_null`). The even-earlier **HALOS** design (Gaussian-in-τ kernels, geometry
 > generator, scale-equivariance) is under `archive/halos/` — also retired.
 
+> **On the `multi-level` branch, read [changes.md](changes.md) AND [amendments.md](amendments.md).**
+> `changes.md` is the plan for the two-level (cell, row) encoder; `amendments.md` records where that
+> plan was **measurably wrong** — six falsified claims and five bugs, each with its measurement. Note
+> `report.md`, which `changes.md` cites throughout, is **absent from the repo**, so every `report X##`
+> citation is unverifiable. Never trust a `changes.md` figure that `amendments.md` supersedes.
+
 **The spec files are normative — read them before doing anything:**
 - [idea.md](idea.md) — method design / rationale: the thesis (route on metadata, transform content), the one
   observation it's built on (RT's *additive* cell token = value component + frozen-LM schema component), the
@@ -58,14 +64,22 @@ arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, w
 
 - **Build on RT, don't reinvent it.** Keep RT's cell-token + relational-mask substrate (same-column / same-row
   / parent-FK / child-FK masks, no positional encoding, names-as-strings). RT / GNN / LightGBM are baselines.
-- **One mechanism.** The MoE enters at exactly one point: RT's `SwiGLU` FFN inside each `RelationalBlock`
-  becomes a `MoEFFN`. The router reads the **value-free signature**; the experts transform the hidden state.
+- **One mechanism, now at two granularities.** On `main` the MoE enters at exactly one point: RT's
+  `SwiGLU` FFN inside each `RelationalBlock` becomes a `MoEFFN`, routed on the **value-free** cell
+  signature. The `multi-level` branch **adds** a second, coarser MoE on the **row** FFN, routed on a
+  value-free *row* signature (table name ⊕ in-role ⊕ hop ⊕ recency); the cell MoE is unchanged. The
+  invariant that matters — *route on a value-free signature, transform the content* — holds at both
+  levels; "exactly one point" no longer does, and that is a deliberate decision, not drift.
+  Cell experts are **routed-only** (`use_shared=False`); row experts are **shared + routed**. That
+  asymmetry is intentional: the cell `+S` arm measured only mildly positive, on regression alone.
 - **Frozen text encoder, cached.** Column-name embeddings are computed offline with **`Qwen/Qwen3-Embedding-4B`**
   (`d_text`≈2560; config-swappable; `HashEncoder` for dev/tests) and cached to `data/schema_cache/`. **No LM
   forward passes in training** — gather the frozen `[C, d_text]` name table by column id.
 - **Value-free routing = leak-free by construction.** The signature is a pure function of a cell's own
   `(column, modality, recency)`; no neighborhood/global statistic enters the router. Recency uses **fixed,
-  context-independent** buckets. This is a unit-tested invariance (`test_routing_invariance.py`).
+  context-independent** buckets — or, behind `time.mode: rope`, a fixed-frequency ladder
+  (`model/time_encoding.py`) whose `ω` is a non-persistent buffer, never learned. Both are
+  context-independent, so the leak-free claim is unaffected. Unit-tested (`test_routing_invariance.py`).
 - **Six routing arms, one trained encoder:** `signature` (the method) | `value` | `identity` | `hidden` |
   `dense` (plain RT) | `dense_wide` (param-matched dense, `d_ff×k`). `signature` vs `dense` is the headline.
 - **Entity tasks, both types.** Binary classification (AUROC) **and** regression (MAE) across all entity tasks
