@@ -97,8 +97,26 @@ reference the same parent table and must stay distinct.
 ### P0.2 Build the row-level adjacency
 
 New `CellBatch` fields. `R = max_rows_per_seed`, config, assert not exceeded.
-Observed post-truncation row maxima: rel-f1 69, rel-trial 63, rel-stack 139.
-Set `R = 160` and assert.
+
+**Measured** (`scripts/measure_substrate.py`, 768 seeds, `seq_len=512`, fanout
+`[12,12]`), superseding the report's unverifiable figures:
+
+| dataset | task | mean | p90 | p99 | **max** | report claimed |
+|---|---|---|---|---|---|---|
+| rel-f1 | driver-dnf | 34.0 | 50 | 63 | **65** | 69 |
+| rel-trial | site-success | 11.9 | 25 | 25 | **25** | 63 |
+| rel-stack | — | *pending* | | | | 139 |
+
+`R = 160` stands, with generous margin at this fanout. **But note the assert is
+fanout-coupled**: Phase 5 sweeps `num_neighbors` up to `[32,16]`, which raises
+the ceiling roughly in proportion. Re-measure before Phase 5 rather than
+discovering it as a fired assert mid-sweep.
+
+**rel-trial saturates the sampler exactly.** p90 = p99 = max = 25 = `1 + 12 + 12`
+— every seed above median degree hits the `[12,12]` cap precisely, so the row
+count is reporting the *fanout*, not the data. This is direct corroboration of
+the degree-capping concern behind the Phase 5 sweep (report B8), measured rather
+than cited.
 
 | Field | Shape | Dtype | Meaning |
 |---|---|---|---|
@@ -537,6 +555,35 @@ Flip `cell.attention: full`.
 **Accept:** (a) within 1 std of Phase 0a; (b) profiler confirms flash /
 mem-efficient SDPA is selected, not the math backend; (c) measured wall-clock
 per step drops. Report the FLOP reduction as a number.
+
+**Measured, replacing the report's 97–98% claim** (`scripts/measure_substrate.py`,
+768 seeds/dataset, fanout `[12,12]`). Mask density is strongly `seq_len`-dependent
+and the report's figure was taken at the collate *default* of 1024, not at the
+512 this document specifies:
+
+| dataset | seq_len | col | feat | nbr | full | mean | wasted |
+|---|---|---|---|---|---|---|---|
+| rel-f1 | 512 | 1.03% | 1.05% | 0.52% | 20.17% | 5.69% | **94.31%** |
+| rel-f1 | 1024 | 0.31% | 0.31% | 0.18% | 5.09% | 1.47% | 98.53% |
+| rel-trial | 512 | 0.66% | 1.44% | 0.21% | 14.10% | 4.10% | **95.90%** |
+
+**Quote 94–96% at `seq_len=512`, not 97–98%.** Padding is what moves: rel-f1
+averages 209 real cells of 512, so pad-pairs are 20% of the matrix at 512 and 5%
+at 1024.
+
+Three corrections to how this phase is argued, all forced by the measurement:
+
+1. **Density is not the speedup.** Collapsing four attentions into one is exactly
+   **4×** fewer score matrices *regardless* of density. The density figure
+   supports a different claim — that the masks buy little coverage. Report the
+   two separately; do not let one imply the other.
+2. **Varlen packing matters more than the mask collapse.** Even after collapsing,
+   the single remaining attention is only ~20% useful pairs at 512. §3.2's
+   left-packing is where the rest of the win is.
+3. **`seq_len=512` is loose.** rel-f1's max is 353 cells/seed and rel-trial's is
+   317, so truncation binds on **0%** of seeds at `[12,12]` and ~59% of the
+   sequence is padding. That is headroom for Phase 5, and it means the Phase 5
+   fanout sweep can raise fanout before it needs `seq_len=1024`.
 
 If (a) fails, the `col` mask was load-bearing. Add a cell-level same-column
 attention back as a third operator and record that the decomposition is three
