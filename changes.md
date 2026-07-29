@@ -39,7 +39,7 @@ they still hold.
 | Zero dataset-fitted constants in the model | the encoder is meant to become a foundation model; see the rule below |
 | Single full cell attention replacing four masked ones | 97–98% of attention FLOPs on masked/padded pairs (report D14) |
 | Cross-attention row encoder (hybrid query) | replaces mean-pool; addresses Griffin App. C.1 degeneracy |
-| Row-level MoE, dense cell-level FFN | cell router is a 129-key lookup table (report F17, F19) |
+| Row-level MoE **added alongside** the existing cell-level MoE | cell router is a 129-key lookup table (report F17, F19); routing on a row signature is a coarser, complementary axis |
 | Head reads the seed row token | replaces mean over 6 seed cells (report H21) |
 | Fanout sweep | survived degree hard-capped at 12 for every high-degree relation (report B8) |
 
@@ -408,7 +408,8 @@ prefer building the batch so real cells are left-packed and using
 point of this change is to get off the math backend; verify with a profiler
 that flash / mem-efficient SDPA is actually selected.
 
-FFN: dense SwiGLU, unchanged.
+FFN: the existing `MoEFFN` (cell-level MoE), unchanged from today's MoRE — see §3.7. Only the
+attention changes at the cell level, not the FFN.
 
 ### 3.3 Row signature (`RowSignature`)
 
@@ -527,7 +528,27 @@ $$\mathcal{L}_{\text{aux}} = \lambda_{\text{ortho}}\sum_{\ell}\big\|\hat W_g \ha
 `f_e` = fraction of rows with top-1 `e`, `p_e` = mean gate probability for `e`.
 `λ_ortho = 0.5` (existing), `λ_bal = 0.01`.
 
-Cell-level FFN stays dense. Cell-level MoE is a Phase 4 ablation arm only.
+**DECIDED: the MoE lives at BOTH levels.** The cell-level `MoEFFN` stays exactly as it is today
+(router on the value-free cell signature — column ⊕ modality ⊕ recency, per CLAUDE.md); the row-level
+MoE above is **added alongside it**, not substituted for it.
+
+Earlier drafts said "cell-level FFN stays dense, cell MoE is a Phase 4 ablation arm only." That is
+retired. It would have *moved* the one mechanism to a different level and quietly changed what the
+router reads, contradicting CLAUDE.md's "the MoE enters at exactly one point." Adding a second level
+is the honest framing: **one mechanism, applied at two granularities**, each routing on the
+value-free signature of its own object — cell signature for cell experts, row signature (§3.3) for
+row experts.
+
+Consequences to keep straight:
+
+- **Two aux terms per level.** `ortho_loss` and the balance term are summed over cell blocks *and*
+  row blocks. Report them separately in `aux` so a collapse at one level is not masked by the other
+  (§7's expert-usage logging likewise splits by level).
+- **The param-matched control gets harder, not easier.** With MoE at both levels the dense-combine
+  cost is `num_experts × d_ff` at *both*, so Phase 4's `r0` must match both widths. Report the
+  active-FLOP arithmetic explicitly; do not claim parity.
+- **Phase 4's question changes** from *which level* to *does the row level add anything on top of the
+  cell level* — see the revised arm table.
 
 ### 3.8 Head
 
@@ -543,7 +564,7 @@ Per block `ℓ = 1..L`:
 
 ```
 1. cell attention        (temporal RoPE, pad mask)
-2. cell FFN              (dense SwiGLU)
+2. cell FFN              (MoEFFN, unchanged — §3.7)
 3. low->high  RowPool
 4. row attention         (role bias, relative-time bias)
 5. row FFN               (MoE)
@@ -571,7 +592,7 @@ model:
     attention: full          # full | four_mask
     rope_time: true
     rope_dims: 16            # 2m per head
-    ffn: dense
+    ffn: moe               # MoE at BOTH levels; cell MoE is today's mechanism, unchanged
 
   row:
     pool_query: hybrid       # mean | signature | hidden | hybrid
@@ -740,11 +761,16 @@ negative given that the information was being discarded.
 
 ### Phase 4 — routing
 
-| Arm | Config |
-|---|---|
-| `r0` dense | `row.ffn: dense`, matched width (see below) |
-| `r1` row MoE | `row.ffn: moe` |
-| `r2` cell MoE instead | `cell.ffn: moe`, `row.ffn: dense` |
+| Arm | Config | Question it answers |
+|---|---|---|
+| `r0` cell MoE only | `cell.ffn: moe`, `row.ffn: dense` @ matched width | the baseline — today's MoRE plus row tokens |
+| `r1` **both levels** | `cell.ffn: moe`, `row.ffn: moe` | **does the row MoE add anything on top of the cell MoE?** |
+| `r2` row MoE only | `cell.ffn: dense` @ matched width, `row.ffn: moe` | is the cell MoE still carrying its weight once rows exist? |
+
+`r1` is the design. `r0` is the arm that has to be beaten — it is *not* a dense control, it is
+today's mechanism, so this table asks whether the second level earns its parameters. `r2` is the
+interesting negative: if `r2 ≈ r1`, the cell MoE is redundant once row routing exists, which would
+be a real finding and the one case where dropping to a single level is justified by evidence.
 
 **Matched control.** The MoE combine is dense (every expert runs, gates only
 weight them), so active FFN width is `num_experts × d_ff`. The honest `r0` is a
@@ -755,8 +781,9 @@ Log from step 1: per-block expert usage histogram, `H(expert | table)`,
 `H(expert | role)`, `W_g` row norms, both aux terms. The current setup cannot
 distinguish collapse from intent; this is what fixes that.
 
-**Accept:** `r1 > r0@4·d_ff` outside seed variance, or the MoE gets one line in
-the ablation table and no subsection.
+**Accept:** `r1 > r0` outside seed variance — i.e. the row MoE beats today's cell-only mechanism.
+If not, the row MoE gets one line in the ablation table and no subsection, and `cell.ffn: moe` +
+`row.ffn: dense` is the shipped config.
 
 ### Phase 5 — fanout
 
