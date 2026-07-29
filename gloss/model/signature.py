@@ -61,7 +61,7 @@ class RelationalSignature(nn.Module):
             from .time_encoding import TimeLadder
 
             self.ladder = ladder or TimeLadder()
-            self.w_tau = nn.Linear(2 * self.ladder.n_freq, d_sig, bias=False)
+            self.w_tau = nn.Linear(self.ladder.feat_dim, d_sig, bias=False)
         self.norm = nn.RMSNorm(d_sig)
 
     def recency_bins(self, cb: CellBatch) -> Tensor:
@@ -84,6 +84,8 @@ class RelationalSignature(nn.Module):
             # 14 of the 20 buckets were empty; the ladder spends every channel instead. Untimed cells
             # get an all-zero feature pair (not [0;1]), so "unknown" stays linearly separable from
             # "Delta = 0" behind W_tau.
-            tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time)
-            z = z + self.w_tau(self.ladder.feats(tau, cb.is_timed).to(z.dtype))
+            seed_t = cb.seed_time.unsqueeze(1)
+            tau = self.ladder.tau_from_times(seed_t, cb.row_time)
+            clamped = self.ladder.was_clamped(seed_t, cb.row_time) & cb.is_timed
+            z = z + self.w_tau(self.ladder.feats(tau, cb.is_timed, clamped).to(z.dtype))
         return self.norm(z)                                                 # [B, S, d_sig]

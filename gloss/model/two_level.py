@@ -76,8 +76,11 @@ class CellAttention(nn.Module):
             th = theta.unsqueeze(1)
             q = self.ladder.rotate(q, th, self.n_rot)
             k = self.ladder.rotate(k, th, self.n_rot)
-            # theta=0 alone reads as "Delta=0, maximally recent" — the flag is what separates them
-            bias = self.ladder.untimed_bias(cb.is_timed, cb.is_timed).unsqueeze(1).to(x.dtype)
+            # theta=0 alone reads as "Delta=0, maximally recent" for untimed cells AND for cells
+            # whose Delta was clamped (§9.10); the additive flags are what separate the three states.
+            clamped = self.ladder.was_clamped(cb.seed_time.unsqueeze(1), cb.row_time) & cb.is_timed
+            bias = self.ladder.time_bias(cb.is_timed, cb.is_timed,
+                                         clamped, clamped).unsqueeze(1).to(x.dtype)
 
         real = ~cb.is_padding                                        # [B,S]
         mask = (real.unsqueeze(2) & real.unsqueeze(1)).unsqueeze(1)  # [B,1,S,S]
@@ -117,6 +120,7 @@ class TwoLevelBlock(nn.Module):
         row_ffn: str = "moe",
         row_num_experts: int = 4,
         row_k: int = 2,
+        row_use_shared: bool = True,
         lambda_ortho: float = 0.5,
         lambda_balance: float = 0.01,
         broadcast: str = "additive",
@@ -151,6 +155,7 @@ class TwoLevelBlock(nn.Module):
                                      role_bias=role_bias, time_bias=time_bias)
         if row_ffn == "moe":
             self.row_ffn = RowMoE(d_model, d_ff, d_sig, num_experts=row_num_experts, k=row_k,
+                                  use_shared=row_use_shared,
                                   lambda_ortho=lambda_ortho, lambda_balance=lambda_balance)
         else:
             self.row_ffn_norm = RMSNorm(d_model)

@@ -93,7 +93,7 @@ class RowSignature(nn.Module):
         self.w_rho = nn.Linear(role_name_emb.shape[-1], d_sig, bias=False)
         # hop is a small universal integer, so an embedding table over it is legal under §0
         self.hop_emb = nn.Embedding(max_hop + 1, d_sig)
-        self.w_tau = nn.Linear(2 * ladder.n_freq, d_sig, bias=False)
+        self.w_tau = nn.Linear(ladder.feat_dim, d_sig, bias=False)
         self.norm = RMSNorm(d_sig)
         self.max_hop = max_hop
 
@@ -107,8 +107,12 @@ class RowSignature(nn.Module):
         z = z + self.w_rho(self.role_name_emb[role])
         z = z + self.hop_emb(hop)
 
-        tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time_r)
-        z = z + self.w_tau(self.ladder.feats(tau, cb.row_is_timed).to(z.dtype))
+        seed_t = cb.seed_time.unsqueeze(1)
+        tau = self.ladder.tau_from_times(seed_t, cb.row_time_r)
+        # §9.10: rows dated AFTER their seed had Delta clamped to 0, so their sinusoids are identical
+        # to a genuine Delta = 0. The indicator channel is the only thing that separates them.
+        clamped = self.ladder.was_clamped(seed_t, cb.row_time_r) & cb.row_is_timed
+        z = z + self.w_tau(self.ladder.feats(tau, cb.row_is_timed, clamped).to(z.dtype))
         return self.norm(z)
 
 
@@ -291,9 +295,11 @@ class RowAttention(nn.Module):
             basis = torch.cat([torch.sin(d), torch.cos(d)], dim=-1)
             scores = scores + torch.einsum("hf,brsf->bhrs", self.w_tb, basis.to(scores.dtype))
 
-        # `b_untimed`: theta=0 alone would read as "Delta=0, maximally recent", which is wrong
-        scores = scores + self.ladder.untimed_bias(cb.row_is_timed, cb.row_is_timed) \
-            .unsqueeze(1).to(scores.dtype)
+        # theta=0 alone would read as "Delta=0, maximally recent" for BOTH untimed rows and rows
+        # whose Delta was clamped (§9.10); only additive flags can separate the three states.
+        clamped = self.ladder.was_clamped(cb.seed_time.unsqueeze(1), cb.row_time_r) & cb.row_is_timed
+        scores = scores + self.ladder.time_bias(cb.row_is_timed, cb.row_is_timed,
+                                                clamped, clamped).unsqueeze(1).to(scores.dtype)
 
         valid = cb.row_valid
         mask = (cb.adj_role != 0) & valid.unsqueeze(2) & valid.unsqueeze(1)
@@ -360,6 +366,7 @@ class RowMoE(nn.Module):
         *,
         num_experts: int = 4,
         k: int = 2,
+        use_shared: bool = True,
         lambda_ortho: float = 0.5,
         lambda_balance: float = 0.01,
     ):
@@ -370,6 +377,12 @@ class RowMoE(nn.Module):
         self.lambda_balance = lambda_balance
         self.norm = RMSNorm(d_model)
         self.experts = nn.ModuleList(SwiGLU(d_model, d_ff) for _ in range(num_experts))
+        # SHARED + ROUTED (DeepSeek-MoE style), and ON by default at the row level. The shared expert
+        # is always applied, so the routed experts only have to model what is *specific* to a row's
+        # signature rather than re-learning the shared transform in every expert. Note the cell level
+        # keeps `use_shared=False` (its `+S` arm measured as only mildly positive, on regression
+        # alone), so the two levels deliberately differ here.
+        self.shared = SwiGLU(d_model, d_ff) if use_shared else None
         self.w_g = nn.Parameter(torch.randn(num_experts, d_sig) * d_sig ** -0.5)
         self.log_T = nn.Parameter(torch.zeros(()))                         # T = exp(0) = 1.0
 
@@ -402,6 +415,8 @@ class RowMoE(nn.Module):
         y = torch.zeros_like(u)
         for e, expert in enumerate(self.experts):                          # dense combine (MVP)
             y = y + g[..., e:e + 1] * expert(x)
+        if self.shared is not None:
+            y = y + self.shared(x)                                         # always-on, ungated
 
         valid = cb.row_valid
         aux = self.lambda_ortho * self.ortho_loss() \

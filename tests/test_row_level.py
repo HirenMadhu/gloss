@@ -286,17 +286,21 @@ def test_row_moe_gates_sum_to_one_over_topk():
     assert int((g > 0).sum(-1).max()) == 2, "top-k support must be exactly k"
 
 
-def test_row_moe_dense_combine_equals_weighted_expert_sum():
+@pytest.mark.parametrize("use_shared", [False, True])
+def test_row_moe_dense_combine_equals_weighted_expert_sum(use_shared):
+    """Dense combine == gate-weighted routed sum, PLUS the ungated shared expert when enabled."""
     cb, K = stub_batch()
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     torch.manual_seed(0)
-    moe = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, num_experts=4, k=2)
+    moe = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, num_experts=4, k=2, use_shared=use_shared)
     u, z = torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG)
     out, _, _ = moe(u, z, cb)
 
     g = moe.gates(z)
     x = moe.norm(u)
     ref = sum(g[..., e:e + 1] * moe.experts[e](x) for e in range(4))
+    if use_shared:
+        ref = ref + moe.shared(x)          # always-on, NOT multiplied by any gate
     assert torch.allclose(out - u, ref, atol=1e-5)
 
 
@@ -367,3 +371,47 @@ def test_grad_reaches_router_signature_wtau_and_b_untimed():
                     ("gamma v_head", att.v_head), ("b_untimed", ladder.b_untimed)):
         assert p.grad is not None, f"no grad reached {name}"
         assert torch.isfinite(p.grad).all(), f"non-finite grad at {name}"
+
+
+# ---- shared + routed row experts ----
+
+
+def test_row_moe_is_shared_plus_routed_by_default():
+    moe = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG)
+    assert moe.shared is not None, "row experts should be shared+routed by default"
+
+
+def test_shared_expert_is_always_on_regardless_of_gates():
+    """The shared expert must contribute even for a row whose gates concentrate elsewhere."""
+    cb, K = stub_batch()
+    B, R = cb.num_seeds, cb.adj_role.shape[1]
+    torch.manual_seed(0)
+    shared = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, use_shared=True)
+    u, z = torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG)
+
+    out, _, _ = shared(u, z, cb)
+    g = shared.gates(z)
+    x = shared.norm(u)
+    routed = sum(g[..., e:e + 1] * shared.experts[e](x) for e in range(shared.num_experts))
+    # output = u + routed + shared(x); the shared term is NOT gated
+    assert torch.allclose(out - u - routed, shared.shared(x), atol=1e-5)
+
+
+def test_routed_only_still_available_for_the_ablation():
+    cb, K = stub_batch()
+    B, R = cb.num_seeds, cb.adj_role.shape[1]
+    routed_only = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, use_shared=False)
+    assert routed_only.shared is None
+    out, aux, _ = routed_only(torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG), cb)
+    assert torch.isfinite(out).all() and torch.isfinite(aux)
+
+
+def test_shared_expert_adds_parameters_but_no_dataset_shape():
+    a = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, use_shared=False)
+    b = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG, use_shared=True)
+    na = sum(p.numel() for p in a.parameters())
+    nb = sum(p.numel() for p in b.parameters())
+    assert nb > na, "shared expert should add parameters"
+    # one extra SwiGLU, nothing sized by a dataset id
+    assert all("shared" not in k or v.shape[0] in (D_MODEL, 4 * D_MODEL, 2 * 4 * D_MODEL)
+               for k, v in b.state_dict().items())

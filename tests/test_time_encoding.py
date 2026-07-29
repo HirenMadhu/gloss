@@ -130,8 +130,8 @@ def test_untimed_theta_and_feats_are_zero():
     assert torch.count_nonzero(th[~is_timed]) == 0
     assert (th[is_timed][1] != 0).any()
     f = ladder.feats(tau, is_timed)
-    assert f.shape == (4, 2 * ladder.n_freq)
-    assert torch.count_nonzero(f[~is_timed]) == 0
+    assert f.shape == (4, ladder.feat_dim)          # 2*n_freq + the §9.10 clamped indicator
+    assert torch.count_nonzero(f[~is_timed]) == 0  # untimed zeroes the sinusoids AND the flag
 
 
 def test_untimed_is_not_equivalent_to_delta_zero():
@@ -271,13 +271,16 @@ def test_feats_are_sin_then_cos_of_the_same_ladder():
     f = ladder.feats(tau)
     n = ladder.n_freq
     assert torch.allclose(f[..., :n], torch.sin(th))
-    assert torch.allclose(f[..., n:], torch.cos(th))
+    assert torch.allclose(f[..., n:2 * n], torch.cos(th))
+    # trailing channel is the §9.10 clamped indicator, 0 when no clamp info was supplied
+    assert f.shape[-1] == ladder.feat_dim
+    assert torch.count_nonzero(f[..., -1]) == 0
 
 
 def test_feats_behind_a_learned_map_have_a_gradient_but_omega_does_not():
     """§3.1: the linear map is learned, the frequencies are not."""
     ladder = TimeLadder()
-    w = torch.nn.Linear(2 * ladder.n_freq, 5, dtype=torch.float64)
+    w = torch.nn.Linear(ladder.feat_dim, 5, dtype=torch.float64)
     tau = ladder.tau(torch.tensor([DAY, YEAR], dtype=torch.float64))
     w(ladder.feats(tau, torch.tensor([True, True]))).sum().backward()
     assert w.weight.grad is not None and torch.isfinite(w.weight.grad).all()
@@ -290,9 +293,12 @@ def test_omega_is_a_non_persistent_buffer_not_a_parameter():
     ladder = TimeLadder()
     sd = ladder.state_dict()
     assert "omega" not in sd, "omega must be persistent=False — a checkpointed ladder is an artifact"
-    assert list(sd) == ["b_untimed"], f"unexpected state_dict entries: {list(sd)}"
+    # Two learned scalars, both UNIVERSAL (no dataset shape): b_untimed (§3.1) and b_clamped
+    # (§9.10, rows dated after their own seed). Anything else appearing here is an artifact.
+    assert sorted(sd) == ["b_clamped", "b_untimed"], f"unexpected state_dict entries: {list(sd)}"
     names = {n for n, _ in ladder.named_parameters()}
-    assert names == {"b_untimed"}
+    assert names == {"b_untimed", "b_clamped"}
+    assert all(v.ndim == 0 for v in sd.values()), "both flags must be scalars, not per-dataset rows"
     assert not isinstance(ladder.omega, torch.nn.Parameter)
     assert {n for n, _ in ladder.named_buffers()} == {"omega"}      # no fitted statistic hides here
 
@@ -324,3 +330,84 @@ def test_no_standardisation_hooks_exist():
     ladder = TimeLadder()
     present = {n for n, _ in ladder.named_parameters()} | {n for n, _ in ladder.named_buffers()}
     assert not (present & forbidden), f"dataset-fitted statistic on the module: {present & forbidden}"
+
+
+# ---- §9.10: the clamped-Delta flag ----
+
+
+def test_was_clamped_detects_rows_dated_after_their_seed():
+    """Must be computed from RAW times: after the clamp these are identical to a genuine Delta = 0."""
+    ladder = TimeLadder()
+    seed = torch.tensor([[100.0, 100.0, 100.0]], dtype=torch.float64)
+    row = torch.tensor([[50.0, 100.0, 150.0]], dtype=torch.float64)   # past, exact, FUTURE
+    clamped = ladder.was_clamped(seed, row)
+    assert clamped.tolist() == [[False, False, True]]
+    # and the clamp really does erase the difference downstream
+    tau = ladder.tau_from_times(seed, row)
+    assert float(tau[0, 1]) == float(tau[0, 2]) == 0.0
+
+
+def test_feats_separates_clamped_from_genuine_delta_zero():
+    """The sinusoids cannot tell them apart; the indicator channel is the only thing that can."""
+    ladder = TimeLadder()
+    seed = torch.tensor([[100.0, 100.0]], dtype=torch.float64)
+    row = torch.tensor([[100.0, 150.0]], dtype=torch.float64)         # Delta=0 exactly vs clamped
+    timed = torch.ones(1, 2, dtype=torch.bool)
+    tau = ladder.tau_from_times(seed, row)
+    clamped = ladder.was_clamped(seed, row)
+
+    f = ladder.feats(tau, timed, clamped)
+    assert f.shape[-1] == ladder.feat_dim == 2 * ladder.n_freq + 1
+    # the sinusoid block is identical...
+    assert torch.allclose(f[0, 0, :-1], f[0, 1, :-1])
+    # ...and only the flag differs
+    assert float(f[0, 0, -1]) == 0.0 and float(f[0, 1, -1]) == 1.0
+
+
+def test_feats_keeps_untimed_clamped_and_delta_zero_all_distinct():
+    """Three states, three distinct encodings — untimed must not collide with either."""
+    ladder = TimeLadder()
+    seed = torch.tensor([[100.0, 100.0, 100.0]], dtype=torch.float64)
+    row = torch.tensor([[100.0, 150.0, 0.0]], dtype=torch.float64)
+    timed = torch.tensor([[True, True, False]])
+    clamped = ladder.was_clamped(seed, row) & timed
+    f = ladder.feats(ladder.tau_from_times(seed, row), timed, clamped)
+
+    delta0, clam, untimed = f[0, 0], f[0, 1], f[0, 2]
+    assert not torch.allclose(delta0, clam)
+    assert not torch.allclose(delta0, untimed)
+    assert not torch.allclose(clam, untimed)
+    assert bool((untimed == 0).all()), "untimed should be the all-zero encoding"
+
+
+def test_clamped_bias_is_a_separate_learned_scalar_with_grad():
+    ladder = TimeLadder()
+    assert "b_clamped" in dict(ladder.named_parameters())
+    q = torch.tensor([[False, True]])
+    b = ladder.clamped_bias(q, q)
+    assert b.shape == (1, 2, 2)
+    with torch.no_grad():
+        ladder.b_clamped.fill_(0.5)
+    b = ladder.clamped_bias(q, q)
+    # any pair touching the clamped endpoint picks up the bias; the (0,0) pair does not
+    assert float(b[0, 0, 0]) == 0.0
+    assert float(b[0, 0, 1]) == float(b[0, 1, 0]) == float(b[0, 1, 1]) == 0.5
+
+    ladder.b_clamped.grad = None
+    ladder.clamped_bias(q, q).sum().backward()
+    assert ladder.b_clamped.grad is not None and float(ladder.b_clamped.grad) != 0.0
+
+
+def test_time_bias_combines_untimed_and_clamped():
+    ladder = TimeLadder()
+    with torch.no_grad():
+        ladder.b_untimed.fill_(0.25)
+        ladder.b_clamped.fill_(0.5)
+    timed = torch.tensor([[True, True]])
+    clamped = torch.tensor([[False, True]])
+    both = ladder.time_bias(timed, timed, clamped, clamped)
+    assert float(both[0, 0, 0]) == 0.0                 # neither flag
+    assert float(both[0, 1, 1]) == 0.5                 # clamped only
+    # untimed-only path still works when no clamp info is supplied
+    untimed = torch.tensor([[True, False]])
+    assert float(ladder.time_bias(untimed, untimed)[0, 1, 1]) == 0.25

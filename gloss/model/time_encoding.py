@@ -117,6 +117,21 @@ class TimeLadder(nn.Module):
         # Non-persistent: a fixed constant of the architecture, never checkpointed, never learned.
         self.register_buffer("omega", w, persistent=False)
         self.b_untimed = nn.Parameter(torch.zeros(()))
+        # changes.md §9.10. `Delta = max(0, t* - t_row)` CLAMPS every row dated after its own seed to
+        # Delta = 0, i.e. tau = 0 — indistinguishable from "happened right now". Those rows are the
+        # query entity's own row, which RelBench includes regardless of its timestamp: 35% of
+        # rel-event/user-attendance task rows, median +9.7 days. "This is the query row" and "this is
+        # maximally recent" are different statements and the clamp collapsed them.
+        #
+        # This is also why the ladder band trips its wraparound check: the tau = 0 mass stretches
+        # rel-f1's observed range from the bulk's 8.2 to 19.7, so the lowest channel aliases tau ~ 0
+        # against tau ~ 21. Flagging the clamp instead of hiding it fixes both at once.
+        self.b_clamped = nn.Parameter(torch.zeros(()))
+
+    @property
+    def feat_dim(self) -> int:
+        """Width of :meth:`feats` — ``2*n_freq`` plus the clamped-indicator channel."""
+        return 2 * self.n_freq + 1
 
     # ---------------------------------------------------------------- τ ---
     @staticmethod
@@ -134,6 +149,15 @@ class TimeLadder(nn.Module):
         """Convenience: ``τ`` straight from a seed time and a row time (broadcast as given)."""
         return self.tau(self.delta_seconds(seed_time, row_time))
 
+    @staticmethod
+    def was_clamped(seed_time: Tensor, row_time: Tensor) -> Tensor:
+        """``t_row > t*`` — the rows whose Δ the ``max(0, ·)`` clamp destroyed (§9.10).
+
+        Must be computed from the raw times, *before* clamping, which is why it cannot be recovered
+        from τ downstream: after the clamp these are numerically identical to a genuine Δ = 0.
+        """
+        return row_time.to(torch.float64) > seed_time.to(torch.float64)
+
     # ------------------------------------------------------------ ladder ---
     def theta(self, tau: Tensor, is_timed: Tensor | None = None) -> Tensor:
         """``θ^(k) = ω_k · τ`` -> ``[..., n_freq]``; exactly 0 on every channel where ``is_timed`` is False."""
@@ -147,17 +171,26 @@ class TimeLadder(nn.Module):
         """Convenience: ``θ`` straight from times, with untimed entries zeroed."""
         return self.theta(self.tau_from_times(seed_time, row_time), is_timed)
 
-    def feats(self, tau: Tensor, is_timed: Tensor | None = None) -> Tensor:
-        """``[sin θ ; cos θ] ∈ R^{2·n_freq}`` -> ``[..., 2*n_freq]``, **all-zero** where untimed.
+    def feats(self, tau: Tensor, is_timed: Tensor | None = None,
+              is_clamped: Tensor | None = None) -> Tensor:
+        """``[sin θ ; cos θ ; 1[clamped]]`` -> ``[..., feat_dim]`` = ``[..., 2*n_freq + 1]``.
 
-        Zeroing (rather than leaving ``cos 0 = 1``) is what keeps "untimed" linearly distinguishable
-        from "Δ = 0" downstream of the learned ``W_τ`` of §3.3.
+        Three states must stay linearly separable behind the learned ``W_τ`` of §3.3, and none of
+        them is separable from the others by the sinusoids alone:
+
+        * **timed, Δ > 0** — the ordinary case.
+        * **untimed** — the whole pair is **zeroed**, rather than left at ``cos 0 = 1``, so it does
+          not collide with Δ = 0.
+        * **clamped** (``t_row > t*``, §9.10) — sinusoids are identical to a genuine Δ = 0, so the
+          only thing that can distinguish it is the explicit indicator channel.
         """
         th = self.theta(tau)                                    # unmasked: mask the pair, not θ
         f = torch.cat((torch.sin(th), torch.cos(th)), dim=-1)   # [..., 2*n_freq]
         if is_timed is not None:
             f = f * is_timed.unsqueeze(-1).to(f.dtype)
-        return f
+        flag = (torch.zeros_like(f[..., :1]) if is_clamped is None
+                else is_clamped.unsqueeze(-1).to(f.dtype))
+        return torch.cat((f, flag), dim=-1)                     # [..., 2*n_freq + 1]
 
     # ---------------------------------------------------------- rotation ---
     def rotate(self, x: Tensor, theta: Tensor, n_rot_dims: int | None = None) -> Tensor:
@@ -200,6 +233,26 @@ class TimeLadder(nn.Module):
         """``b_untimed · 1[q or k untimed]`` -> ``[..., Sq, Sk]``, the additive logit term of §3.1/§3.5."""
         either_untimed = ~(is_timed_q.unsqueeze(-1) & is_timed_k.unsqueeze(-2))
         return self.b_untimed * either_untimed.to(self.b_untimed.dtype)
+
+    def clamped_bias(self, is_clamped_q: Tensor, is_clamped_k: Tensor) -> Tensor:
+        """``b_clamped · 1[q or k clamped]`` -> ``[..., Sq, Sk]`` (§9.10).
+
+        The rotation cannot express this: a clamped row has ``θ = 0`` exactly like a genuine Δ = 0,
+        so the *relative* angle to every other row is the same in both cases. Only an additive term
+        can separate "the query row" from "maximally recent", which is the same argument §3.1 makes
+        for ``b_untimed`` — hence the same mechanism, and one extra universal scalar.
+        """
+        either = is_clamped_q.unsqueeze(-1) | is_clamped_k.unsqueeze(-2)
+        return self.b_clamped * either.to(self.b_clamped.dtype)
+
+    def time_bias(self, is_timed_q: Tensor, is_timed_k: Tensor,
+                  is_clamped_q: Tensor | None = None,
+                  is_clamped_k: Tensor | None = None) -> Tensor:
+        """Both additive time flags at once — what attention layers should call."""
+        b = self.untimed_bias(is_timed_q, is_timed_k)
+        if is_clamped_q is not None and is_clamped_k is not None:
+            b = b + self.clamped_bias(is_clamped_q, is_clamped_k)
+        return b
 
     def extra_repr(self) -> str:
         w = self.omega
