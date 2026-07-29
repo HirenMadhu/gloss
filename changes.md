@@ -721,13 +721,19 @@ gate rather than running the full cross product.
 5. **Row-level bias memory.** `[B,H,R,R]` at `B=64, H=8, R=160` is ~52 MB fp32
    per block. Confirm it fits alongside activations on the A40, or move to fp16
    / reduce `R`.
-6. **Timestamp units.** Confirm what `row_time` / `seed_time` actually hold
-   coming out of `collate.py` — pandas datetime64[ns], epoch seconds, or
-   something else — and convert to **seconds** at exactly one place. §3.1's
-   `τ ∈ [0, 22]` claim, the band constants, and the `report.md` recency
-   histograms are all stated in seconds; a nanosecond-valued Δ silently shifts
-   every `τ` by `log(10^9) ≈ 20.7` and pushes the whole dataset off the ladder.
-   The §6 range assert catches it, but know the answer first.
-7. **Ladder constants.** `[0.05, 5.0]` and `n_freq = 8` are derived from the
+6. **Timestamp units — RESOLVED: already UNIX seconds.** RelBench's
+   `to_unix_time` (`relbench/modeling/utils.py:11-27`) floor-divides ns by 1e9,
+   and `collate.py:155,230` carries the result through as float64. §3.1's
+   `τ = log1p(Δ)` therefore needs **no conversion**, and rel-f1's ~70-year span
+   gives `τ ≈ 21.5`, inside the `[0, 22]` band. Keep the §6 range assert anyway:
+   `to_unix_time`'s integer-dtype branch passes integers through *unconverted*,
+   so a future dataset whose `time_col` is a raw integer in another unit would
+   silently arrive in the wrong scale.
+7. **Parity vs P0.5 — ordering constraint.** Pinning the stype enum changes
+   `stype_emb.num_embeddings`, which changes init RNG draw order, which breaks
+   the §6 bit-for-bit parity guard. Capture the `arch: rt` parity baseline
+   **before** P0.5 lands, or the strongest regression guard in the plan is
+   unavailable for the rest of the refactor.
+8. **Ladder constants.** `[0.05, 5.0]` and `n_freq = 8` are derived from the
    0–22 range, not measured. Check them against the observed Δ histogram per
    dataset before Phase 1 and adjust if the resolved band misses the mass.
