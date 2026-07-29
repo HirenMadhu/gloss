@@ -146,10 +146,29 @@ Qwen3-Embedding-4B path:
 Store as `table_name_emb [n_tables, d_text]`, `role_name_emb [K, d_text]`.
 Name-derived rather than learned per-id, so an unseen schema works on day one.
 
-**Confirm before running anything:** the report's environment note says the
-instrumentation used a *hash* name encoder. Assert at startup that
-`name_emb.shape[-1] == 2560` and that the encoder identity is Qwen3, and fail
-loudly otherwise. Every claim in this document assumes real name embeddings.
+**Encoder — DECIDED: `qwen` (Qwen3-Embedding-4B, `d_text = 2560`).** Assert at
+startup that `name_emb.shape[-1] == 2560` and fail loudly otherwise.
+
+Two facts this branch inherits, both verified against the cache on disk:
+
+- The cache contains **no hash encoder**. `data/schema_cache/` holds `qwen`
+  (2560) and `harrier` (`microsoft/harrier-oss-v1-27b`, 5376) only. The report's
+  "hash encoder" environment note is stale or refers to instrumentation runs.
+- **The existing baselines are `harrier`, not qwen** (`recap.md:44`;
+  `run_gridsearch.py` header). Coverage is uneven: rel-f1 has both, rel-trial
+  has harrier only, rel-stack has qwen only — no encoder covers all three.
+
+Consequences of choosing qwen, both mandatory:
+
+1. **Build the rel-trial qwen cache** before any 9-task run.
+   `scripts/build_schema_cache.py` defaults to qwen and is content-hash keyed,
+   so re-running over all three datasets computes only what is missing.
+2. **Every number in `recap.md` is a harrier number and is not a valid
+   reference for this branch.** Phase 0a's acceptance ("within 1 std of the
+   current RT+MoE numbers") therefore needs a **fresh qwen baseline of the
+   current architecture on all 9 tasks × 3 seeds** first. Budget it: without it,
+   Phase 0a's gate compares against a different encoder and means nothing.
+   This baseline doubles as the §6 parity reference — capture it before P0.5.
 
 ### P0.5 Pin the modality (stype) id space
 
