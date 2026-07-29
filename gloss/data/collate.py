@@ -8,7 +8,10 @@ PyG temporal sampler:
   per-cell  ``[B, S]``           : node_idxs (local row), col_idxs (table,column), table_idxs,
                                    is_padding, is_seed_cell, row_time, is_timed, n_id
   per-cell  ``[B, S, max_fk]``   : f2p_nbr_idxs — local row indices this cell's row references via FK
-  per-seed  ``[B]``              : seed_time, target, has_target
+  per-seed  ``[B]``              : seed_time, target, has_target, num_rows
+  per-row   ``[B, R]``           : row_valid, row_table, row_time_r, row_is_timed, row_hop,
+                                   row_in_role, row_is_root   (changes.md P0.2/P0.3)
+  per-row   ``[B, R, R]``        : adj_role — FK-role-and-direction adjacency (``row_graph.py``)
   encoding  (per node type)      : tf_dict (TensorFrame) + cell_placement (scatter map) so Phase-2's
                                    cell encoder can place per-cell value vectors into the [B, S, d] grid.
 
@@ -26,9 +29,11 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .graph import GraphBundle, is_forward_relation
+from .graph import FK_NONE, GraphBundle, is_forward_relation
+from .row_graph import build_row_graph
 
 PAD = -1
+MAX_ROWS = 160  # R — default cap on rows per seed (changes.md P0.2; assert, never clamp)
 
 
 def feature_col_names(tf) -> list[str]:
@@ -68,6 +73,7 @@ class CellBatch:
     num_seeds: int                 # B
     seq_len: int                   # S
     max_fk: int
+    max_rows: int                  # R
     # per-cell [B, S]
     node_idxs: Tensor              # long; local row index within the seed subgraph (pad = -1)
     col_idxs: Tensor               # long; global (table, column) id (pad = -1)
@@ -83,34 +89,65 @@ class CellBatch:
     seed_time: Tensor              # float64
     target: Tensor                 # float32
     has_target: Tensor             # bool
+    # per-row [B] / [B, R] / [B, R, R]  (changes.md P0.2/P0.3; row slot r == node_idxs value)
+    num_rows: Tensor               # long; rows actually present per seed
+    row_valid: Tensor              # bool; slot holds a real row
+    row_table: Tensor              # long; node-type id (pad = -1)
+    row_time_r: Tensor             # float64; row timestamp (0 if untimed). NB: per-ROW; the [B,S]
+                                   #   per-CELL timestamp above is `row_time` (kept for RT parity)
+    row_is_timed: Tensor           # bool
+    row_hop: Tensor                # long; BFS distance from the seed root (root = 0)
+    row_in_role: Tensor            # long; FK role this row was reached by (root/unset = 0), in [0, K]
+    row_is_root: Tensor            # bool; exactly one True per seed
+    adj_role: Tensor               # long [B,R,R]; 0 none | 1..K child | K+1..2K parent | 2K+1 self
     # for value encoding (scatter): per node type
     tf_dict: dict                  # node_type -> torch_frame.TensorFrame
     cell_placement: dict           # node_type -> (b_idx, s_idx, row_idx, col_idx) LongTensors
+
+    @property
+    def cell_row(self) -> Tensor:
+        """``[B, S]`` row slot of each cell — an alias of ``node_idxs``, named for the row level."""
+        return self.node_idxs
+
+    def row_mask(self) -> Tensor:
+        """``[B, R, R]`` admissibility mask for row attention: an edge, and both ends real."""
+        return (self.adj_role != 0) & self.row_valid.unsqueeze(2) & self.row_valid.unsqueeze(1)
 
     def to(self, device) -> "CellBatch":
         def mv(x):
             return x.to(device) if torch.is_tensor(x) else x
 
         return CellBatch(
-            num_seeds=self.num_seeds, seq_len=self.seq_len, max_fk=self.max_fk,
+            num_seeds=self.num_seeds, seq_len=self.seq_len, max_fk=self.max_fk, max_rows=self.max_rows,
             node_idxs=mv(self.node_idxs), col_idxs=mv(self.col_idxs), table_idxs=mv(self.table_idxs),
             is_padding=mv(self.is_padding), is_seed_cell=mv(self.is_seed_cell),
             row_time=mv(self.row_time), is_timed=mv(self.is_timed), n_id=mv(self.n_id),
             f2p_nbr_idxs=mv(self.f2p_nbr_idxs),
             seed_time=mv(self.seed_time), target=mv(self.target), has_target=mv(self.has_target),
+            num_rows=mv(self.num_rows), row_valid=mv(self.row_valid), row_table=mv(self.row_table),
+            row_time_r=mv(self.row_time_r), row_is_timed=mv(self.row_is_timed),
+            row_hop=mv(self.row_hop), row_in_role=mv(self.row_in_role),
+            row_is_root=mv(self.row_is_root), adj_role=mv(self.adj_role),
             tf_dict={k: v.to(device) for k, v in self.tf_dict.items()},
             cell_placement={k: tuple(t.to(device) for t in v) for k, v in self.cell_placement.items()},
         )
 
     def pretty_shapes(self) -> str:
-        lines = [f"CellBatch: B={self.num_seeds} S={self.seq_len} max_fk={self.max_fk}"]
+        lines = [f"CellBatch: B={self.num_seeds} S={self.seq_len} max_fk={self.max_fk} "
+                 f"R={self.max_rows}"]
         for name in ("node_idxs", "col_idxs", "table_idxs", "is_padding", "is_seed_cell",
-                     "row_time", "is_timed", "f2p_nbr_idxs"):
+                     "row_time", "is_timed", "f2p_nbr_idxs",
+                     "num_rows", "row_valid", "row_table", "row_time_r", "row_is_timed",
+                     "row_hop", "row_in_role", "row_is_root", "adj_role"):
             t = getattr(self, name)
             lines.append(f"  {name:14s} {tuple(t.shape)} {t.dtype}")
         n_real = int((~self.is_padding).sum())
         lines.append(f"  real cells={n_real}  seed cells={int(self.is_seed_cell.sum())}  "
                      f"targets={int(self.has_target.sum())}")
+        lines.append(f"  rows/seed: mean={float(self.num_rows.double().mean()):.1f} "
+                     f"max={int(self.num_rows.max())} of R={self.max_rows}  "
+                     f"max hop={int(self.row_hop.max())}  "
+                     f"row edges={int((self.adj_role != 0).sum()) - int(self.row_valid.sum())}")
         lines.append(f"  tf_dict types: {sorted(self.tf_dict)}")
         return "\n".join(lines)
 
@@ -134,8 +171,14 @@ def to_cell_batch(
     *,
     seq_len: int = 1024,
     max_fk: int = 5,
+    max_rows: int = MAX_ROWS,
+    num_hops: int | None = None,
 ) -> CellBatch:
-    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`CellBatch`."""
+    """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`CellBatch`.
+
+    ``max_rows`` (R) caps rows per seed and is asserted, never clamped; ``num_hops`` (optional, =
+    ``len(num_neighbors)``) additionally asserts the BFS depth of the row graph.
+    """
     vocab = column_vocab(bundle)
     node_types = [nt for nt in bundle.node_types if nt in batch.node_types and batch[nt].num_nodes > 0]
 
@@ -203,20 +246,43 @@ def to_cell_batch(
     def flat_index(nt: str, local_in_store: Tensor) -> Tensor:
         return local_in_store + type_slice[nt].start
 
+    # Row-graph edges are collected in the same pass but from **every** edge type, both directions,
+    # canonicalized to (child, parent, role): PyG records a traversed edge only under the edge type it
+    # was traversed in, so the forward store is not the transpose of the reverse one and forward-only
+    # reading leaves rows unreachable from the root. `f2p_nbr_idxs` keeps its forward-only,
+    # max_fk-capped semantics unchanged (it is a frozen RT model input).
+    edge_child, edge_parent, edge_role = [], [], []
+
     for (src, rel, dst) in bundle.edge_types:
-        if not is_forward_relation(rel):
-            continue
         if (src, rel, dst) not in batch.edge_types:
+            continue
+        if src not in type_slice or dst not in type_slice:
             continue
         ei = batch[(src, rel, dst)].edge_index
         if ei.numel() == 0:
             continue
+        forward = is_forward_relation(rel)
         # f2p_<col>: src = table holding the FK (child), dst = referenced pkey table (parent).
-        gchild = flat_index(src, ei[0])
-        gparent = flat_index(dst, ei[1])
+        gchild = flat_index(src if forward else dst, ei[0] if forward else ei[1])
+        gparent = flat_index(dst if forward else src, ei[1] if forward else ei[0])
+        role = bundle.edge_fk_role((src, rel, dst))
+        if role != FK_NONE:
+            edge_child.append(gchild)
+            edge_parent.append(gparent)
+            edge_role.append(torch.full((gchild.numel(),), role, dtype=torch.long))
+        if not forward:
+            continue
         for c, p in zip(gchild.tolist(), gparent.tolist()):
             if int(seg[c]) == int(seg[p]) and len(f2p[c]) < max_fk:
                 f2p[c].append(int(local_node[p]))
+
+    cat = lambda xs: torch.cat(xs) if xs else torch.zeros(0, dtype=torch.long)
+    rows = build_row_graph(
+        seg=seg, local_node=local_node, table_id=ntype, row_t=rowt, timed=timed,
+        is_root=is_seed_node,
+        child_g=cat(edge_child), parent_g=cat(edge_parent), edge_role=cat(edge_role),
+        num_seeds=B, max_rows=max_rows, num_roles=bundle.num_roles, num_hops=num_hops,
+    )
 
     # ---- enumerate cells; seed-row cells first so they survive truncation ----
     feat_cols = {nt: feature_col_names(batch[nt].tf) for nt in node_types}
@@ -274,10 +340,14 @@ def to_cell_batch(
     tf_dict = {nt: batch[nt].tf for nt in node_types}
 
     return CellBatch(
-        num_seeds=B, seq_len=seq_len, max_fk=max_fk,
+        num_seeds=B, seq_len=seq_len, max_fk=max_fk, max_rows=max_rows,
         node_idxs=node_idxs, col_idxs=col_idxs, table_idxs=table_idxs,
         is_padding=is_padding, is_seed_cell=is_seed_cell, row_time=row_time, is_timed=is_timed,
         n_id=n_id_g, f2p_nbr_idxs=f2p_g,
         seed_time=seed_time, target=target, has_target=has_target,
+        num_rows=rows["num_rows"], row_valid=rows["row_valid"], row_table=rows["row_table"],
+        row_time_r=rows["row_time"],          # per-ROW [B,R] (per-CELL [B,S] is `row_time` above)
+        row_is_timed=rows["row_is_timed"], row_hop=rows["row_hop"],
+        row_in_role=rows["row_in_role"], row_is_root=rows["row_is_root"], adj_role=rows["adj_role"],
         tf_dict=tf_dict, cell_placement=cell_placement,
     )

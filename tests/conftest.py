@@ -5,6 +5,11 @@ The synthetic graph is a **dual-FK** schema: an ``event`` table with two foreign
 masks) and the leakage rule. Minimal ``TensorFrame``s carry only ``col_names_dict`` (the collate reads
 column identities, not values), so no pytorch-frame stats are needed. Encoder/FiLM tests that need real
 dtype stats are guarded by the cached real rel-f1.
+
+A second, additive fixture (``COLLIDE_*`` / :func:`collide_bundle`) adds a ``review`` table whose FK
+column is *also* named ``buyer`` — the same-name-different-child-table case that the column-keyed role
+vocabulary silently merged (changes.md P0.1). It is separate from the dual-FK bundle on purpose: the
+dual-FK fixture is consumed by unrelated tests and must not change shape.
 """
 from __future__ import annotations
 
@@ -84,6 +89,89 @@ def make_synth_batch(seed_time: float = 100.0, event_times=(10.0, 20.0, 30.0, 40
     d["event", "f2p_seller", "user"].edge_index = torch.tensor([[1, 3], [0, 1]])
     d["user", "rev_f2p_buyer", "event"].edge_index = torch.tensor([[0, 1], [0, 2]])
     d["user", "rev_f2p_seller", "event"].edge_index = torch.tensor([[0, 1], [1, 3]])
+    return d
+
+
+# ---- P0.1: same-named FK column in two different child tables (must NOT share a role id) ----
+COLLIDE_NODE_TYPES = ["event", "review", "user"]
+COLLIDE_EDGE_TYPES = EDGE_TYPES + [
+    ("review", "f2p_buyer", "user"),       # same column NAME as event.buyer, different child table
+    ("user", "rev_f2p_buyer", "review"),
+]
+REVIEW_COLS = ["r_score"]
+
+
+def collide_bundle() -> GraphBundle:
+    """Bundle whose schema has ``buyer`` as an FK column of two different child tables."""
+    from torch_geometric.data import HeteroData
+
+    d = HeteroData()
+    d["user"].tf = _tf(2, USER_COLS)
+    d["event"].tf = _tf(4, EVENT_COLS)
+    d["review"].tf = _tf(2, REVIEW_COLS)
+    node_type_id, fk_role_id, metapath_id = _build_vocabs(COLLIDE_NODE_TYPES, COLLIDE_EDGE_TYPES)
+    return GraphBundle(
+        dataset_name="synthetic-collide",
+        data=d,
+        col_stats_dict={},
+        node_types=COLLIDE_NODE_TYPES,
+        edge_types=COLLIDE_EDGE_TYPES,
+        node_type_id=node_type_id,
+        fk_role_id=fk_role_id,
+        metapath_id=metapath_id,
+    )
+
+
+# ---- P0.2/P0.3: a 2-hop chain whose edges are sampled in the REVERSE direction only ----
+# user (seed) <- event (child via buyer) <- comment (child via eventId). PyG records a traversed edge
+# under the edge type it was traversed in, so expanding outward from the seed populates only the
+# `rev_f2p_*` stores; the row graph must still be complete and connected.
+CHAIN_NODE_TYPES = ["comment", "event", "user"]
+CHAIN_EDGE_TYPES = [
+    ("event", "f2p_buyer", "user"),
+    ("user", "rev_f2p_buyer", "event"),
+    ("comment", "f2p_eventId", "event"),
+    ("event", "rev_f2p_eventId", "comment"),
+]
+COMMENT_COLS = ["c_txt"]
+
+
+def chain_bundle() -> GraphBundle:
+    from torch_geometric.data import HeteroData
+
+    d = HeteroData()
+    d["user"].tf = _tf(2, USER_COLS)
+    d["event"].tf = _tf(2, EVENT_COLS)
+    d["comment"].tf = _tf(2, COMMENT_COLS)
+    node_type_id, fk_role_id, metapath_id = _build_vocabs(CHAIN_NODE_TYPES, CHAIN_EDGE_TYPES)
+    return GraphBundle(
+        dataset_name="synthetic-chain",
+        data=d,
+        col_stats_dict={},
+        node_types=CHAIN_NODE_TYPES,
+        edge_types=CHAIN_EDGE_TYPES,
+        node_type_id=node_type_id,
+        fk_role_id=fk_role_id,
+        metapath_id=metapath_id,
+    )
+
+
+def make_chain_batch(seed_time: float = 100.0):
+    """2 seeds; each segment is user -> event -> comment, all times <= seed_time."""
+    from torch_geometric.data import HeteroData
+
+    d = HeteroData()
+    for nt, cols, n in (("user", USER_COLS, 2), ("event", EVENT_COLS, 2), ("comment", COMMENT_COLS, 2)):
+        d[nt].num_nodes = n
+        d[nt].batch = torch.tensor([0, 1])
+        d[nt].n_id = torch.tensor([0, 1])
+        d[nt].tf = _tf(n, cols)
+    d["user"].seed_time = torch.tensor([seed_time, seed_time], dtype=torch.float64)
+    d["event"].time = torch.tensor([10.0, 20.0], dtype=torch.float64)
+    d["comment"].time = torch.tensor([5.0, 15.0], dtype=torch.float64)
+    # reverse stores only (as the sampler would fill them when expanding away from the seed)
+    d["user", "rev_f2p_buyer", "event"].edge_index = torch.tensor([[0, 1], [0, 1]])
+    d["event", "rev_f2p_eventId", "comment"].edge_index = torch.tensor([[0, 1], [0, 1]])
     return d
 
 

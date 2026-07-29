@@ -6,9 +6,12 @@ sampled set unchanged — a precondition for scale-equivariance). On top we buil
 **vocabularies** HALOS needs:
 
 * ``node_type_id``  — table name -> int.
-* ``fk_role_id``    — FK edge relation (``f2p_<col>`` / ``rev_f2p_<col>``) -> int. Two FKs into one
-  table are distinct relations, so they get distinct ids (this is how HALOS disambiguates dual FKs).
-* ``metapath_id``   — reserved {PAD:0, SELF:1, MULTIHOP:2} + one id per directed relation (>=3).
+* ``fk_role_id``    — FK **role triple** ``(child_table, fk_column, parent_table)`` -> int in ``[1, K]``
+  (changes.md P0.1). Keyed on the triple, not on the column name: two FK columns that merely *share a
+  name* in different child tables are different relations and must not collide (``raceId`` merges 5
+  relations on rel-f1, ``nct_id`` merges 10 on rel-trial under the old column-only keying). A relation
+  and its reverse (``f2p_<col>`` / ``rev_f2p_<col>``) share one role — the role is direction-free.
+* ``metapath_id``   — reserved {PAD:0, SELF:1, MULTIHOP:2} + one id per role triple (>=3).
 
 Cell *features* are pytorch-frame ``TensorFrame``s on each node store; embedding the text columns
 needs a ``TextEmbedderConfig``. For Phase-0 substrate work we default to a cheap deterministic
@@ -91,6 +94,24 @@ def is_forward_relation(rel: str) -> bool:
     return not rel.startswith("rev_")
 
 
+def canonical_edge_role(edge_type: tuple[str, str, str]) -> tuple[str, str, str]:
+    """PyG edge type -> the direction-free FK **role triple** ``(child_table, fk_column, parent_table)``.
+
+    ``(child, "f2p_<col>", parent)`` and its reverse ``(parent, "rev_f2p_<col>", child)`` both map to
+    ``(child, <col>, parent)``, so forward and reverse share a role id (changes.md P0.1). The triple —
+    not the column name — is the identity: the same column name in two child tables is two roles.
+    """
+    src, rel, dst = edge_type
+    col = canonical_relation(rel)
+    return (src, col, dst) if is_forward_relation(rel) else (dst, col, src)
+
+
+def role_name(role: tuple[str, str, str]) -> str:
+    """The P0.4 name string for a role triple (fed to the frozen name encoder)."""
+    child, col, parent = role
+    return f"table {child} column {col} references table {parent}"
+
+
 class HashTextEmbedder:
     """Deterministic, dependency-free text embedder for substrate/dev work.
 
@@ -120,8 +141,9 @@ class GraphBundle:
     node_types: list[str]
     edge_types: list[tuple[str, str, str]]
     node_type_id: dict[str, int]
-    fk_role_id: dict[str, int] = field(default_factory=dict)       # relation name -> id (>=1)
-    metapath_id: dict[str, int] = field(default_factory=dict)      # relation name -> id (>=3)
+    # (child_table, fk_column, parent_table) -> id
+    fk_role_id: dict[tuple[str, str, str], int] = field(default_factory=dict)   # >=1 (0 = FK_NONE)
+    metapath_id: dict[tuple[str, str, str], int] = field(default_factory=dict)  # >=3 (0,1,2 reserved)
 
     @property
     def num_node_types(self) -> int:
@@ -132,23 +154,71 @@ class GraphBundle:
         return 1 + len(self.fk_role_id)  # + FK_NONE
 
     @property
+    def num_roles(self) -> int:
+        """K — the number of real FK roles (ids ``1..K``), excluding ``FK_NONE``."""
+        return len(self.fk_role_id)
+
+    @property
     def num_metapaths(self) -> int:
         return 3 + len(self.metapath_id)  # + reserved PAD/SELF/MULTIHOP
 
+    @property
+    def role_triples(self) -> list[tuple[str, str, str]]:
+        """Role triples ordered by id, so ``role_triples[i]`` is role ``i + 1`` (P0.4 name tables)."""
+        return [t for t, _ in sorted(self.fk_role_id.items(), key=lambda kv: kv[1])]
+
+    # ---- the triple is the identity; prefer these two over the name-based helpers ----
+    def edge_fk_role(self, edge_type: tuple[str, str, str]) -> int:
+        """Role id of a PyG edge type ``(src, rel, dst)`` — unambiguous in both directions."""
+        return self.fk_role_id.get(canonical_edge_role(edge_type), FK_NONE)
+
+    def edge_metapath(self, edge_type: tuple[str, str, str]) -> int:
+        return self.metapath_id.get(canonical_edge_role(edge_type), MP_MULTIHOP)
+
+    def _roles_for_relation(self, rel: str) -> list[tuple[str, str, str]]:
+        col = canonical_relation(rel)
+        return sorted(t for t in self.fk_role_id if t[1] == col)
+
     def relation_fk_role(self, rel: str) -> int:
-        return self.fk_role_id.get(canonical_relation(rel), FK_NONE)
+        """Role id from a relation *name* alone. Only defined when the name is unambiguous.
+
+        A name (``f2p_<col>``) identifies a role only if that FK column occurs in exactly one child
+        table; otherwise the schema has several roles behind the name and the caller must say *which*
+        edge type it means — use :meth:`edge_fk_role` with the ``(src, rel, dst)`` triple. Raising is
+        deliberate: silently returning one of several ids is how the pre-P0.1 vocabulary lost 9 of
+        rel-f1's 13 roles.
+        """
+        matches = self._roles_for_relation(rel)
+        if not matches:
+            return FK_NONE
+        if len(matches) > 1:
+            raise ValueError(
+                f"relation {rel!r} is ambiguous: {len(matches)} roles share this FK column "
+                f"({matches}). Use edge_fk_role((src, rel, dst)) instead."
+            )
+        return self.fk_role_id[matches[0]]
 
     def relation_metapath(self, rel: str) -> int:
-        return self.metapath_id.get(canonical_relation(rel), MP_MULTIHOP)
+        """Metapath id from a relation name alone; same ambiguity contract as :meth:`relation_fk_role`."""
+        matches = self._roles_for_relation(rel)
+        if not matches:
+            return MP_MULTIHOP
+        if len(matches) > 1:
+            raise ValueError(
+                f"relation {rel!r} is ambiguous: {len(matches)} roles share this FK column "
+                f"({matches}). Use edge_metapath((src, rel, dst)) instead."
+            )
+        return self.metapath_id[matches[0]]
 
 
 def _build_vocabs(node_types, edge_types) -> tuple[dict, dict, dict]:
-    """Vocabs keyed by the **canonical** FK column, so forward/reverse share a role and two FKs into
-    one table stay distinct. ``fk_role_id``/``metapath_id`` map ``<col> -> int``."""
+    """Vocabs keyed by the FK **role triple** ``(child_table, fk_column, parent_table)`` (changes.md
+    P0.1), sorted for determinism. Forward and reverse edge types canonicalize to the same triple, so
+    they share a role; same-named FK columns in different child tables do **not**."""
     node_type_id = {nt: i for i, nt in enumerate(sorted(node_types))}
-    cols = sorted({canonical_relation(rel) for (_, rel, _) in edge_types})
-    fk_role_id = {c: i + 1 for i, c in enumerate(cols)}          # 0 reserved (FK_NONE)
-    metapath_id = {c: i + 3 for i, c in enumerate(cols)}         # 0,1,2 reserved
+    roles = sorted({canonical_edge_role(et) for et in edge_types})
+    fk_role_id = {r: i + 1 for i, r in enumerate(roles)}          # 0 reserved (FK_NONE)
+    metapath_id = {r: i + 3 for i, r in enumerate(roles)}         # 0,1,2 reserved
     return node_type_id, fk_role_id, metapath_id
 
 
