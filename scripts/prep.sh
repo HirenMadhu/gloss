@@ -2,10 +2,11 @@
 #SBATCH --job-name=gloss_prep
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --partition=gpu_h200
-#SBATCH --gpus=h200:1
+#SBATCH --partition=gpu
+#SBATCH --gpus=h100:1
 #SBATCH --nodes=1
-#SBATCH --mem=256G   # harrier (Gemma-3-27B) is ~51GB; h200 nodes have ~2TB. (Or run prep_data.py interactively on the H200.)
+#SBATCH --mem=256G   # harrier (Gemma-3-27B) is ~51GB. NB: gpu_h200 does not exist on this
+                     # cluster; `gpu` carries a40:4 / h100:4 (see sinfo).
 #SBATCH --output=./logs/slurm/%x_%A.out
 #SBATCH --error=./logs/slurm/%x_%A.err
 #SBATCH --mail-user=hiren.madhu@yale.edu
