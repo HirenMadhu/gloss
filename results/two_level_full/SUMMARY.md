@@ -61,9 +61,30 @@ At `128/2` the model beats RT (from scratch) on **4 of 9** (driver-dnf, driver-t
 user-attendance) rather than 2, and several losses shrink to near-ties (study-outcome 67.8 vs 68.6,
 user-repeat 77.8 vs 79.7).
 
+### ...and the headline config is OUT OF SPEC on parameters
+
+Measured on rel-f1 (`sum(p.numel() for p in MoRE(...).parameters())`):
+
+| config | params | vs `CLAUDE.md` budget (<= ~30M) |
+|---|---|---|
+| **2L 256/8 — the headline, all 27 runs** | **68.87M** (blocks 66.74M) | **2.3x OVER** |
+| 2L 256/4 (grid cfg 6/7) | 35.50M | slightly over |
+| 2L 128/4 (grid cfg 2/3) | 11.04M | ok |
+| **2L 128/2 (grid cfg 0)** | **6.28M** | ok |
+
+`CLAUDE.md`'s working agreement caps the model at ~30M. The MoRE defaults (`d_model=256,
+n_blocks=8`) satisfy that on `arch=rt`, but at `arch=two_level` each block gains a second attention
+and a second MoE FFN — and the row MoE is **shared+routed**, so five experts, not four. Nobody
+re-checked the default against the budget after the row level was added.
+
+The headline is therefore a **69M-parameter model, 2.3x over its own stated budget, trained 10 epochs
+on tasks with a few hundred to a few thousand labelled rows** — losing to a **6.3M** version of
+itself on 8 of 9 tasks. That is a far more mundane explanation than "the two-level mechanism does not
+work", and it is consistent with the one-collapsed-seed-in-three instability below.
+
 **So the 27-run table above should NOT be read as the verdict on the two-level architecture.** It is
-the verdict on one over-sized configuration of it. The grid (`29030571`) exists to settle this and
-still has 7 of 8 configs to run.
+the verdict on one over-sized, out-of-spec configuration of it. The grid (`29030571`) exists to
+settle this and still has 7 of 8 configs to run — note that only its `128/*` half is inside budget.
 
 ## Seed instability is the other story
 

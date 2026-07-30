@@ -130,6 +130,10 @@ Full table: **`results/two_level_full/SUMMARY.md`** (tracked despite the `result
   beats the 256/8 headline on 8 of 9 tasks** (driver-dnf 71.4→83.2, user-attendance NMAE
   0.554→0.397, user-repeat 67.9→77.8), and beats RT (scratch) on 4/9 instead of 2/9.
   **So the 27-run table is a verdict on one over-sized configuration, not on the architecture.**
+* **The headline config is OUT OF SPEC**: `2L 256/8` measures **68.87M params** against `CLAUDE.md`'s
+  ~30M cap (`2L 128/2` is 6.28M). The MoRE defaults are fine on `arch=rt`, but each two-level block
+  adds a second attention and a second MoE FFN whose row experts are **shared+routed** (5, not 4).
+  Only the `128/*` half of the grid is inside budget; `256/4` is 35.5M.
 * **Seed instability**: `driver-position` / `user-repeat` / `study-outcome` have cv 28.5% / 18.9% /
   12.6%, and each is **one collapsed seed out of three**, not uniform spread. Single-seed grid
   winners will need a multi-seed confirmation run before anything is claimed.
