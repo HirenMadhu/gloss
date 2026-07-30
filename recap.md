@@ -27,7 +27,41 @@ Never trust a `changes.md` figure that `amendments.md` supersedes.
 
 ---
 
-## 1. WHAT IS RUNNING RIGHT NOW — two-level full design (array 29029490)
+## 1. WHAT IS RUNNING RIGHT NOW — four chained jobs
+
+**The 8-GPU QOS cap is the binding constraint.** All of these SHARE 8 concurrent slots — submitting
+more arrays does not add throughput, it only changes ordering. Ordered so the comparable (qwen)
+results land first.
+
+| job | what | notes |
+|---|---|---|
+| `29029490` | **headline**: 27 two-level runs, `--phase full`, qwen | `results/two_level_full/` |
+| `29029525` | harrier **table/role** cache build, **h100-pinned** | see the a40 warning below |
+| `29029522` | **qwen grid**: 72 jobs | `results/tl_grid_qwen/` |
+| `29029526` | harrier grid: 72 jobs, `afterok:29029525` | `results/tl_grid_harrier/` — **may not finish** |
+
+**Grid** (`run_gridsearch.py --arch two_level`): `d_model {128,256} × n_blocks {2,4} × lr {3e-4,1e-3}`
+= 8 configs × 9 tasks × **1 seed**, 10 epochs. Targeted at the *losses*, not at polishing a winner:
+the earlier RT grid found `d_model=128` best while the headline runs use 256, and a two-level block has
+**six** sublayers to RT's five, so `n_blocks=8` is 48 sublayers.
+
+> **⚠ harrier needs an h100, NOT `--gpus=1`.** harrier is Gemma-3-27B in **bf16 ≈ 54 GB**; the `gpu`
+> partition carries a40 (**46 GB**) *and* h100. An a40 assignment OOMs the cache build, and then
+> `afterok` leaves the whole harrier grid in `DependencyNeverSatisfied` — a silent, hard-to-diagnose
+> stall. Always pass `--gpus=h100:1` for any harrier job.
+>
+> **Cache state:** qwen is COMPLETE (67 entries = 45 cols + 9 tables + 13 roles). harrier had only 45
+> (columns only) — P0.4's table/role strings were never embedded with it, hence job `29029525`.
+
+### Aggregate the grids
+```bash
+.venv/bin/python scripts/run_gridsearch.py --aggregate --arch two_level --seeds 1 \
+    --out-dir results/tl_grid_qwen        # best config per task vs RT; regression rows carry NMAE
+```
+
+---
+
+## 1b. The headline array (29029490)
 
 ```
 sbatch --array=0-26%8 scripts/run_ablation.sh \
@@ -53,13 +87,23 @@ for f in logs/slurm/gloss_abl_29029490_*.err; do grep -qE "Traceback" "$f" && ec
 **If it died, resubmit the identical command** — there is an idempotent skip-if-done guard keyed on the
 output filename, so finished configs are not recomputed.
 
-### Results so far (2 of 27) — DO NOT over-read
-| task | seed | test AUROC | val AUROC |
-|---|---|---|---|
-| rel-f1/driver-top3 | 0 | 0.9100 | 0.8116 |
-| rel-f1/driver-top3 | 1 | 0.9154 | 0.8433 |
+### Results so far (8 of 27) — **MIXED, and the honest read is 1 win / 2 losses on rel-f1**
 
-Leaderboard driver-top3: `RT (from scratch) = 82.7`, `GelGT = 84.1`.
+NMAE-correct (regression converted as `test_mae / train-std`; the pipeline stores RAW mae):
+
+| task | metric | two-level | our RT | RT (lb) | GelGT | |
+|---|---|---|---|---|---|---|
+| rel-f1/driver-top3 | AUROC | **89.69** (3 sd) | 82.65 | 82.70 | 84.10 | **beats both** |
+| rel-f1/driver-dnf | AUROC | 70.46 (2 sd) | 77.40 | 78.70 | 76.10 | **loses ~8** |
+| rel-f1/driver-position | NMAE | 0.6290 (1 sd) | 0.4303 | 0.477 | 0.531 | **loses badly (+32%)** |
+
+**Do not generalise from driver-top3.** Its first two seeds (0.910, 0.915) looked like a clean win; the
+third came in at **0.8655**, so the real spread is ~0.05. And the two other rel-f1 tasks go the *other*
+way by a similar margin. **Our RT reproduces the leaderboard closely** (82.65 vs 82.70; 77.40 vs 78.70),
+so the reference is trustworthy and these losses are real, not a broken baseline.
+
+That is what the grid search is for: testing whether the losses are a **capacity/LR mismatch** rather
+than the mechanism being wrong.
 
 **One matched-seed comparison exists.** A partial RT baseline (`results/baseline_qwen/`, 6 runs,
 cancelled on the user's instruction) covered driver-top3 **seed 1** at identical encoder/epochs/batch/
