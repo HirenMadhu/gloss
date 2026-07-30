@@ -473,9 +473,26 @@ diagnostics restrict to `row_valid`, and `RowTokenHead` pools the root only — 
 explicit int is still honoured as a hard cap that asserts and never clamps. `max_rows` is now plumbed
 through `MoRELitModule` and `evaluate_split`, so the config key is real rather than decorative.
 
+**Measured after the fix** (`scripts/probe_max_rows.py`, rel-event at `[12,12]`, 14 edge types):
+
+| split | max rows/seed |
+|---|---|
+| train | 148 |
+| **val** | **161–162** |
+| **test** | **172** |
+
+This is the part that matters. Training passed because train peaks at **148**, under the cap — the
+crash always came at the first validation. But **test peaks at 172**. Raising `MAX_ROWS` to any value
+inferable from the crash message (162, or even a padded 165) would have trained fine, validated fine,
+and then died in **TEST eval at the very end of a full run**. There is no constant recoverable from
+the failure itself that survives all three splits, because the splits are disjoint temporal eras with
+different degree distributions.
+
 **The general lesson:** a constant measured on one DB and asserted on all of them is a landmine, and
-"measured max × 1.6" is not a safety margin when the quantity is schema-coupled. Prefer fitting the
-axis to the batch over raising the constant.
+"measured max × 1.6" is not a safety margin when the quantity is schema-coupled. Worse, the obvious
+repair — read the number off the assert and raise the constant — is itself a trap here, because the
+split that overruns first is not the split that overruns most. Prefer fitting the axis to the batch
+over raising the constant.
 
 ### 9.2 The MET offset assert, made diagnosable (4 failures)
 
