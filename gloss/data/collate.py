@@ -48,7 +48,11 @@ NAT_UNIX_SENTINEL = -9223372037           # == pd.Timestamp.min.value // 10**9
 UNTIMED_FLOOR = -5364662400.0             # == pd.Timestamp("1800-01-01").value // 10**9
 
 PAD = -1
-MAX_ROWS = 160  # R — default cap on rows per seed (changes.md P0.2; assert, never clamp)
+# R — the padded rows-per-seed axis (changes.md P0.2). ``None`` = fit R to each batch, which is the
+# default: R is fanout- AND schema-coupled, so no single constant is safe across DBs. The old fixed
+# 160 was measured on rel-f1 (max 65 rows/seed) and rel-event overruns it at 162. An explicit int is
+# still honoured as a hard cap that asserts and never clamps.
+MAX_ROWS: int | None = None
 
 
 def feature_col_names(tf) -> list[str]:
@@ -186,12 +190,13 @@ def to_cell_batch(
     *,
     seq_len: int = 1024,
     max_fk: int = 5,
-    max_rows: int = MAX_ROWS,
+    max_rows: int | None = MAX_ROWS,
     num_hops: int | None = None,
 ) -> CellBatch:
     """Convert a disjoint sampled ``HeteroData`` minibatch into a dense :class:`CellBatch`.
 
-    ``max_rows`` (R) caps rows per seed and is asserted, never clamped; ``num_hops`` (optional, =
+    ``max_rows`` (R) is the padded rows-per-seed axis: ``None`` (the default) fits it to the batch, an
+    explicit int is a hard cap that asserts and never clamps. ``num_hops`` (optional, =
     ``len(num_neighbors)``) additionally asserts the BFS depth of the row graph.
     """
     vocab = column_vocab(bundle)
@@ -303,6 +308,9 @@ def to_cell_batch(
         child_g=cat(edge_child), parent_g=cat(edge_parent), edge_role=cat(edge_role),
         num_seeds=B, max_rows=max_rows, num_roles=bundle.num_roles, num_hops=num_hops,
     )
+    # R may have been fitted to this batch (max_rows=None), so read it back off the built axis
+    # rather than echoing the request — CellBatch.max_rows must describe the tensors it carries.
+    R = int(rows["adj_role"].shape[1])
 
     # ---- enumerate cells; seed-row cells first so they survive truncation ----
     feat_cols = {nt: feature_col_names(batch[nt].tf) for nt in node_types}
@@ -360,7 +368,7 @@ def to_cell_batch(
     tf_dict = {nt: batch[nt].tf for nt in node_types}
 
     return CellBatch(
-        num_seeds=B, seq_len=seq_len, max_fk=max_fk, max_rows=max_rows,
+        num_seeds=B, seq_len=seq_len, max_fk=max_fk, max_rows=R,
         node_idxs=node_idxs, col_idxs=col_idxs, table_idxs=table_idxs,
         is_padding=is_padding, is_seed_cell=is_seed_cell, row_time=row_time, is_timed=is_timed,
         n_id=n_id_g, f2p_nbr_idxs=f2p_g,

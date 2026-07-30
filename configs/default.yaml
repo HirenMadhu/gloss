@@ -12,8 +12,12 @@ data:
   collate:
     seq_len: 512               # fixed cell-token cap per seed; rel-f1 max≈353 cells/seed -> 0% truncation
     max_fk: 5                  # max foreign-key neighbors per row (RT f2p_nbr width)
-    max_rows: 160              # R — rows per seed (row-graph axis). ASSERTED, never clamped; it is
-                               # fanout-coupled, so re-measure before raising data.sampler.num_neighbors
+    max_rows: null             # R — rows per seed (row-graph axis). null = fit R to each batch, which
+                               # is what you want: R is fanout- AND schema-coupled (it grows with
+                               # num_neighbors and with the number of edge types), so a constant that
+                               # fits one DB will not fit the next — a fixed 160 from rel-f1 killed
+                               # every rel-event run. An int is honoured as a hard cap: it ASSERTS on
+                               # overflow and never clamps.
 
 # MoE FFN. `route_on` picks the router input (the load-bearing ablation axis); the S/C/P/H additions
 # are OFF by default so the base arm == plain RT + top-k MoE. `run_train.py` / `run_ablation.py` flags

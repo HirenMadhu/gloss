@@ -10,7 +10,8 @@ data:
   collate:
     seq_len: 512               # measured max≈353 cells/seed at num_neighbors=[12,12] -> 0% truncation
     max_fk: 5
-    max_rows: 160              # measured max 65 rows/seed at [12,12] (768 seeds); asserted, not clamped
+    max_rows: null             # null = fit R to each batch (rel-f1 measured max 65 rows/seed at
+                               # [12,12], 768 seeds). An int is a hard cap: asserted, never clamped.
 
 model:
   d_model: 256

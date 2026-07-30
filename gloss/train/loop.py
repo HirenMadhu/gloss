@@ -35,6 +35,7 @@ class MoRELitModule(pl.LightningModule):
         weight_decay: float = 0.01,
         seq_len: int = 1024,
         max_fk: int = 5,
+        max_rows: int | None = None,
     ):
         super().__init__()
         self.bundle = bundle
@@ -46,6 +47,7 @@ class MoRELitModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.seq_len = seq_len
         self.max_fk = max_fk
+        self.max_rows = max_rows          # None = fit the row axis R to each batch (see collate)
         self.lambda_ortho = lambda_ortho
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
@@ -57,7 +59,8 @@ class MoRELitModule(pl.LightningModule):
         return logits.squeeze(-1)            # [B] raw output (logit for binary, std-space for regression)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx: int = 0):
-        cb = to_cell_batch(batch, self.bundle, self.entity_table, seq_len=self.seq_len, max_fk=self.max_fk)
+        cb = to_cell_batch(batch, self.bundle, self.entity_table, seq_len=self.seq_len,
+                           max_fk=self.max_fk, max_rows=self.max_rows)
         return cb.to(device)
 
     def _standardize(self, target):

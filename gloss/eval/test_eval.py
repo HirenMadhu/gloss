@@ -30,6 +30,7 @@ def predict_split(
     max_fk: int,
     batch_size: int = 64,
     num_workers: int = 0,
+    max_rows: int | None = None,
     device=None,
 ) -> np.ndarray:
     """Run ``module(cb)`` over every seed of ``split``; return per-row predictions ``[n]`` aligned to the
@@ -45,7 +46,8 @@ def predict_split(
     n = len(task.get_table(split).df)
     pred = np.full(n, np.nan, dtype=np.float64)
     for raw in loader:
-        cb = to_cell_batch(raw, bundle, task.entity_table, seq_len=seq_len, max_fk=max_fk).to(device)
+        cb = to_cell_batch(raw, bundle, task.entity_table, seq_len=seq_len, max_fk=max_fk,
+                           max_rows=max_rows).to(device)
         out = module(cb).float().cpu()                        # [B] one prediction per seed (segment order)
         if getattr(module, "task_type", "binary") == "regression":
             pred_b = out * module.target_std + module.target_mean   # de-standardize to original units
@@ -73,6 +75,7 @@ def evaluate_split(
     max_fk: int,
     batch_size: int = 64,
     num_workers: int = 0,
+    max_rows: int | None = None,
     device=None,
 ) -> dict:
     """Predict ``split`` and score with ``task.evaluate`` (RelBench metrics: average_precision,
@@ -80,7 +83,8 @@ def evaluate_split(
     other splits the table carries labels."""
     pred = predict_split(
         module, bundle, task, split, num_neighbors=num_neighbors,
-        seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers, device=device,
+        seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers,
+        max_rows=max_rows, device=device,
     )
     # Pass the (label-bearing) target table explicitly for every split — including test, where RelBench
     # would otherwise fetch its own internal copy — so boolean-string targets are coerced before scoring

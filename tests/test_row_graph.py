@@ -237,6 +237,44 @@ def test_max_rows_asserts_and_never_clamps():
     assert int(cb.num_rows.max()) == 3
 
 
+def test_max_rows_none_fits_r_to_the_batch():
+    """``max_rows=None`` (the default) sizes R to the batch instead of asserting against a constant.
+
+    The fixed 160 was a rel-f1 measurement; rel-event needs 162+ and died on it. Fitting must (a) never
+    raise however many rows arrive, (b) report the R it actually built, and (c) leave the row fields
+    identical to a hand-picked exact cap — the padding it drops is inert.
+    """
+    cb = _cb(max_rows=None)
+    need = int(cb.num_rows.max())
+    assert cb.max_rows == need == 3
+    assert cb.adj_role.shape == (cb.num_seeds, need, need)
+    assert cb.row_valid.shape == (cb.num_seeds, need)
+
+    exact = _cb(max_rows=need)
+    assert torch.equal(cb.adj_role, exact.adj_role)
+    assert torch.equal(cb.row_hop, exact.row_hop)
+    assert torch.equal(cb.row_in_role, exact.row_in_role)
+    assert torch.equal(cb.row_is_root, exact.row_is_root)
+
+    # ...and a generous fixed cap agrees on the populated prefix — fitting only drops pad slots.
+    padded = _cb(max_rows=32)
+    assert padded.max_rows == 32
+    assert torch.equal(padded.adj_role[:, :need, :need], cb.adj_role)
+    assert torch.equal(padded.row_valid[:, :need], cb.row_valid)
+    assert not bool(padded.row_valid[:, need:].any())
+
+
+def test_default_max_rows_is_fit_to_batch():
+    """The module default must be the fitting one — the bug was that MAX_ROWS=160 (a rel-f1 number)
+    was baked in as a cross-dataset constant AND unreachable from config, so it could only be found
+    by crashing a job."""
+    from gloss.data.collate import MAX_ROWS
+
+    assert MAX_ROWS is None
+    cb = to_cell_batch(make_synth_batch(), synthetic_bundle(), ENTITY, seq_len=16, max_fk=2)
+    assert cb.max_rows == int(cb.num_rows.max())
+
+
 # ---- real data ----
 
 @rel_f1_available

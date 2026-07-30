@@ -41,7 +41,9 @@ def _patch_multiembedding_offset() -> None:
     keeping the referenced value-columns is **content-preserving**: per-column embeddings are byte-identical.
     It is a strict **no-op** when ``offset[0]==0`` (every normal batch), so it can only turn a crash into
     the correct result — never change a batch that already succeeds. Genuinely corrupt METs (values shorter
-    than the offsets reference) fall through to the original assertion instead of being silently repaired.
+    than the offsets reference) raise a **diagnostic** ``RuntimeError`` carrying the actual layout rather
+    than being silently repaired — see the ``else`` branch below for why the message, not a print, is
+    the only thing that escapes a worker.
     Forked DataLoader workers inherit this patch (applied at import, before any loader is built)."""
     try:
         from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor as _MET
@@ -66,6 +68,21 @@ def _patch_multiembedding_offset() -> None:
                 object.__setattr__(self, "offset", off - k)
             elif w == T:
                 object.__setattr__(self, "offset", off - k)
+            else:
+                # Still un-normalisable. torch_frame's own `assert self.offset[0] == 0` would fire next
+                # with no numbers attached, and inside a DataLoader worker that is all the log ever
+                # shows — which is why four grid runs told us nothing. Raise the layout instead:
+                # exceptions cross the worker boundary with their message, `print()` does not.
+                raise RuntimeError(
+                    "MultiEmbeddingTensor offset could not be rebased (unrecognised layout): "
+                    f"n_cols={int(off.numel()) - 1} k={k} T={T} values={tuple(self.values.shape)} "
+                    f"w-T={w - T} w-(k+T)={w - (k + T)} "
+                    f"col_dims={(off[1:] - off[:-1]).tolist()[:8]}. "
+                    "This only occurs with num_workers>0 (a DataLoader IPC artifact); rerun with "
+                    "--num-workers 0 to get past it, and extend _patch_multiembedding_offset for the "
+                    "layout above once it is understood. Do NOT guess a repair — a wrong rebase "
+                    "silently corrupts embeddings instead of crashing."
+                )
         return _orig_validate(self)
 
     _MET.validate = _validate

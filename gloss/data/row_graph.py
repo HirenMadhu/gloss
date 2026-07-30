@@ -70,24 +70,38 @@ def build_row_graph(
     parent_g: Tensor,       # [E] int64  global node index of the referenced (parent) endpoint
     edge_role: Tensor,      # [E] int64  role id in [1, K]
     num_seeds: int,
-    max_rows: int,
+    max_rows: int | None,
     num_roles: int,
     num_hops: int | None = None,
 ) -> dict[str, Tensor]:
     """Build the per-seed row graph. Returns the P0.2/P0.3 ``CellBatch`` fields as a dict.
 
-    ``max_rows`` (R) is a hard cap: exceeding it **asserts**, it never clamps — a silently dropped row
-    would break the ``cell_row`` alias and hide a sampler/fanout change.
+    ``max_rows`` (R) is the padded row axis. ``None`` (the default everywhere) **fits R to the batch**:
+    R = the largest per-seed row count actually present. An explicit int is a hard cap that **asserts**
+    on overflow and never clamps — a silently dropped row would break the ``cell_row`` alias and hide a
+    sampler/fanout change.
+
+    Fitting is what makes this safe across datasets. R is fanout- *and schema*-coupled (it grows with
+    ``num_neighbors`` and with the number of edge types), so any fixed R is a measurement of one DB
+    masquerading as a constant: ``MAX_ROWS = 160`` was measured on rel-f1 (max 65 rows/seed) and every
+    rel-event run of the two-level arrays died on it at 162. Fitting also *saves* memory — row
+    attention and ``adj_role`` are dense ``O(R²)``, so padding rel-f1's 65 rows out to 160 cost ~6×.
     """
-    B, R, K = num_seeds, max_rows, num_roles
+    B, K = num_seeds, num_roles
     dev = seg.device
 
     num_rows = torch.bincount(seg, minlength=B)[:B]
     over = int(num_rows.max()) if num_rows.numel() else 0
-    assert over <= R, (
-        f"max_rows_per_seed exceeded: {over} rows on some seed but R={R}. Raise data.collate.max_rows "
-        f"(R is fanout-coupled: it grows with data.sampler.num_neighbors). Do not clamp."
-    )
+    if max_rows is None:
+        R = max(1, over)                 # fit to the batch; floor at 1 so the dense axes stay well-formed
+    else:
+        R = max_rows
+        assert over <= R, (
+            f"max_rows_per_seed exceeded: {over} rows on some seed but R={R}. Raise "
+            f"data.collate.max_rows, or leave it unset to fit R to each batch (R is fanout- and "
+            f"schema-coupled: it grows with data.sampler.num_neighbors and with the number of edge "
+            f"types). Do not clamp."
+        )
 
     flat = seg * R + local_node                                   # [N] slot index into [B*R]
     row_valid = torch.zeros(B * R, dtype=torch.bool, device=dev)
