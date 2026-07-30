@@ -103,6 +103,35 @@ def enumerate_configs(datasets, seeds: int, signals=ROUTING_SIGNALS, tasks=None)
     return build_grid(dataset_tasks(datasets, tasks), seeds, signals)
 
 
+#: Keys every result JSON must carry so a finished run can be checked against the config it was meant
+#: to run. Do not shrink this list.
+FINGERPRINT_KEYS = ("encoder", "d_text", "d_model", "n_blocks", "n_heads", "d_ff", "enc_channels",
+                    "num_experts", "k", "lr", "max_epochs", "batch_size", "seq_len")
+
+
+def run_fingerprint(*, encoder, d_text, model_kwargs, num_experts, k, lr, max_epochs,
+                    batch_size, seq_len) -> dict:
+    """The run's identity, to be merged into its result record alongside the scores.
+
+    Records used to carry `(dataset, task, signal, seed, arch)` and metrics only — no `encoder`, no
+    model shape. That is not a cosmetic gap: it means a finished result cannot be checked against the
+    config it was supposed to run, so you have to trust the submit line. Trusting the submit line is
+    exactly how two grid arrays reached completion on the wrong architecture AND the wrong encoder
+    before anyone read a result back (`amendments.md` §9.3), and why `results/two_level_full/` can
+    only be shown to be qwen by inference rather than by record.
+
+    `run_gridsearch.py` writes the same fields; keep the two runners in step.
+    """
+    mk = model_kwargs or {}
+    out = {"encoder": encoder, "d_text": d_text,
+           "num_experts": num_experts, "k": k, "lr": lr,
+           "max_epochs": max_epochs, "batch_size": batch_size, "seq_len": seq_len}
+    for key in ("d_model", "n_blocks", "n_heads", "d_ff", "enc_channels"):
+        out[key] = mk.get(key)
+    assert set(out) == set(FINGERPRINT_KEYS), "fingerprint drifted from FINGERPRINT_KEYS"
+    return out
+
+
 def run_config(
     index: int,
     *,
@@ -189,7 +218,10 @@ def run_config(
         # grouping key, so without this a two_level run would overwrite / be averaged together with an
         # RT run of the same (index, router). They are different architectures and must never merge.
         variant = f"{variant}@{arch}"
-    rec = {**c, "variant": variant, "arch": arch, "task_type": task_kind(task)}
+    rec = {**c, "variant": variant, "arch": arch, "task_type": task_kind(task),
+           **run_fingerprint(encoder=encoder, d_text=d_text, model_kwargs=mk, num_experts=num_experts,
+                             k=k, lr=lr, max_epochs=max_epochs, batch_size=batch_size,
+                             seq_len=seq_len)}
     if arch == "two_level":
         # self-describing results: which phase switches produced this number
         rec["two_level"] = {kk: vv for kk, vv in (two_level or {}).items()

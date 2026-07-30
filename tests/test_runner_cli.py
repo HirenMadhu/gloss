@@ -92,3 +92,40 @@ def test_ablation_main_forwards_arch_and_phase(monkeypatch, tmp_path):
     assert seen.get("arch") == "two_level"
     assert seen.get("encoder") == "qwen"
     assert seen.get("two_level"), "--phase full must resolve to a non-empty two_level switch dict"
+
+
+def test_ablation_record_is_self_describing():
+    """A finished result must state the config it ran, not just its scores.
+
+    `run_config` used to record neither `encoder` nor the model shape, so `results/two_level_full/`
+    can only be shown to be qwen by inference from the submit line, not by record. Trusting the
+    submit line is exactly how two grid arrays finished on the wrong architecture AND the wrong
+    encoder (amendments.md §9.3).
+    """
+    from gloss.eval.ablation import FINGERPRINT_KEYS, run_fingerprint
+
+    fp = run_fingerprint(
+        encoder="harrier", d_text=5376,
+        model_kwargs={"d_model": 256, "n_blocks": 8, "n_heads": 8, "d_ff": 1024,
+                      "enc_channels": 256, "arch": "two_level"},
+        num_experts=4, k=2, lr=3e-4, max_epochs=10, batch_size=64, seq_len=512,
+    )
+    assert set(fp) == set(FINGERPRINT_KEYS)
+    assert fp["encoder"] == "harrier" and fp["d_text"] == 5376
+    assert fp["d_model"] == 256 and fp["n_blocks"] == 8 and fp["d_ff"] == 1024
+    assert fp["lr"] == 3e-4 and fp["max_epochs"] == 10 and fp["seq_len"] == 512
+    # a missing model kwarg must read as null, never silently vanish from the record
+    sparse = run_fingerprint(encoder="qwen", d_text=2560, model_kwargs={}, num_experts=4, k=2,
+                             lr=1e-3, max_epochs=5, batch_size=8, seq_len=128)
+    assert set(sparse) == set(FINGERPRINT_KEYS)
+    assert sparse["d_model"] is None
+
+
+def test_ablation_run_config_merges_the_fingerprint():
+    """The fingerprint must actually be merged into the record, not just exist as a helper."""
+    import inspect
+
+    from gloss.eval import ablation
+
+    src = inspect.getsource(ablation.run_config)
+    assert "run_fingerprint(" in src, "run_config no longer stamps its result with run_fingerprint()"
