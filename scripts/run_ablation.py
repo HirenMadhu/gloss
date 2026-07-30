@@ -24,20 +24,7 @@ from gloss.eval import ablation  # noqa: E402
 
 
 
-# changes.md §5 phase presets. Each flips ONE group of switches relative to the previous, so a delta is
-# attributable. `full` is the proposed design: cell RoPE + one full cell attention + name-derived role
-# bias + row RoPE + MoE at BOTH levels (cell routed-only, row shared+routed).
-TWO_LEVEL_PHASES = {
-    "phase0a": dict(cell_attention="four_mask", cell_rope_time=False, time_mode="buckets",
-                    pool_query="mean", role_bias="none", time_bias="none", row_ffn="dense",
-                    broadcast="additive", head_mode="row_token"),
-    "phase0b": dict(cell_attention="full", cell_rope_time=False, time_mode="buckets",
-                    pool_query="mean", role_bias="none", time_bias="none", row_ffn="dense",
-                    broadcast="additive", head_mode="row_token"),
-    "full":    dict(cell_attention="full", cell_rope_time=True, time_mode="rope",
-                    pool_query="hybrid", role_bias="name_derived", time_bias="rope", row_ffn="moe",
-                    row_use_shared=True, broadcast="additive", head_mode="row_token"),
-}
+from run_ablation_phases import TWO_LEVEL_PHASES  # noqa: E402  (shared with run_gridsearch)
 
 
 def main() -> int:

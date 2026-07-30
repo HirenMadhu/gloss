@@ -111,14 +111,17 @@ def test_aggregate_keeps_architectures_separate():
 
 def test_phase_presets_differ_and_cover_the_gate():
     """changes.md §5: phase0a must keep the CELL level RT-like; full must turn the design on."""
-    import importlib.util
     from pathlib import Path
 
-    spec = importlib.util.spec_from_file_location(
-        "_ra", Path(__file__).resolve().parents[1] / "scripts" / "run_ablation.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    P = mod.TWO_LEVEL_PHASES
+    # the presets now live in scripts/run_ablation_phases.py, shared by BOTH array runners so they
+    # cannot drift — if they drifted, a grid-search "winner" would not be the same architecture as the
+    # headline run. Import it directly rather than through run_ablation.py (which pulls in torch).
+    import sys
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from run_ablation_phases import TWO_LEVEL_PHASES as P
 
     assert set(P) == {"phase0a", "phase0b", "full"}
     # phase0a isolates the row-token addition: cell level behaves exactly like RT

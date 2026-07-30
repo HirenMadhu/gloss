@@ -44,6 +44,30 @@ NUM_EXPERTS = [4, 8]
 ENC_CHANNELS = [128, 256]
 
 
+# ---------------------------------------------------------------------------------------------
+# TWO-LEVEL hyperparameter grid (changes.md `arch: two_level`).
+#
+# Deliberately SMALL and targeted, not a cross product for its own sake. The full-design run beat
+# RT on driver-top3 (+7 AUROC) but LOST on driver-dnf (-8) and driver-position (NMAE 0.629 vs 0.430),
+# so the hypothesis under test is a CAPACITY / LR mismatch rather than a broken mechanism:
+#   * the earlier RT arch grid found small `d_model=128` best, while the two-level runs used 256;
+#   * a two-level block has SIX sublayers to RT's five, so n_blocks=8 is 48 sublayers — likely too
+#     deep. Sweep 2 and 4.
+#   * more parameters at the same lr can simply be undertrained in 10 epochs; sweep lr.
+# 2 x 2 x 2 = 8 configs. n_heads=8 divides both d_model values.
+TWO_LEVEL_D_MODEL = [128, 256]
+TWO_LEVEL_N_BLOCKS = [2, 4]
+TWO_LEVEL_LR = [3.0e-4, 1.0e-3]
+
+
+def two_level_grid() -> list[dict]:
+    grid = []
+    for dm, nb, lr in itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS, TWO_LEVEL_LR):
+        grid.append(dict(d_model=dm, n_blocks=nb, n_heads=8, d_ff=dm * 4,
+                         num_experts=4, enc_channels=dm, lr=lr))
+    return grid
+
+
 def arch_grid() -> list[dict]:
     grid = []
     for dm, nb, nh, ffm, ne, enc in itertools.product(
@@ -54,10 +78,11 @@ def arch_grid() -> list[dict]:
     return grid
 
 
-def jobs(seeds: int) -> list[tuple]:
+def jobs(seeds: int, arch: str = "rt") -> list[tuple]:
     """Flat (config_idx, cfg, dataset, task, seed) list the array iterates by index."""
+    g = two_level_grid() if arch == "two_level" else arch_grid()
     return [(ci, cfg, ds, tk, s)
-            for ci, cfg in enumerate(arch_grid())
+            for ci, cfg in enumerate(g)
             for (ds, tk) in TASKS
             for s in range(seeds)]
 
@@ -72,7 +97,8 @@ def init_batch(cfg: dict) -> int:
     return 64
 
 
-def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) -> dict:
+def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
+              arch: str = "rt", phase: str = "full", encoder: str = "qwen") -> dict:
     import torch
 
     from relbench.tasks import get_task
@@ -81,7 +107,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) ->
     from gloss.eval.test_eval import evaluate_split
     from gloss.train.finetune import name_embeddings, target_stats, task_kind, train_prebuilt
 
-    J = jobs(seeds)
+    J = jobs(seeds, arch)
     if index >= len(J):
         print(f"index {index} >= grid size {len(J)}; nothing to do")
         return {}
@@ -94,10 +120,24 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) ->
     graph_cache = str(REPO / "data" / "graph_cache" / ds)
     bundle = build_gloss_graph(ds, cache_dir=graph_cache)
     task = get_task(ds, tk, download=False)
-    name_emb = name_embeddings(bundle, ds, encoder="harrier", d_text=2560)   # cached; no model load
+    # ENCODER must match whatever the run being compared against used. The two-level array used
+    # qwen, so a harrier grid would not be comparable to it — this used to be hardcoded to harrier.
+    d_text = 5376 if encoder == "harrier" else 2560
+    name_emb = name_embeddings(bundle, ds, encoder=encoder, d_text=d_text)   # cached; no model load
     kind = task_kind(task)
     mk = dict(cfg)
     mk["k"] = 2
+    lr = mk.pop("lr", 3.0e-4)          # lr is a TRAINER arg, not a model kwarg
+    if arch == "two_level":
+        from gloss.text.schema import build_table_name_embeddings, role_name_embeddings_with_none
+        from gloss.train.finetune import _name_encoder
+        from run_ablation_phases import TWO_LEVEL_PHASES
+
+        enc = _name_encoder(ds, encoder=encoder, d_text=d_text)
+        mk.update(arch="two_level",
+                  table_name_emb=build_table_name_embeddings(bundle, enc, kind="query"),
+                  role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
+                  **TWO_LEVEL_PHASES[phase])
 
     bs = init_batch(cfg)
     module = metrics = None
@@ -106,7 +146,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) ->
             module, metrics = train_prebuilt(
                 bundle, task, name_emb, model_kwargs=mk, route_on="signature", lambda_ortho=0.5,
                 seq_len=seq_len, max_fk=max_fk, batch_size=bs, max_epochs=epochs,
-                seed=seed, num_workers=num_workers,
+                seed=seed, num_workers=num_workers, lr=lr,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -117,7 +157,10 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir) ->
             print(f"CUDA OOM -> retry with batch_size={bs}", flush=True)
 
     rec = {"config_idx": ci, "dataset": ds, "task": tk, "seed": seed,
-           "task_type": kind, "batch_size": bs, **cfg, "k": 2}
+           "task_type": kind, "batch_size": bs, "arch": arch, "encoder": encoder,
+           **cfg, "k": 2}
+    if arch == "two_level":
+        rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     try:
         tm = evaluate_split(module, bundle, task, "test", num_neighbors=None,
@@ -209,6 +252,11 @@ def main() -> int:
     ap.add_argument("--seq-len", type=int, default=512)
     ap.add_argument("--max-fk", type=int, default=5)
     ap.add_argument("--out-dir", default="results/gridsearch")
+    ap.add_argument("--arch", default="rt", choices=["rt", "two_level"],
+                    help="two_level sweeps TWO_LEVEL_GRID (d_model x n_blocks x lr), not arch_grid")
+    ap.add_argument("--phase", default="full", choices=["phase0a", "phase0b", "full"])
+    ap.add_argument("--encoder", default="qwen",
+                    help="MUST match the run you compare against (the two-level array used qwen)")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
