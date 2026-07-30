@@ -61,6 +61,47 @@ the earlier RT grid found `d_model=128` best while the headline runs use 256, an
 
 ---
 
+## 1a-bis. 2026-07-30 — what failed, what was fixed, what is running now
+
+61 of the 2026-07-29 array tasks failed; see `amendments.md` §9 for the full diagnosis.
+
+* **57 failures, all rel-event:** `max_rows_per_seed exceeded: 162 rows but R=160`. `MAX_ROWS=160`
+  was a rel-f1 measurement asserted on every DB, and `train/loop.py` never passed the config key, so
+  the assert's own advice was a no-op. Fixed in `e9d98a1`: `max_rows=None` fits R to each batch
+  (semantics-preserving — padding rows are masked everywhere — and ~6x cheaper on rel-f1).
+* **4 failures:** the intermittent MET offset assert (`num_workers>0` only). Its layout is still
+  unknown; the fall-through now raises the actual numbers, because exceptions cross the DataLoader
+  worker boundary and `print()` does not.
+* **Both grid arrays ran the WRONG experiment** — `arch=rt`, `encoder=qwen`, RT configs 0-7. Neither
+  `--arch two_level` nor `--encoder harrier` reached the jobs. Their output is parked in
+  `results/rt_arch_grid_cfg0-7_qwen{,_DUPLICATE}/` with a README.
+
+| job | what | out-dir |
+|---|---|---|
+| `29030109` | headline rel-event redo, indices 18-26 | `results/two_level_full/` (was 18/27) |
+| `29030122` | **two-level** grid, qwen, 72 jobs, `afterany:29030109` | `results/tl_grid_qwen/` |
+| `29030123` | **two-level** grid, harrier, 72 jobs, `afterany:29030122` | `results/tl_grid_harrier/` |
+
+Chained, not parallel: all three share the same 8-GPU QOS cap, so extra arrays add ordering, not
+throughput. qwen first because it is the one comparable to the headline runs.
+
+```bash
+sbatch --array=0-71%8 scripts/run_gridsearch.sh --arch two_level --phase full \
+    --seeds 1 --epochs 10 --encoder qwen --out-dir results/tl_grid_qwen
+```
+
+> **Before letting any array run to completion, fingerprint its first finished record.** §9.3 cost 96
+> GPU-jobs and a whole harrier cache build because nobody did:
+> ```bash
+> .venv/bin/python -c "import json,glob;d=json.load(open(sorted(glob.glob('results/tl_grid_qwen/*.json'))[0]));print({k:d.get(k) for k in ('arch','phase','encoder','d_model','n_blocks','lr')})"
+> ```
+> `arch`, `phase`, `lr` and `encoder` are in every JSON precisely so this is a one-liner.
+
+The harrier schema cache **is** complete: its key set is byte-identical to the known-good qwen cache
+for all three DBs (67/134/134), so `29029525` did its job and no model load happens at train time.
+
+---
+
 ## 1b. The headline array (29029490)
 
 ```
