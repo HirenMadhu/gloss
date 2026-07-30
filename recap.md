@@ -118,6 +118,27 @@ for all three DBs (67/134/134), so `29029525` did its job and no model load happ
 
 ---
 
+## 1a-ter. Headline result — 27/27 DONE, and what it does (not) show
+
+Full table: **`results/two_level_full/SUMMARY.md`** (tracked despite the `results/` ignore).
+
+* **2/9 vs RT (from scratch)**, and **0/6 vs our own RT** in this codebase — including against our
+  RT's *median* config, so it is not a best-of-8 optimism artifact. Only `rel-f1/driver-top3` (+6.99
+  AUROC) is a clear win; the `driver-position` win (−0.004 NMAE) is far inside its own ±0.135.
+* **But the headline ran the MoRE default `d_model=256, n_blocks=8`** — and a two-level block has SIX
+  sublayers to RT's five, i.e. 48 sublayers. **Grid config 0, the SMALLEST point (`128/2`, 1 seed),
+  beats the 256/8 headline on 8 of 9 tasks** (driver-dnf 71.4→83.2, user-attendance NMAE
+  0.554→0.397, user-repeat 67.9→77.8), and beats RT (scratch) on 4/9 instead of 2/9.
+  **So the 27-run table is a verdict on one over-sized configuration, not on the architecture.**
+* **Seed instability**: `driver-position` / `user-repeat` / `study-outcome` have cv 28.5% / 18.9% /
+  12.6%, and each is **one collapsed seed out of three**, not uniform spread. Single-seed grid
+  winners will need a multi-seed confirmation run before anything is claimed.
+
+Regression rows are **NMAE = `test_mae` / `target_stats(task)[1]`** — `run_ablation` records store
+raw MAE, so always divide before comparing to the leaderboard.
+
+---
+
 ## 1b. The headline array (29029490)
 
 ```
