@@ -1,0 +1,94 @@
+"""Every CLI knob the array runners parse must actually reach the function that runs the job.
+
+This exists because of `amendments.md` §9.3: `run_gridsearch.py` parsed `--arch`, `--phase` and
+`--encoder` and then called `run_index(...)` **without them**, so every task fell back to
+`arch="rt", encoder="qwen"` regardless of the command line — while `--list` in the same `main()` DID
+honour `args.arch`. The array was therefore sized from the two-level grid (72) but every task ran the
+864-entry RT grid, and a `--encoder harrier` array quietly ran qwen. It cost 96 completed GPU-jobs of
+the wrong experiment, twice, before a result JSON was read back.
+
+A dropped kwarg is invisible at runtime — the job succeeds, it just answers a different question — so
+it needs a test rather than a code review. Assert on the *whole* forwarded set, not one flag, so the
+next knob added to the parser is covered by the same failure.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+
+def _load(mod_name: str):
+    """Import a runner script without executing a job (its heavy imports are function-local)."""
+    return pytest.importorskip(mod_name)
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        (["--index", "0", "--arch", "two_level", "--phase", "full", "--encoder", "qwen"],
+         {"arch": "two_level", "phase": "full", "encoder": "qwen"}),
+        (["--index", "5", "--arch", "two_level", "--phase", "phase0a", "--encoder", "harrier"],
+         {"arch": "two_level", "phase": "phase0a", "encoder": "harrier"}),
+        (["--index", "5", "--encoder", "harrier"],            # the flag that silently ran qwen
+         {"arch": "rt", "phase": "full", "encoder": "harrier"}),
+    ],
+)
+def test_gridsearch_main_forwards_arch_phase_encoder(monkeypatch, tmp_path, argv, expected):
+    rg = _load("run_gridsearch")
+    seen = {}
+
+    def fake_run_index(index, **kw):
+        seen["index"] = index
+        seen.update(kw)
+        return {"config_idx": index, **kw}
+
+    monkeypatch.setattr(rg, "run_index", fake_run_index)
+    monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", *argv, "--out-dir", str(tmp_path)])
+    assert rg.main() == 0
+
+    for k, v in expected.items():
+        assert seen.get(k) == v, f"--{k} was parsed but not forwarded to run_index (got {seen.get(k)!r})"
+
+
+def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
+    """`--list` and the run path must not disagree about the grid, and no parsed knob may be dropped.
+
+    The §9.3 bug was exactly a disagreement: `--list` read `args.arch`, the run path did not.
+    """
+    rg = _load("run_gridsearch")
+    seen = {}
+    monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
+    monkeypatch.setattr(sys, "argv", [
+        "run_gridsearch.py", "--index", "0", "--arch", "two_level", "--phase", "full",
+        "--encoder", "harrier", "--seeds", "2", "--epochs", "7", "--num-workers", "3",
+        "--seq-len", "256", "--max-fk", "4", "--out-dir", str(tmp_path),
+    ])
+    assert rg.main() == 0
+    assert seen == {
+        "seeds": 2, "epochs": 7, "num_workers": 3, "seq_len": 256, "max_fk": 4,
+        "out_dir": tmp_path, "arch": "two_level", "phase": "full", "encoder": "harrier",
+    }
+    # the grid `--list` reports must be the grid the run path indexes
+    assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
+
+
+def test_ablation_main_forwards_arch_and_phase(monkeypatch, tmp_path):
+    """`run_ablation.py` got this right — pin it so it stays right (the headline arrays depend on it)."""
+    ra = _load("run_ablation")
+    seen = {}
+    monkeypatch.setattr(ra.ablation, "run_config", lambda index, **kw: (seen.update(kw), {})[1])
+    monkeypatch.setattr(sys, "argv", [
+        "run_ablation.py", "--index", "0", "--arch", "two_level", "--phase", "full",
+        "--encoder", "qwen", "--seeds", "3", "--datasets", "rel-f1",
+        "--signals", "signature", "--out-dir", str(tmp_path),
+    ])
+    assert ra.main() == 0
+    assert seen.get("arch") == "two_level"
+    assert seen.get("encoder") == "qwen"
+    assert seen.get("two_level"), "--phase full must resolve to a non-empty two_level switch dict"

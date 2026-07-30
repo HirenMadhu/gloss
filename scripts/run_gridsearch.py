@@ -272,8 +272,15 @@ def main() -> int:
     if args.index is None:
         print("pass --index N, --list, or --aggregate")
         return 2
+    # arch/phase/encoder MUST be forwarded. They used to be parsed and then silently dropped here, so
+    # `run_index` fell back to its defaults (arch="rt", encoder="qwen") no matter what was on the
+    # command line — while `--list` above DID honour `args.arch`. That mismatch is what made it
+    # invisible: the array was sized 72 from the two-level grid but every task ran the 864-entry RT
+    # grid, and a `--encoder harrier` array quietly ran qwen. 96 completed GPU-jobs of the wrong
+    # experiment (amendments.md §9.3) plus a wasted harrier cache build. Keep this call exhaustive.
     rec = run_index(args.index, seeds=args.seeds, epochs=args.epochs, num_workers=args.num_workers,
-                    seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir)
+                    seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir,
+                    arch=args.arch, phase=args.phase, encoder=args.encoder)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0

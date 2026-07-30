@@ -76,11 +76,27 @@ the earlier RT grid found `d_model=128` best while the headline runs use 256, an
   `--arch two_level` nor `--encoder harrier` reached the jobs. Their output is parked in
   `results/rt_arch_grid_cfg0-7_qwen{,_DUPLICATE}/` with a README.
 
-| job | what | out-dir |
-|---|---|---|
-| `29030109` | headline rel-event redo, indices 18-26 | `results/two_level_full/` (was 18/27) |
-| `29030122` | **two-level** grid, qwen, 72 jobs, `afterany:29030109` | `results/tl_grid_qwen/` |
-| `29030123` | **two-level** grid, harrier, 72 jobs, `afterany:29030122` | `results/tl_grid_harrier/` |
+| job | what | out-dir | state |
+|---|---|---|---|
+| `29030109` | headline rel-event redo, indices 18-26 | `results/two_level_full/` | **DONE 27/27** |
+| `29030571` | **two-level** grid, qwen, 72 jobs | `results/tl_grid_qwen/` | queued |
+| `29030572` | **two-level** grid, harrier, 72 jobs, `afterany:29030571` | `results/tl_grid_harrier/` | queued |
+
+`29030122`/`29030123` were an earlier attempt, cancelled — see §9.3/§9.4 in `amendments.md`. The
+real bug was in `run_gridsearch.py::main`, which **parsed `--arch`/`--phase`/`--encoder` and then
+dropped them** when calling `run_index`, so every task silently ran `arch=rt, encoder=qwen` however
+the array was submitted. Fixed, with `tests/test_runner_cli.py` asserting the whole forwarded kwarg
+set for both runners.
+
+**Two scheduling facts, learned the hard way:**
+* `priority_gpu` is NOT usable by the `ying_rex` account (`sbatch --test-only` -> "Invalid account or
+  account/partition combination"); a `gpu,priority_gpu` list parks the array in `(PartitionConfig)`
+  forever. `gpu` is the only GPU partition.
+* The cluster has **12 h100s total**, shared. When another user's array fills them we hold one slot
+  and the array LOOKS serialized — task N+1 starting the same second on the same node is SLURM
+  handing our own freed GPU back, not a throttle bug. Confirm with
+  `sinfo -N -o "%N %t %G"` and `sacct -j <id> -X` (the throttle shows as `_[a-b%8]`) before
+  blaming the submission.
 
 Chained, not parallel: all three share the same 8-GPU QOS cap, so extra arrays add ordering, not
 throughput. qwen first because it is the one comparable to the headline runs.

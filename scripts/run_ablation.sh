@@ -13,9 +13,20 @@
 
 # Routing-signal ablation as a SLURM job ARRAY: one (dataset, task, signal, seed) config per task.
 #
-# Partition: `gpu` with h100:1. An earlier version targeted `gpu_h200`/`h200:1` and claimed "this
-# cluster has no h100" — both wrong: `sinfo` shows NO gpu_h200 partition at all, and `gpu` carries
-# a40:4 and h100:4 (plus priority_gpu h100:4, scavenge). As written it would never have scheduled.
+# Partition: `gpu,priority_gpu` with h100:1. An earlier version targeted `gpu_h200`/`h200:1` and
+# claimed "this cluster has no h100" — both wrong: `sinfo` shows NO gpu_h200 partition at all, and
+# `gpu` carries a40:4 and h100:4. As written it would never have scheduled.
+#
+# Do NOT add `priority_gpu`: it fronts the same three h100 nodes but the `ying_rex` account cannot
+# submit there — `sbatch --test-only --partition=priority_gpu` returns "Invalid account or
+# account/partition combination", and a `gpu,priority_gpu` list just parks the array in
+# (PartitionConfig) forever. `gpu` is the only usable GPU partition.
+#
+# The whole cluster has only 12 h100s and they are shared. When another user's array fills them we
+# drop to one slot and the array LOOKS serialized: on 2026-07-30 job 29030122 ran task 0 alone, then
+# task 1 started the *same second on the same node* — SLURM handing our own freed GPU straight back
+# to us. That is contention, not a throttle bug; `sacct` shows the `%8` throttle intact as
+# `29030122_[2-71%8]`. Check `sinfo -N -o "%N %t %G"` before blaming the submission.
 #
 # Concurrency is capped at %8 — the account's simultaneous-GPU limit. Raising it just queues.
 #

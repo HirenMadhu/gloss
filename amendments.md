@@ -530,14 +530,60 @@ Consequences:
   `29029525` it depended on was consumed for nothing.
 - **Nothing was learned about the two-level capacity/LR question the grid existed to answer.**
 
-The code is not at fault — `run_gridsearch.py` threads `arch` correctly, and `--list` honours
-`--arch` since `6a4c938`. The submission simply omitted the flags. The defence is to stop trusting
-the submit line and check the **first completed record** against the intended config before letting
-an array run to completion; `arch`/`phase`/`lr` are in every JSON precisely so this is a one-liner.
+**The cause — and the first diagnosis here was WRONG.** This section originally concluded "the code
+is not at fault … the submission simply omitted the flags." That was wrong, and believing it cost a
+second wasted run: the grid was resubmitted on 2026-07-30 *with* `--arch two_level --encoder qwen`
+explicitly on the `sbatch` line, and job `29030122_0` still wrote `"arch": "rt"`.
+
+The real cause is one line in `run_gridsearch.py::main`:
+
+```python
+rec = run_index(args.index, seeds=args.seeds, epochs=args.epochs, num_workers=args.num_workers,
+                seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir)
+#               ^ arch / phase / encoder are PARSED and then dropped
+```
+
+`run_index` therefore fell back to its defaults `arch="rt", phase="full", encoder="qwen"` no matter
+what was on the command line. What made it invisible is that **`--list`, in the same `main()`, DID
+honour `args.arch`** — so `--list --arch two_level` correctly printed 72, the array was sized 72, and
+every task then indexed the 864-entry RT grid. `--out-dir` was forwarded, which is why the results
+landed in the right directory and looked plausible. `--encoder harrier` was dropped the same way,
+which is why the "harrier grid" ran qwen and was a byte-for-byte duplicate.
+
+`run_ablation.py` does **not** have this bug — it forwards `arch=args.arch` and resolves `--phase`
+into `two_level=` — which is why the headline arrays genuinely ran two-level throughout.
+
+Fixed by forwarding the three kwargs, plus `tests/test_runner_cli.py`, which asserts on the **whole**
+forwarded kwarg set for both runners so the next knob added to a parser is covered by the same test.
+A dropped kwarg is invisible at runtime — the job succeeds, it just answers a different question — so
+it needs a test, not a code review.
+
+**The habit that catches this class of thing in minutes** is to check the **first completed record**
+against the intended config before letting an array run out; `arch`/`phase`/`encoder`/`lr` are in
+every JSON precisely so this is a one-liner. It is what caught the second occurrence:
+
+```bash
+python -c "import json,glob;d=json.load(open(sorted(glob.glob('results/<dir>/*.json'))[0]));print({k:d.get(k) for k in ('arch','phase','encoder','d_model','n_blocks','lr')})"
+```
 
 ### 9.4 What was resubmitted
 
 `29030109` — headline array indices 18–26 (the nine rel-event runs), same flags as `29029490`.
-`results/two_level_full/` had 18 of 27. The grids were **not** resubmitted: their failed indices are
-moot because the 96 that "succeeded" are the wrong experiment, so the whole grid needs re-running
-with `--arch two_level` rather than patching 24 indices.
+**All 9 COMPLETED**, `results/two_level_full/` now 27/27: the `max_rows` fix holds on the real path.
+
+The grids took two more attempts:
+
+* `29030122`/`29030123` (2026-07-30 10:2x) — resubmitted whole rather than patching the 24 failed
+  indices, since the 96 that "succeeded" were the wrong experiment. Cancelled by the user at 12:01
+  because the array appeared to run one task at a time. That appearance was **cluster contention**,
+  not a submission bug: all 12 h100s cluster-wide were allocated to another user's array, we held
+  exactly one slot, and when task 0 released its GPU task 1 started the same second on the same node.
+  `sacct` shows the throttle intact as `29030122_[2-71%8]`. Cancelling turned out to be lucky — the
+  one record it did write proved §9.3 was still happening.
+* `29030571` (qwen) → `29030572` (harrier, `afterany`) — submitted after the kwarg-forwarding fix,
+  with the bogus RT record deleted from `results/tl_grid_qwen/` so the skip-guard could not honour it.
+
+**`priority_gpu` is not usable by this account** — `sbatch --test-only --partition=priority_gpu`
+returns "Invalid account or account/partition combination", and a `gpu,priority_gpu` list parks the
+array in `(PartitionConfig)` indefinitely. `gpu` is the only GPU partition available, and its h100
+pool is 12 GPUs shared cluster-wide.
