@@ -436,3 +436,91 @@ Both were tests that would have "verified" working code forever without exercisi
   and both constraints hold comfortably at `ω_min = 0.3`.
 - An earlier encoder-coverage table was read from the repo-relative `data/schema_cache/` fallback
   rather than the scratch60 path SLURM reads. The real cache held **harrier only, zero qwen**.
+
+---
+
+## 9. Failures of the 2026-07-29 arrays, diagnosed 2026-07-30
+
+61 of the 243 submitted array tasks failed. Two unrelated causes, plus a third problem that the
+failures happened to expose.
+
+### 9.1 `R = 160` did NOT hold — it killed every rel-event run (57 failures)
+
+§1.1 above concluded "`R = 160` holds, but at 1.6× margin", from a measured max of **100** on
+rel-event/user-attendance. That measurement was an **undersample**. In the real runs rel-event
+reached **161–162** rows on a seed and tripped the assert:
+
+    AssertionError: max_rows_per_seed exceeded: 162 rows on some seed but R=160
+
+All 57 were rel-event; all three of its tasks; both grids and the headline array. It always fired
+at the **first validation pass**, i.e. after 5–25 min of training, so every rel-event run was
+wasted. rel-f1 and rel-trial were unaffected — which is precisely the trap: `MAX_ROWS = 160` was a
+**rel-f1** measurement (max 65 rows/seed at `[12,12]`) frozen into `collate.py` as if it were a
+cross-dataset constant. R is fanout- **and schema**-coupled: it grows with `num_neighbors` *and*
+with the number of edge types, and rel-event has far more of the latter.
+
+Two things made it undiscoverable short of crashing a job:
+1. `configs/*.yaml` advertise `data.collate.max_rows`, but `train/loop.py` never passed it to
+   `to_cell_batch` — so the assert's own advice ("Raise `data.collate.max_rows`") was a no-op.
+2. §1.1's margin came from a partial sweep, and the shortfall is only ~1%. No amount of extra
+   sampling makes a fixed constant safe for the *next* database.
+
+**Fix (`e9d98a1`): `max_rows=None` — fit R to each batch.** R becomes the largest per-seed row count
+actually present. This is semantics-preserving, because padding rows are already fully masked
+everywhere they could matter — row attention masks them, `RowMoE.balance_loss` and the usage
+diagnostics restrict to `row_valid`, and `RowTokenHead` pools the root only — and it *saves* memory:
+`adj_role` and row attention are dense `O(R²)`, so padding rel-f1's 65 rows out to 160 cost ~6×. An
+explicit int is still honoured as a hard cap that asserts and never clamps. `max_rows` is now plumbed
+through `MoRELitModule` and `evaluate_split`, so the config key is real rather than decorative.
+
+**The general lesson:** a constant measured on one DB and asserted on all of them is a landmine, and
+"measured max × 1.6" is not a safety margin when the quantity is schema-coupled. Prefer fitting the
+axis to the batch over raising the constant.
+
+### 9.2 The MET offset assert, made diagnosable (4 failures)
+
+`29029522_{8,34}` and `29029526_{16,33}` died on the known intermittent
+`assert self.offset[0] == 0` inside a DataLoader worker — the un-normalisable branch of
+`_patch_multiembedding_offset`. All four were also rel-event, and only occur with `num_workers>0`.
+
+The layout is **still unknown**, and that is the point: `scripts/probe_met_offset.py` tried to
+`print()` it, and worker stdout is discarded, so the probe could never have reported anything. The
+fall-through now raises a `RuntimeError` carrying `(n_cols, k, T, values.shape, col_dims)` —
+**exceptions cross the worker boundary, prints do not** — so the next occurrence will say what the
+layout is. No repair is guessed: a wrong rebase would silently corrupt embeddings rather than crash.
+Workaround meanwhile is unchanged: `--num-workers 0`.
+
+### 9.3 Both grid arrays ran the WRONG experiment
+
+Not a crash — worse, 96 jobs that completed and produced meaningless output. Reading the result
+JSONs back:
+
+| | intended | actually ran |
+|---|---|---|
+| `29029522` "qwen grid" | `--arch two_level`, `d_model{128,256} × n_blocks{2,4} × lr{3e-4,1e-3}` | `arch=rt`, `arch_grid()` configs 0–7 |
+| `29029526` "harrier grid" | `--arch two_level --encoder harrier` | `arch=rt`, **`encoder=qwen`** |
+
+Neither `--arch two_level` nor `--encoder harrier` reached the jobs. Evidence in every record:
+`"arch": "rt"`, no `"phase"` key (two-level records carry one), no `"lr"` key, and
+`n_heads=4, d_ff∈{256,512}, num_experts∈{4,8}` — the signature of `arch_grid()`, whose two-level
+counterpart is `n_heads=8, d_ff=d_model×4, num_experts=4`.
+
+Consequences:
+- The array was sized `0-71` from `--list --arch two_level` (8 configs × 9 tasks), but indexed the
+  **864-entry RT grid**, so it covered only RT configs 0–7 — all at `d_model=128, n_blocks=4`,
+  varying only `num_experts` and `enc_channels`.
+- `29029526` is therefore a **byte-for-byte duplicate** of `29029522`, and the harrier cache build
+  `29029525` it depended on was consumed for nothing.
+- **Nothing was learned about the two-level capacity/LR question the grid existed to answer.**
+
+The code is not at fault — `run_gridsearch.py` threads `arch` correctly, and `--list` honours
+`--arch` since `6a4c938`. The submission simply omitted the flags. The defence is to stop trusting
+the submit line and check the **first completed record** against the intended config before letting
+an array run to completion; `arch`/`phase`/`lr` are in every JSON precisely so this is a one-liner.
+
+### 9.4 What was resubmitted
+
+`29030109` — headline array indices 18–26 (the nine rel-event runs), same flags as `29029490`.
+`results/two_level_full/` had 18 of 27. The grids were **not** resubmitted: their failed indices are
+moot because the 96 that "succeeded" are the wrong experiment, so the whole grid needs re-running
+with `--arch two_level` rather than patching 24 indices.
