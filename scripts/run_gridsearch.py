@@ -264,7 +264,7 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = REPO / out_dir
     if args.list:
-        print(len(jobs(args.seeds)))
+        print(len(jobs(args.seeds, args.arch)))
         return 0
     if args.aggregate:
         print(aggregate(out_dir))

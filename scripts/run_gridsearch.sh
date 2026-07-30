@@ -25,8 +25,12 @@ source .venv/bin/activate
 source scripts/env.sh
 date; hostname; echo "grid task ${SLURM_ARRAY_TASK_ID}"
 
+# NOTE --epochs/--seeds are NOT pinned here. They used to be (30/3), before "$@", so a caller's
+# override only won by argparse last-wins — the same silent-wrong-answer trap that had --encoder
+# pinned to harrier. 30 epochs is also 3x the 10 the ablation runs use, which matters when a sweep
+# has to fit a wall-clock budget. Pass them explicitly at the call site.
 python scripts/run_gridsearch.py --index "${SLURM_ARRAY_TASK_ID}" \
-    --epochs 30 --seeds 3 --num-workers 8 "$@"
+    --num-workers 8 "$@"
 rc=$?
 echo "GRID_TASK_${SLURM_ARRAY_TASK_ID}_DONE (rc=$rc)"
 exit $rc
