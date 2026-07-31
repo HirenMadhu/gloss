@@ -494,7 +494,33 @@ repair — read the number off the assert and raise the constant — is itself a
 split that overruns first is not the split that overruns most. Prefer fitting the axis to the batch
 over raising the constant.
 
-### 9.2 The MET offset assert, made diagnosable (4 failures)
+### 9.2 The MET offset assert — diagnosed and fixed (11 failures total)
+
+**RESOLVED 2026-07-31 (`eb488e4`). The layout was a ZERO-COLUMN MET**, and the reason the repair
+never fired on it is that the repair itself required `off.numel() >= 2`.
+
+The tell was in the traceback: it passed **through** `graph.py`'s `_validate` and *then* hit
+torch_frame's bare `assert self.offset[0] == 0` — so `offset[0] != 0` (our outer guard matched) while
+neither rebase branch ran, which is only possible at `numel() == 1`. torch_frame's own `validate()`
+asserts `len(self.offset) == self.num_cols + 1`, so a 1-element offset means **`num_cols == 0`**:
+there is no column whose embedding `values[:, offset[j]:offset[j+1]]` could be addressed, so rebasing
+to `[0]` is **provably content-preserving** — it is not a guessed repair. `values` is untouched.
+`_row_index_select` forwards the parent's `offset` verbatim, which is how a rebased parent hands its
+non-zero base down to a child.
+
+Cost: 7 further grid failures on top of the original 4 — `29030571_{15,25,71}` (qwen) and
+`29030572_{34,44,51,71}` (harrier), on **six different configs**, all rel-event, all `num_workers>0`.
+Config-independence is what identifies it as a data-layout bug rather than a capacity one. Re-run as
+`29033870` / `29033883`. Note `graph.py` mtime is the cutoff: a task that started before the fix had
+already imported the old module, so **check `sacct` for FAILED before declaring an array complete**.
+
+Pinned by three tests in `tests/test_runner_cli.py`: the zero-column repair, a **no-op on healthy
+tensors** (the patch must only ever turn a crash into the correct result, never alter a batch that
+already validates), and the un-normalisable branch still reporting its layout.
+
+The original entry, kept because its lesson about worker stdout is what made the diagnosis possible:
+
+#### (original) The MET offset assert, made diagnosable (4 failures)
 
 `29029522_{8,34}` and `29029526_{16,33}` died on the known intermittent
 `assert self.offset[0] == 0` inside a DataLoader worker — the un-normalisable branch of
