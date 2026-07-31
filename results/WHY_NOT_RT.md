@@ -83,7 +83,7 @@ standardized target) could plausibly close it outright. Same story on user-atten
 
 This does **not** explain site-success (skew 0.24) — that one is underfitting, cause 3.
 
-## 4b. RULED OUT: `seq_len` truncation is *not* starving the losing tasks
+## 4b. `seq_len` truncation: ruled out on rel-f1/rel-trial, CONFIRMED SEVERE on rel-event
 
 Worth checking because it is the same shape of mistake as `MAX_ROWS=160` — a rel-f1 number applied to
 every DB — except that `max_rows` asserted loudly while `to_cell_batch` drops overflow cells with a
@@ -93,22 +93,46 @@ of each neighbourhood and looked perfectly healthy. Measured with `scripts/probe
 
 | dataset | median | p90 | max | seeds over cap | cells kept |
 |---|---|---|---|---|---|
-| rel-f1 (3 tasks) | 249–288 | 290–336 | **374** | 0.0% | **100%** |
-| rel-trial (3 tasks) | 71–109 | 113–317 | **317** | 0.0% | **100%** |
+| rel-f1 (3 tasks) | 249–288 | 290–336 | 374 | 0.0% | **100%** |
+| rel-trial (3 tasks) | 71–109 | 113–317 | 317 | 0.0% | **100%** |
+| **rel-event/user-repeat** | **1017** | **1808** | **2581** | **66.7%** | **43.7%** |
+| **rel-event/user-ignore** | **798** | **1590** | **3256** | **57.8%** | **42.2%** |
 
-**Nothing is truncated on either DB.** rel-trial is in fact the *sparsest* — site-success has a median
-of 109 cells/seed against a 512 cap, and study-adverse 71. So the two worst tasks are not
-information-starved by the cap; they simply are not learning from what they already get, which
-sharpens cause 3 (underfitting) rather than competing with it.
+Two different stories, and they split exactly along the DBs.
 
-It also means the losses are not explained by neighbourhood size: rel-trial gets *less* context per
-seed than rel-f1 and loses, while rel-f1 gets the most and wins 3/3. (rel-event measurement pending —
-its loader is slow; it is the one DB where a large fanout could still overflow.)
+**rel-f1 and rel-trial fit entirely.** rel-trial is in fact the *sparsest* — site-success has a median
+of 109 cells/seed against a 512 cap, study-adverse 71. So the two worst regression tasks are not
+information-starved; they are not learning from what they already get, which sharpens cause 3
+(underfitting) rather than competing with it.
+
+**rel-event is silently training on well under half its neighbourhood.** The median seed demands
+~2× the cap and the worst 6.4× it; **~57% of every seed's cells are discarded, with no warning.**
+Seed-row cells are emitted first, so what gets dropped is precisely the *relational context* — the
+part MoRE exists to exploit. Every rel-event number in the grid AND in the 27-run headline was
+produced under this, including the user-repeat loss (one of the three consistent losses) and the
+user-ignore / user-attendance "wins".
+
+This is the `MAX_ROWS = 160` mistake a second time — a rel-f1 measurement (`~353 cells/seed`, quoted
+in `CLAUDE.md` as the justification for 512) applied to every DB — except `max_rows` asserted and
+died, so it got fixed in a day, while this one degrades in silence and has been shaping results all
+along.
+
+**It is not a one-line fix.** Covering rel-event's max needs `seq_len ≈ 3456`, and cell attention is
+dense `O(S²)` with four masks per block, so that is ~45× the attention cost — infeasible at the
+current batch sizes. The realistic options are a smaller rel-event fanout (trading breadth for
+completeness, and measurable with this probe), or accepting truncation and *reporting* it. What is
+not defensible is the status quo, where the loss is invisible.
+
+Caveat on scope: 3 batches × 192 seeds on the train split, `--tasks user-repeat user-ignore`
+(user-attendance shares user-ignore's seed table, 19,239 rows). rel-f1/rel-trial used 8–12 batches
+over train+test.
 
 Related size facts, for the record: train rows are site-success 151,407 and study-adverse 43,335 —
-the two **largest** training sets are two of the three losses, so this is not a shortage of labels or
-of optimizer steps either. Distinct column names: rel-f1 **45**, rel-event **134**. We win where the
-schema is *least* diverse, which is the opposite of what a schema-routing mechanism should predict.
+the two **largest** training sets are two of the three losses, so on rel-trial this is not a shortage
+of labels or of optimizer steps either. Distinct column names: rel-f1 **45**, rel-event **134**. We
+win outright only on rel-f1 — the DB with the *least* schema diversity, which is the opposite of what
+a schema-routing mechanism should predict, though rel-event's truncation now partly confounds that
+reading too.
 
 ## 5. lr fragility, and a fixed 10-epoch budget
 
