@@ -78,12 +78,33 @@ def arch_grid() -> list[dict]:
     return grid
 
 
-def jobs(seeds: int, arch: str = "rt") -> list[tuple]:
-    """Flat (config_idx, cfg, dataset, task, seed) list the array iterates by index."""
+#: Task subsets selectable with `--tasks`. `regression` is the 4 NMAE-scored entity tasks — the only
+#: ones a change to the regression objective can affect, so an L1/Huber sweep runs just these.
+TASK_SETS = {
+    "all": TASKS,
+    "regression": [("rel-f1", "driver-position"), ("rel-trial", "study-adverse"),
+                   ("rel-trial", "site-success"), ("rel-event", "user-attendance")],
+    "binary": [t for t in TASKS if t not in
+               {("rel-f1", "driver-position"), ("rel-trial", "study-adverse"),
+                ("rel-trial", "site-success"), ("rel-event", "user-attendance")}],
+}
+
+
+def jobs(seeds: int, arch: str = "rt", task_set: str = "all") -> list[tuple]:
+    """Flat (config_idx, cfg, dataset, task, seed) list the array iterates by index.
+
+    `task_set` changes the index->job mapping, so it MUST be passed identically to `--list` and to
+    `run_index` — see the §9.3 comment in `main`. Results for different task sets therefore belong in
+    different `--out-dir`s: index 0 means a different job under each.
+    """
     g = two_level_grid() if arch == "two_level" else arch_grid()
+    try:
+        tasks = TASK_SETS[task_set]
+    except KeyError:
+        raise ValueError(f"unknown task_set {task_set!r}; expected one of {sorted(TASK_SETS)}") from None
     return [(ci, cfg, ds, tk, s)
             for ci, cfg in enumerate(g)
-            for (ds, tk) in TASKS
+            for (ds, tk) in tasks
             for s in range(seeds)]
 
 
@@ -98,7 +119,8 @@ def init_batch(cfg: dict) -> int:
 
 
 def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
-              arch: str = "rt", phase: str = "full", encoder: str = "qwen") -> dict:
+              arch: str = "rt", phase: str = "full", encoder: str = "qwen",
+              task_set: str = "all", regression_loss: str = "mse") -> dict:
     import torch
 
     from relbench.tasks import get_task
@@ -107,7 +129,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
     from gloss.eval.test_eval import evaluate_split
     from gloss.train.finetune import name_embeddings, target_stats, task_kind, train_prebuilt
 
-    J = jobs(seeds, arch)
+    J = jobs(seeds, arch, task_set)
     if index >= len(J):
         print(f"index {index} >= grid size {len(J)}; nothing to do")
         return {}
@@ -146,7 +168,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
             module, metrics = train_prebuilt(
                 bundle, task, name_emb, model_kwargs=mk, route_on="signature", lambda_ortho=0.5,
                 seq_len=seq_len, max_fk=max_fk, batch_size=bs, max_epochs=epochs,
-                seed=seed, num_workers=num_workers, lr=lr,
+                seed=seed, num_workers=num_workers, lr=lr, regression_loss=regression_loss,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -158,7 +180,10 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
 
     rec = {"config_idx": ci, "dataset": ds, "task": tk, "seed": seed,
            "task_type": kind, "batch_size": bs, "arch": arch, "encoder": encoder,
-           **cfg, "k": 2}
+           # stamp the objective on the record: an L1 run and an MSE run are otherwise
+           # indistinguishable from their JSON, and they live in sibling directories
+           "regression_loss": regression_loss if kind == "regression" else None,
+           "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
@@ -257,6 +282,11 @@ def main() -> int:
     ap.add_argument("--phase", default="full", choices=["phase0a", "phase0b", "full"])
     ap.add_argument("--encoder", default="qwen",
                     help="MUST match the run you compare against (the two-level array used qwen)")
+    ap.add_argument("--tasks", default="all", choices=sorted(TASK_SETS),
+                    help="task subset; CHANGES the index->job mapping, so use a distinct --out-dir")
+    ap.add_argument("--reg-loss", default="mse", choices=["mse", "l1", "huber"],
+                    help="regression objective (binary tasks ignore it). mse = every result before "
+                         "2026-07-31; l1 aligns training with RelBench's MAE metric")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
@@ -264,7 +294,7 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = REPO / out_dir
     if args.list:
-        print(len(jobs(args.seeds, args.arch)))
+        print(len(jobs(args.seeds, args.arch, args.tasks)))
         return 0
     if args.aggregate:
         print(aggregate(out_dir))
@@ -280,7 +310,8 @@ def main() -> int:
     # experiment (amendments.md §9.3) plus a wasted harrier cache build. Keep this call exhaustive.
     rec = run_index(args.index, seeds=args.seeds, epochs=args.epochs, num_workers=args.num_workers,
                     seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir,
-                    arch=args.arch, phase=args.phase, encoder=args.encoder)
+                    arch=args.arch, phase=args.phase, encoder=args.encoder,
+                    task_set=args.tasks, regression_loss=args.reg_loss)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0

@@ -67,15 +67,46 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", [
         "run_gridsearch.py", "--index", "0", "--arch", "two_level", "--phase", "full",
         "--encoder", "harrier", "--seeds", "2", "--epochs", "7", "--num-workers", "3",
-        "--seq-len", "256", "--max-fk", "4", "--out-dir", str(tmp_path),
+        "--seq-len", "256", "--max-fk", "4", "--tasks", "regression", "--reg-loss", "l1",
+        "--out-dir", str(tmp_path),
     ])
     assert rg.main() == 0
     assert seen == {
         "seeds": 2, "epochs": 7, "num_workers": 3, "seq_len": 256, "max_fk": 4,
         "out_dir": tmp_path, "arch": "two_level", "phase": "full", "encoder": "harrier",
+        "task_set": "regression", "regression_loss": "l1",
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
+
+
+def test_task_set_changes_the_index_mapping_consistently(monkeypatch, tmp_path):
+    """`--tasks` re-maps index->job, so `--list` and the run path must agree on it.
+
+    This is the same failure shape as §9.3: a knob that `--list` honours and the run path ignores
+    sizes the array from one grid while the jobs index another. Here it would silently run binary
+    tasks under an `--reg-loss l1` array and report them as the regression sweep.
+    """
+    rg = _load("run_gridsearch")
+    reg = rg.TASK_SETS["regression"]
+    assert len(reg) == 4 and set(reg) <= set(rg.TASKS)
+    assert set(reg) & set(rg.TASK_SETS["binary"]) == set(), "regression/binary subsets must partition"
+    assert len(rg.TASK_SETS["binary"]) + len(reg) == len(rg.TASKS)
+
+    assert len(rg.jobs(1, "two_level", "regression")) == len(rg.two_level_grid()) * 4
+    # index 0 must denote a REGRESSION job under this task set, not TASKS[0] (a binary task)
+    _ci, _cfg, ds, tk, _s = rg.jobs(1, "two_level", "regression")[0]
+    assert (ds, tk) in reg
+
+    seen = {}
+    monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
+    monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", "--list", "--arch", "two_level",
+                                      "--tasks", "regression", "--seeds", "1",
+                                      "--out-dir", str(tmp_path)])
+    assert rg.main() == 0          # --list must not blow up on the subset
+
+    with pytest.raises(ValueError, match="unknown task_set"):
+        rg.jobs(1, "two_level", "nonsense")
 
 
 def test_ablation_main_forwards_arch_and_phase(monkeypatch, tmp_path):
