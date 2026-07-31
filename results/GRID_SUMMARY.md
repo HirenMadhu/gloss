@@ -7,10 +7,10 @@ tasks × 8 configs × 2 encoders. Grid axes: `d_model ∈ {128,256}` × `n_block
 Regenerate with `python scripts/aggregate_gridsearch.py --spread`. Records are self-describing —
 `arch=two_level, phase=full, encoder=∈{qwen,harrier}` verified from the JSONs, not the submit line.
 
-**Coverage: 70/72 scoreable per encoder.** Four cells hit the zero-column MET bug at TEST eval
-(fixed in `eb488e4`); their stale records are parked in `results/_test_error_pre_eb488e4/` and the
-cells are re-running as `29033908`/`29033909`. Two of them (qwen `256/4@3e-4` on driver-position and
-user-attendance) could still move a per-task best, so treat those two rows as provisional.
+**Coverage: 72/72 scoreable per encoder — COMPLETE.** Four cells had hit the zero-column MET bug at
+TEST eval (fixed in `eb488e4`, re-run as `29033908`/`29033909`; stale records parked in
+`results/_test_error_pre_eb488e4/`). The re-runs changed exactly one per-task best — qwen
+driver-position 0.4073 → **0.3961** (`256/4 @ 3e-4`) — and flipped no W/L verdict.
 
 ## Best config per task, vs the leaderboard
 
@@ -21,7 +21,7 @@ user-attendance) could still move a per-task best, so treat those two rows as pr
 |---|---|---|---|---|---|---|---|---|
 | rel-f1/driver-dnf | AUROC↑ | 78.7 | 76.1 | 71.37 | 83.77 (128/4 @ 3e-4) | **W / W** | 83.51 (128/2 @ 3e-4) | **W / W** |
 | rel-f1/driver-top3 | AUROC↑ | 82.7 | 84.1 | 89.69 | 91.15 (256/2 @ 3e-4) | **W / W** | 92.00 (128/2 @ 3e-4) | **W / W** |
-| rel-f1/driver-position | NMAE↓ | 0.4775 | 0.5315 | 0.4735 | 0.4073 (128/2 @ 1e-3) | **W / W** | 0.3950 (256/2 @ 1e-3) | **W / W** |
+| rel-f1/driver-position | NMAE↓ | 0.4775 | 0.5315 | 0.4735 | 0.3961 (256/4 @ 3e-4) | **W / W** | 0.3950 (256/2 @ 1e-3) | **W / W** |
 | rel-trial/study-outcome | AUROC↑ | 68.6 | 72.5 | 60.91 | 70.06 (128/4 @ 3e-4) | W / L | 69.19 (256/4 @ 3e-4) | W / L |
 | rel-trial/study-adverse | NMAE↓ | 0.1306 | 0.1255 | 0.1763 | 0.1547 (256/2 @ 3e-4) | L / L | 0.1549 (128/2 @ 3e-4) | L / L |
 | rel-trial/site-success | NMAE↓ | 0.7341 | 0.7324 | 0.9670 | 0.8775 (128/4 @ 3e-4) | L / L | 0.8210 (256/4 @ 3e-4) | L / L |
