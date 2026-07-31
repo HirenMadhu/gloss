@@ -146,9 +146,14 @@ this lr-sensitive at 10 fixed epochs is being measured partly on its optimizatio
 1. **Wire the diagnostics into the runner** (`expert_usage`, `mean_active_experts`) and re-run a few
    cells. Near-zero cost, and it tests the method's core claim. If the router has collapsed, nothing
    else here matters.
-2. **Swap MSE → L1/Huber** for regression and re-run the 4 regression tasks. Directly targets a
+2. **Make the `seq_len` truncation visible, then fix rel-event's fanout.** Counting dropped cells in
+   `to_cell_batch` and stamping the rate into each result record is a few lines and ends the class of
+   bug outright. Then re-run rel-event at a fanout that fits (or a raised `seq_len` if the memory
+   allows) — 3 of 9 tasks currently train on ~43% of their context, so those rows are not yet
+   evidence of anything.
+3. **Swap MSE → L1/Huber** for regression and re-run the 4 regression tasks. Directly targets a
    quantified 0.0455 / 0.2765 NMAE penalty.
-3. **Run the in-codebase dense control** (`arch=rt, route_on=dense`) — requires lifting the standing
+4. **Run the in-codebase dense control** (`arch=rt, route_on=dense`) — requires lifting the standing
    never-run-dense rule. Without it no result can be attributed to the MoE.
-4. Multi-seed confirmation of the winning configs; the grid is 1 seed and the headline showed cv to
+5. Multi-seed confirmation of the winning configs; the grid is 1 seed and the headline showed cv to
    28.5%.
