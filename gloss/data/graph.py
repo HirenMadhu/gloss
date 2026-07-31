@@ -61,8 +61,22 @@ def _patch_multiembedding_offset() -> None:
         #   * values width == k + T  : k orphan leading value-columns, drop them then rebase
         # Any other width is genuinely inconsistent -> fall through to the original assertion (no silent fix).
         off = self.offset
-        if off is not None and off.numel() >= 2 and int(off[0]) != 0:
-            k = int(off[0]); T = int(off[-1]) - k; w = int(self.values.shape[1])
+        if off is not None and off.numel() and int(off[0]) != 0:
+            k = int(off[0])
+            if off.numel() == 1:
+                # ZERO-COLUMN MET. torch_frame's own `validate` requires
+                # `len(offset) == num_cols + 1`, so a 1-element offset means num_cols == 0: there is
+                # no column whose embedding `values[:, offset[j]:offset[j+1]]` could be addressed, so
+                # rebasing to [0] cannot lose data — there is no data. `values` is left untouched
+                # (nothing indexes it) and still satisfies `ndim == 2 or numel() == 0`.
+                #
+                # This case used to fall through the `numel() >= 2` guard straight into
+                # `assert self.offset[0] == 0`, and it is what killed 29030571_{15,25,71} — three
+                # rel-event grid tasks, on three different configs. `_row_index_select` forwards the
+                # parent's `offset` verbatim, so a rebased parent hands its non-zero base down.
+                object.__setattr__(self, "offset", off - k)
+                return _orig_validate(self)
+            T = int(off[-1]) - k; w = int(self.values.shape[1])
             if w == k + T:
                 object.__setattr__(self, "values", self.values[:, k:])
                 object.__setattr__(self, "offset", off - k)

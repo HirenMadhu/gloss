@@ -129,3 +129,56 @@ def test_ablation_run_config_merges_the_fingerprint():
 
     src = inspect.getsource(ablation.run_config)
     assert "run_fingerprint(" in src, "run_config no longer stamps its result with run_fingerprint()"
+
+
+# --- the MultiEmbeddingTensor offset repair (amendments.md §9.2) -----------------------------------
+
+def _met(values, offset):
+    import torch
+    from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor
+
+    import gloss.data.graph  # noqa: F401  — installs the patch at import
+
+    return MultiEmbeddingTensor(num_rows=values.shape[0], num_cols=max(offset.numel() - 1, 0),
+                                values=values, offset=offset)
+
+
+def test_met_zero_column_offset_is_rebased():
+    """A ZERO-column MET with a non-zero offset base must be repaired, not crash.
+
+    `validate()` requires `len(offset) == num_cols + 1`, so a 1-element offset means num_cols == 0 —
+    no column embedding is addressable, and rebasing to [0] cannot lose data. This case fell through
+    the old `numel() >= 2` guard into torch_frame's bare `assert self.offset[0] == 0` and killed
+    29030571_{15,25,71}, three rel-event grid tasks on three different configs.
+    """
+    import torch
+
+    met = _met(torch.zeros(4, 0), torch.tensor([7]))     # would previously raise AssertionError
+    assert int(met.offset[0]) == 0 and met.offset.numel() == 1
+    assert met.num_cols == 0
+
+
+def test_met_repair_is_a_noop_on_healthy_tensors():
+    """The patch must never touch a batch that already validates — it can only turn a crash into the
+    correct result, never change a correct result."""
+    import torch
+
+    values = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    met = _met(values.clone(), torch.tensor([0, 3, 6]))
+    assert torch.equal(met.offset, torch.tensor([0, 3, 6]))
+    assert torch.equal(met.values, values)
+
+
+def test_met_unrecognised_layout_raises_a_diagnostic_not_a_bare_assert():
+    """The un-normalisable branch must report the layout. Worker stdout is discarded, so a print
+    could never surface it — the message has to ride on the exception."""
+    import re
+
+    import pytest
+    import torch
+
+    with pytest.raises(RuntimeError, match=r"could not be rebased") as exc:
+        _met(torch.zeros(2, 5), torch.tensor([3, 6, 99]))   # w=5 matches neither T nor k+T
+    msg = str(exc.value)
+    assert re.search(r"n_cols=2", msg) and re.search(r"k=3", msg) and "col_dims=" in msg
+    assert "--num-workers 0" in msg
