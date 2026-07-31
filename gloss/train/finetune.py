@@ -113,6 +113,7 @@ def train_prebuilt(
     early_stop: bool = True,
     patience: int = 3,
     regression_loss: str = "mse",
+    binary_loss: str = "bce",
 ):
     """Train one run on a PREBUILT bundle + name table (the ablation reuses these across arms so the
     graph and the frozen name embeddings are built once)."""
@@ -126,7 +127,7 @@ def train_prebuilt(
         task_type=kind, target_mean=mean, target_std=std,
         model_kwargs=model_kwargs, route_on=route_on, lambda_ortho=lambda_ortho,
         lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
-        regression_loss=regression_loss,
+        regression_loss=regression_loss, binary_loss=binary_loss,
     )
     dm = MoREDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
                         num_workers=num_workers)

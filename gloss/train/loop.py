@@ -37,6 +37,7 @@ class MoRELitModule(pl.LightningModule):
         max_fk: int = 5,
         max_rows: int | None = None,
         regression_loss: str = "mse",
+        binary_loss: str = "bce",
     ):
         super().__init__()
         self.bundle = bundle
@@ -50,7 +51,8 @@ class MoRELitModule(pl.LightningModule):
         self.max_fk = max_fk
         self.max_rows = max_rows          # None = fit the row axis R to each batch (see collate)
         self.lambda_ortho = lambda_ortho
-        self.regression_loss = regression_loss   # ignored for binary; see losses.task_loss
+        self.regression_loss = regression_loss   # each is ignored for the other task
+        self.binary_loss = binary_loss           # kind; see losses.task_loss
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)               # d_text is inferred from name_emb inside the encoder
         self.model = MoRE(bundle, name_emb, route_on=route_on, **mk)
@@ -74,7 +76,8 @@ class MoRELitModule(pl.LightningModule):
         logits, aux = self.model(cb)
         y = self._standardize(cb.target)
         loss = task_loss(logits.squeeze(-1), y, cb.has_target, self.task_type,
-                         regression_loss=self.regression_loss) + self.lambda_ortho * aux
+                         regression_loss=self.regression_loss,
+                         binary_loss=self.binary_loss) + self.lambda_ortho * aux
         self.log("train/loss", loss, prog_bar=True, batch_size=int(cb.num_seeds))
         return loss
 

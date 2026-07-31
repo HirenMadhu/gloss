@@ -120,7 +120,8 @@ def init_batch(cfg: dict) -> int:
 
 def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               arch: str = "rt", phase: str = "full", encoder: str = "qwen",
-              task_set: str = "all", regression_loss: str = "mse") -> dict:
+              task_set: str = "all", regression_loss: str = "mse",
+              binary_loss: str = "bce") -> dict:
     import torch
 
     from relbench.tasks import get_task
@@ -169,6 +170,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                 bundle, task, name_emb, model_kwargs=mk, route_on="signature", lambda_ortho=0.5,
                 seq_len=seq_len, max_fk=max_fk, batch_size=bs, max_epochs=epochs,
                 seed=seed, num_workers=num_workers, lr=lr, regression_loss=regression_loss,
+                binary_loss=binary_loss,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -183,6 +185,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # stamp the objective on the record: an L1 run and an MSE run are otherwise
            # indistinguishable from their JSON, and they live in sibling directories
            "regression_loss": regression_loss if kind == "regression" else None,
+           "binary_loss": binary_loss if kind == "binary" else None,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
@@ -287,6 +290,9 @@ def main() -> int:
     ap.add_argument("--reg-loss", default="mse", choices=["mse", "l1", "huber"],
                     help="regression objective (binary tasks ignore it). mse = every result before "
                          "2026-07-31; l1 aligns training with RelBench's MAE metric")
+    ap.add_argument("--bin-loss", default="bce", choices=["bce", "auc"],
+                    help="binary objective (regression tasks ignore it). bce = every result before "
+                         "2026-07-31; auc is a pairwise squared-hinge AUROC surrogate")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
@@ -311,7 +317,8 @@ def main() -> int:
     rec = run_index(args.index, seeds=args.seeds, epochs=args.epochs, num_workers=args.num_workers,
                     seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir,
                     arch=args.arch, phase=args.phase, encoder=args.encoder,
-                    task_set=args.tasks, regression_loss=args.reg_loss)
+                    task_set=args.tasks, regression_loss=args.reg_loss,
+                    binary_loss=args.bin_loss)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0

@@ -68,13 +68,13 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         "run_gridsearch.py", "--index", "0", "--arch", "two_level", "--phase", "full",
         "--encoder", "harrier", "--seeds", "2", "--epochs", "7", "--num-workers", "3",
         "--seq-len", "256", "--max-fk", "4", "--tasks", "regression", "--reg-loss", "l1",
-        "--out-dir", str(tmp_path),
+        "--bin-loss", "auc", "--out-dir", str(tmp_path),
     ])
     assert rg.main() == 0
     assert seen == {
         "seeds": 2, "epochs": 7, "num_workers": 3, "seq_len": 256, "max_fk": 4,
         "out_dir": tmp_path, "arch": "two_level", "phase": "full", "encoder": "harrier",
-        "task_set": "regression", "regression_loss": "l1",
+        "task_set": "regression", "regression_loss": "l1", "binary_loss": "auc",
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2

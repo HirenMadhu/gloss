@@ -22,6 +22,43 @@ def masked_mse(pred: Tensor, target: Tensor, has_target: Tensor) -> Tensor:
     return F.mse_loss(pred[m], target[m].to(pred.dtype))
 
 
+def masked_pairwise_auc(logits: Tensor, target: Tensor, has_target: Tensor,
+                        margin: float = 1.0) -> Tensor:
+    """Squared-hinge pairwise AUC surrogate over labelled seeds (0 if either class is absent).
+
+    ``mean_{i in pos, j in neg} relu(margin - (s_i - s_j))**2``. AUROC *is* the fraction of
+    (pos, neg) pairs ranked correctly, so this optimises the metric directly, where BCE optimises
+    calibrated probability and only ranks correctly as a side effect. This is the core of the
+    AUC-margin objective without LibAUC's learnable ``(a, b, alpha)`` or its PESG optimizer — keeping
+    AdamW means a change here is attributable to the loss alone (``results/WHY_NOT_RT.md``).
+
+    Two caveats worth knowing before reading a result:
+
+    * The pairs are **within-batch only**, so the estimate is biased by batch composition. At
+      batch 64 and the measured positive rates (0.17-0.88) every batch has pairs, but a task at
+      1000:1 imbalance would need a sampler, not just this loss.
+    * The squared hinge has a different **scale** from BCE, which acts like a change in effective
+      learning rate — and this model is lr-fragile (33/69 cells beat RT at 3e-4 vs 15/71 at 1e-3).
+      The sweep varies lr, so this is covered rather than confounded, but a single-lr comparison
+      would not be trustworthy.
+    """
+    m = has_target
+    if m.sum() == 0:
+        return logits.sum() * 0.0
+    s, y = logits[m], target[m].to(logits.dtype)
+    pos, neg = s[y > 0.5], s[y <= 0.5]
+    if pos.numel() == 0 or neg.numel() == 0:
+        # A single-class batch carries no ranking information. Return a real zero that still tracks
+        # the graph, so DDP/grad-accum see a gradient of the right shape rather than a detached 0.
+        return logits.sum() * 0.0
+    diff = pos.unsqueeze(1) - neg.unsqueeze(0)          # [P, N]
+    return (margin - diff).clamp_min(0).pow(2).mean()
+
+
+#: Binary objectives selectable at train time. ``bce`` is the historical default.
+BINARY_LOSSES = {"bce": masked_bce, "auc": masked_pairwise_auc}
+
+
 def masked_l1(pred: Tensor, target: Tensor, has_target: Tensor) -> Tensor:
     """pred/target/has_target `[B]` -> scalar L1 over labelled seeds (0 if none). ``target`` is assumed
     already standardized by the caller.
@@ -54,17 +91,17 @@ REGRESSION_LOSSES = {"mse": masked_mse, "l1": masked_l1, "huber": masked_huber}
 
 
 def task_loss(out: Tensor, target: Tensor, has_target: Tensor, task_type: str,
-              regression_loss: str = "mse") -> Tensor:
-    """Dispatch by task type: BCE for ``binary``, ``regression_loss`` for ``regression``.
+              regression_loss: str = "mse", binary_loss: str = "bce") -> Tensor:
+    """Dispatch by task type: ``binary_loss`` for ``binary``, ``regression_loss`` for ``regression``.
 
-    ``regression_loss`` is ignored for binary tasks (there is one sensible objective) rather than
-    raising, so a runner can pass it unconditionally.
+    The objective for the *other* task type is ignored rather than rejected, so a runner can pass
+    both unconditionally without knowing the task kind.
     """
-    if task_type == "regression":
-        try:
-            fn = REGRESSION_LOSSES[regression_loss]
-        except KeyError:
-            raise ValueError(f"unknown regression_loss {regression_loss!r}; "
-                             f"expected one of {sorted(REGRESSION_LOSSES)}") from None
-        return fn(out, target, has_target)
-    return masked_bce(out, target, has_target)
+    table, name = ((REGRESSION_LOSSES, regression_loss) if task_type == "regression"
+                   else (BINARY_LOSSES, binary_loss))
+    kind = "regression_loss" if task_type == "regression" else "binary_loss"
+    try:
+        fn = table[name]
+    except KeyError:
+        raise ValueError(f"unknown {kind} {name!r}; expected one of {sorted(table)}") from None
+    return fn(out, target, has_target)
