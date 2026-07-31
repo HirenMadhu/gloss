@@ -59,10 +59,21 @@ TWO_LEVEL_D_MODEL = [128, 256]
 TWO_LEVEL_N_BLOCKS = [2, 4]
 TWO_LEVEL_LR = [3.0e-4, 1.0e-3]
 
+#: `extended` adds 1e-4 BELOW the current range. Motivated twice over: our own grid found 3e-4 far
+#: better than 1e-3 (33/69 cells beat RT vs 15/71), so the optimum may lie below the swept range;
+#: and GelGT trains at 1e-4. It is a SEPARATE set rather than an edit to TWO_LEVEL_LR because
+#: changing that list re-maps every array index — arrays already queued would silently run a
+#: different experiment (amendments.md §9.3).
+LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3]}
 
-def two_level_grid() -> list[dict]:
+
+def two_level_grid(lr_set: str = "default") -> list[dict]:
+    try:
+        lrs = LR_SETS[lr_set]
+    except KeyError:
+        raise ValueError(f"unknown lr_set {lr_set!r}; expected one of {sorted(LR_SETS)}") from None
     grid = []
-    for dm, nb, lr in itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS, TWO_LEVEL_LR):
+    for dm, nb, lr in itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS, lrs):
         grid.append(dict(d_model=dm, n_blocks=nb, n_heads=8, d_ff=dm * 4,
                          num_experts=4, enc_channels=dm, lr=lr))
     return grid
@@ -90,14 +101,15 @@ TASK_SETS = {
 }
 
 
-def jobs(seeds: int, arch: str = "rt", task_set: str = "all") -> list[tuple]:
+def jobs(seeds: int, arch: str = "rt", task_set: str = "all",
+         lr_set: str = "default") -> list[tuple]:
     """Flat (config_idx, cfg, dataset, task, seed) list the array iterates by index.
 
     `task_set` changes the index->job mapping, so it MUST be passed identically to `--list` and to
     `run_index` — see the §9.3 comment in `main`. Results for different task sets therefore belong in
     different `--out-dir`s: index 0 means a different job under each.
     """
-    g = two_level_grid() if arch == "two_level" else arch_grid()
+    g = two_level_grid(lr_set) if arch == "two_level" else arch_grid()
     try:
         tasks = TASK_SETS[task_set]
     except KeyError:
@@ -121,16 +133,20 @@ def init_batch(cfg: dict) -> int:
 def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               arch: str = "rt", phase: str = "full", encoder: str = "qwen",
               task_set: str = "all", regression_loss: str = "mse",
-              binary_loss: str = "bce") -> dict:
+              binary_loss: str = "bce", lr_set: str = "default",
+              optimizer: str = "adamw", weight_decay: float = 0.01,
+              target_scaling: str = "zscore", clamp_pct: float | None = None,
+              batch_size: int | None = None, accum: int = 1) -> dict:
+    import numpy as np
     import torch
 
     from relbench.tasks import get_task
 
     from gloss.data.graph import build_gloss_graph
-    from gloss.eval.test_eval import evaluate_split
+    from gloss.eval.test_eval import evaluate_split, score_pred
     from gloss.train.finetune import name_embeddings, target_stats, task_kind, train_prebuilt
 
-    J = jobs(seeds, arch, task_set)
+    J = jobs(seeds, arch, task_set, lr_set)
     if index >= len(J):
         print(f"index {index} >= grid size {len(J)}; nothing to do")
         return {}
@@ -162,7 +178,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                   role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
                   **TWO_LEVEL_PHASES[phase])
 
-    bs = init_batch(cfg)
+    bs = batch_size or init_batch(cfg)
     module = metrics = None
     while True:
         try:
@@ -170,7 +186,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                 bundle, task, name_emb, model_kwargs=mk, route_on="signature", lambda_ortho=0.5,
                 seq_len=seq_len, max_fk=max_fk, batch_size=bs, max_epochs=epochs,
                 seed=seed, num_workers=num_workers, lr=lr, regression_loss=regression_loss,
-                binary_loss=binary_loss,
+                binary_loss=binary_loss, optimizer=optimizer, weight_decay=weight_decay,
+                target_scaling=target_scaling, clamp_pct=clamp_pct, accumulate_grad_batches=accum,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -186,16 +203,34 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # indistinguishable from their JSON, and they live in sibling directories
            "regression_loss": regression_loss if kind == "regression" else None,
            "binary_loss": binary_loss if kind == "binary" else None,
+           "lr_set": lr_set, "optimizer": optimizer, "weight_decay": weight_decay,
+           "target_scaling": target_scaling if kind == "regression" else None,
+           "clamp_pct": clamp_pct if kind == "regression" else None, "accum": accum,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     try:
-        tm = evaluate_split(module, bundle, task, "test", num_neighbors=None,
-                            seq_len=seq_len, max_fk=max_fk, batch_size=bs, num_workers=num_workers)
+        # Score UNCLAMPED and keep the raw predictions, then apply the clamp to the same array. One
+        # trained model yields both numbers, so the clamp's eval effect is isolated from any change
+        # in what was learned; a second training run would confound the two.
+        tm, pred = evaluate_split(module, bundle, task, "test", num_neighbors=None,
+                                  seq_len=seq_len, max_fk=max_fk, batch_size=bs,
+                                  num_workers=num_workers, clamp=False, return_pred=True)
         rec.update({f"test_{k}": v for k, v in tm.items()})
+        std = target_stats(task)[1] if kind == "regression" else None
         if kind == "regression" and rec.get("test_mae") is not None:
-            rec["test_nmae"] = rec["test_mae"] / target_stats(task)[1]
+            rec["test_nmae"] = rec["test_mae"] / std
+        np.save(out_dir / f"{index:05d}_pred.npy", pred)
+        if kind == "regression" and clamp_pct:
+            from gloss.train.finetune import target_clamp
+
+            lo, hi = target_clamp(task, clamp_pct, 100.0 - clamp_pct)
+            cm = score_pred(task, "test", np.clip(pred, lo, hi))
+            rec.update({f"test_clamped_{k}": v for k, v in cm.items()})
+            rec["clamp_bounds"] = [lo, hi]
+            if cm.get("mae") is not None:
+                rec["test_clamped_nmae"] = cm["mae"] / std
     except Exception as exc:                       # keep the (trained) val metrics if test eval fails
         rec["test_error"] = repr(exc)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -290,6 +325,21 @@ def main() -> int:
     ap.add_argument("--reg-loss", default="mse", choices=["mse", "l1", "huber"],
                     help="regression objective (binary tasks ignore it). mse = every result before "
                          "2026-07-31; l1 aligns training with RelBench's MAE metric")
+    ap.add_argument("--lr-set", default="default", choices=sorted(LR_SETS),
+                    help="extended adds lr=1e-4 (12 configs, not 8). CHANGES index->job: new --out-dir")
+    ap.add_argument("--optimizer", default="adamw", choices=["adamw", "adam"],
+                    help="adam + --weight-decay 1e-5 reproduces GelGT's optimizer")
+    ap.add_argument("--weight-decay", type=float, default=0.01, help="0.01 = ours, 1e-5 = GelGT")
+    ap.add_argument("--target-scaling", default="zscore", choices=["zscore", "raw"],
+                    help="regression only; raw trains on the unstandardized target (GelGT does)")
+    ap.add_argument("--clamp-pct", type=float, default=None,
+                    help="regression only; clip preds to the train target's [p, 100-p] percentiles "
+                         "(GelGT uses 2). Applied to val for selection; test is scored BOTH ways")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="override the per-config heuristic (still halves on CUDA OOM)")
+    ap.add_argument("--accum", type=int, default=1,
+                    help="gradient accumulation; equivalent to a bigger batch for bce/mse/l1 but "
+                         "NOT for the pairwise auc loss (its pairs are within-batch)")
     ap.add_argument("--bin-loss", default="bce", choices=["bce", "auc"],
                     help="binary objective (regression tasks ignore it). bce = every result before "
                          "2026-07-31; auc is a pairwise squared-hinge AUROC surrogate")
@@ -300,7 +350,7 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = REPO / out_dir
     if args.list:
-        print(len(jobs(args.seeds, args.arch, args.tasks)))
+        print(len(jobs(args.seeds, args.arch, args.tasks, args.lr_set)))
         return 0
     if args.aggregate:
         print(aggregate(out_dir))
@@ -318,7 +368,9 @@ def main() -> int:
                     seq_len=args.seq_len, max_fk=args.max_fk, out_dir=out_dir,
                     arch=args.arch, phase=args.phase, encoder=args.encoder,
                     task_set=args.tasks, regression_loss=args.reg_loss,
-                    binary_loss=args.bin_loss)
+                    binary_loss=args.bin_loss, lr_set=args.lr_set, optimizer=args.optimizer,
+                    weight_decay=args.weight_decay, target_scaling=args.target_scaling,
+                    clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0

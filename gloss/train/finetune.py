@@ -61,6 +61,25 @@ def target_stats(task) -> tuple[float, float]:
     return float(y.mean()), float(max(y.std(), 1e-6))
 
 
+def target_clamp(task, lo_pct: float = 2.0, hi_pct: float = 98.0) -> tuple[float, float]:
+    """TRAIN-split target percentiles used to clip regression PREDICTIONS at eval time.
+
+    Copied from GelGT's reference implementation (`main_node_ddp.py`), which clips predictions to the
+    train target's 2nd/98th percentile before scoring. It is an eval-time transform only — training
+    never sees it — and it is aimed squarely at MAE on heavy-tailed targets, where a handful of
+    runaway predictions dominate the mean absolute error. rel-trial/study-adverse has train skew
+    39.1, so this is the failure mode it targets.
+
+    Returns raw-unit bounds (NOT standardized), so callers must clip after de-standardizing.
+    """
+    import numpy as np
+
+    y = task.get_table("train").df[task.target_col].to_numpy(dtype="float64")
+    y = y[~np.isnan(y)]
+    lo, hi = np.percentile(y, [lo_pct, hi_pct])
+    return float(lo), float(hi)
+
+
 class _BestValState(pl.Callback):
     """Keep the best-val model weights (in memory, on CPU — no disk checkpoint) and the val metrics at
     that epoch, so a run reports / evaluates its best-val model rather than the last epoch."""
@@ -114,6 +133,10 @@ def train_prebuilt(
     patience: int = 3,
     regression_loss: str = "mse",
     binary_loss: str = "bce",
+    optimizer: str = "adamw",
+    target_scaling: str = "zscore",
+    clamp_pct: float | None = None,
+    accumulate_grad_batches: int = 1,
 ):
     """Train one run on a PREBUILT bundle + name table (the ablation reuses these across arms so the
     graph and the frozen name embeddings are built once)."""
@@ -121,13 +144,25 @@ def train_prebuilt(
 
     seed_everything(seed)
     kind = task_kind(task)
-    mean, std = target_stats(task) if kind == "regression" else (0.0, 1.0)
+    # `raw` trains on the unstandardized target (GelGT does this). Under L1 that is only a per-task
+    # rescale of the loss — i.e. a different EFFECTIVE lr per task — not a different optimum; under
+    # MSE it also changes the curvature. Either way it is not free of the lr sweep, so read the two
+    # together.
+    if kind != "regression" or target_scaling == "raw":
+        mean, std = 0.0, 1.0
+    elif target_scaling == "zscore":
+        mean, std = target_stats(task)
+    else:
+        raise ValueError(f"unknown target_scaling {target_scaling!r}; expected 'zscore' or 'raw'")
+    clamp = target_clamp(task, clamp_pct, 100.0 - clamp_pct) if (
+        kind == "regression" and clamp_pct) else None
     module = MoRELitModule(
         bundle, name_emb, task.entity_table,
         task_type=kind, target_mean=mean, target_std=std,
         model_kwargs=model_kwargs, route_on=route_on, lambda_ortho=lambda_ortho,
         lr=lr, weight_decay=weight_decay, seq_len=seq_len, max_fk=max_fk,
         regression_loss=regression_loss, binary_loss=binary_loss,
+        optimizer=optimizer, clamp=clamp,
     )
     dm = MoREDataModule(bundle, task, num_neighbors=num_neighbors, batch_size=batch_size,
                         num_workers=num_workers)
@@ -145,6 +180,10 @@ def train_prebuilt(
         logger=logger, enable_checkpointing=False, enable_model_summary=False,
         enable_progress_bar=False, log_every_n_steps=20, callbacks=callbacks,
         num_sanity_val_steps=0,
+        # Equivalent to a larger batch for SUM-decomposable losses (BCE, MSE, L1) but NOT for the
+        # pairwise AUC surrogate, whose pairs are formed within a batch — accumulating 8x64 gives the
+        # gradient noise of 64, not 512. Only a real batch increase helps there.
+        accumulate_grad_batches=accumulate_grad_batches,
         gradient_clip_val=1.0,                     # stabilizes training (hidden-router + HMoE explodes to
                                                    # NaN without it); a no-op for arms whose grads stay < 1
         check_val_every_n_epoch=1,                 # best-val selection + early stopping need per-epoch val
@@ -152,6 +191,7 @@ def train_prebuilt(
         limit_val_batches=limit_val_batches or 1.0,
     )
     trainer.fit(module, dm)
+    module.clamp = clamp          # carried to the TEST eval (eval/test_eval.py)
     metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
     if best.best_state is not None:
         module.load_state_dict(best.best_state)      # restore best-val weights for downstream TEST eval

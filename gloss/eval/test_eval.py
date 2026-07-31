@@ -32,6 +32,7 @@ def predict_split(
     num_workers: int = 0,
     max_rows: int | None = None,
     device=None,
+    clamp: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Run ``module(cb)`` over every seed of ``split``; return per-row predictions ``[n]`` aligned to the
     split table's row order via the entity store's ``input_id`` (probability for binary, de-standardized
@@ -61,6 +62,11 @@ def predict_split(
     if was_training:
         module.train()
     assert not np.isnan(pred).any(), f"{split}: {int(np.isnan(pred).sum())} seeds got no prediction"
+    # `clamp` defaults to the value the module was trained with, so a run that selected on clamped
+    # val metrics is scored the same way on test. Pass an explicit tuple/False to override.
+    bounds = getattr(module, "clamp", None) if clamp is None else clamp
+    if bounds and getattr(module, "task_type", "binary") == "regression":
+        pred = np.clip(pred, bounds[0], bounds[1])
     return pred
 
 
@@ -77,17 +83,33 @@ def evaluate_split(
     num_workers: int = 0,
     max_rows: int | None = None,
     device=None,
-) -> dict:
+    clamp: tuple[float, float] | None = None,
+    return_pred: bool = False,
+) -> dict | tuple[dict, np.ndarray]:
     """Predict ``split`` and score with ``task.evaluate`` (RelBench metrics: average_precision,
     roc_auc, accuracy, f1). For ``test`` the labels are internal (pass ``target_table=None``); for
     other splits the table carries labels."""
     pred = predict_split(
         module, bundle, task, split, num_neighbors=num_neighbors,
         seq_len=seq_len, max_fk=max_fk, batch_size=batch_size, num_workers=num_workers,
-        max_rows=max_rows, device=device,
+        max_rows=max_rows, device=device, clamp=clamp,
     )
     # Pass the (label-bearing) target table explicitly for every split — including test, where RelBench
     # would otherwise fetch its own internal copy — so boolean-string targets are coerced before scoring
     # (relbench's roc_auc uses pos_label=1, which rejects 't'/'f'). Row order matches predict_split's.
+    target_table = coerce_binary_target(task.get_table(split, mask_input_cols=False), task)
+    metrics = {k: float(v) for k, v in task.evaluate(pred, target_table).items()}
+    # Returning the predictions lets any EVAL-TIME transform (the percentile clamp, a calibration,
+    # a different threshold) be scored post-hoc from a finished run instead of costing a retrain.
+    return (metrics, pred) if return_pred else metrics
+
+
+def score_pred(task, split: str, pred) -> dict:
+    """Score an already-computed prediction array with RelBench's metrics.
+
+    Exists so an eval-time transform can be measured on a FINISHED run: save the raw predictions
+    once, then score `pred` and `clip(pred, lo, hi)` from the same trained model. That isolates the
+    transform's effect from any change in what the model learned — a re-train would confound the two.
+    """
     target_table = coerce_binary_target(task.get_table(split, mask_input_cols=False), task)
     return {k: float(v) for k, v in task.evaluate(pred, target_table).items()}

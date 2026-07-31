@@ -75,6 +75,10 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         "seeds": 2, "epochs": 7, "num_workers": 3, "seq_len": 256, "max_fk": 4,
         "out_dir": tmp_path, "arch": "two_level", "phase": "full", "encoder": "harrier",
         "task_set": "regression", "regression_loss": "l1", "binary_loss": "auc",
+        # defaults must be forwarded too — an unset knob that silently keeps run_index's own default
+        # is fine only while the two agree, and they drift
+        "lr_set": "default", "optimizer": "adamw", "weight_decay": 0.01,
+        "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -213,3 +217,49 @@ def test_met_unrecognised_layout_raises_a_diagnostic_not_a_bare_assert():
     msg = str(exc.value)
     assert re.search(r"n_cols=2", msg) and re.search(r"k=3", msg) and "col_dims=" in msg
     assert "--num-workers 0" in msg
+
+
+# --- lr sets and the GelGT-style knobs -------------------------------------------------------------
+
+def test_default_lr_set_is_unchanged_so_queued_arrays_keep_their_index_mapping():
+    """LOAD-BEARING. Arrays are sized and indexed from `two_level_grid()`. Adding lr=1e-4 to
+    TWO_LEVEL_LR in place would have silently re-mapped every index of the arrays already queued —
+    they would have finished, exit 0, and answered a different question (amendments.md §9.3).
+    The new lr lives in a separate set; this test fails if anyone folds it back into the default.
+    """
+    rg = _load("run_gridsearch")
+    assert rg.LR_SETS["default"] == rg.TWO_LEVEL_LR == [3.0e-4, 1.0e-3]
+    assert len(rg.two_level_grid()) == 8, "the default two-level grid must stay 8 configs"
+    assert len(rg.two_level_grid("extended")) == 12
+    assert 1.0e-4 in rg.LR_SETS["extended"] and 1.0e-4 not in rg.LR_SETS["default"]
+    # the sizes the running arrays were submitted with
+    assert len(rg.jobs(1, "two_level", "regression")) == 32
+    assert len(rg.jobs(1, "two_level", "binary")) == 40
+    with pytest.raises(ValueError, match="unknown lr_set"):
+        rg.two_level_grid("nope")
+
+
+def test_gridsearch_forwards_the_gelgt_style_knobs(monkeypatch, tmp_path):
+    rg = _load("run_gridsearch")
+    seen = {}
+    monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
+    monkeypatch.setattr(sys, "argv", [
+        "run_gridsearch.py", "--index", "0", "--arch", "two_level", "--tasks", "regression",
+        "--reg-loss", "l1", "--lr-set", "extended", "--optimizer", "adam",
+        "--weight-decay", "1e-5", "--target-scaling", "raw", "--clamp-pct", "2",
+        "--batch-size", "256", "--accum", "2", "--seeds", "1", "--out-dir", str(tmp_path),
+    ])
+    assert rg.main() == 0
+    for k, v in {"lr_set": "extended", "optimizer": "adam", "weight_decay": 1e-5,
+                 "target_scaling": "raw", "clamp_pct": 2.0, "batch_size": 256, "accum": 2}.items():
+        assert seen.get(k) == v, f"--{k} parsed but not forwarded (got {seen.get(k)!r})"
+
+
+def test_list_and_run_path_agree_on_the_lr_set(monkeypatch, tmp_path, capsys):
+    """Same §9.3 trap as --tasks: --list must size the array from the grid the run path indexes."""
+    rg = _load("run_gridsearch")
+    monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", "--list", "--arch", "two_level",
+                                      "--tasks", "regression", "--lr-set", "extended",
+                                      "--seeds", "1", "--out-dir", str(tmp_path)])
+    assert rg.main() == 0
+    assert int(capsys.readouterr().out.strip()) == len(rg.jobs(1, "two_level", "regression", "extended"))
