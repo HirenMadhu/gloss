@@ -83,6 +83,33 @@ standardized target) could plausibly close it outright. Same story on user-atten
 
 This does **not** explain site-success (skew 0.24) — that one is underfitting, cause 3.
 
+## 4b. RULED OUT: `seq_len` truncation is *not* starving the losing tasks
+
+Worth checking because it is the same shape of mistake as `MAX_ROWS=160` — a rel-f1 number applied to
+every DB — except that `max_rows` asserted loudly while `to_cell_batch` drops overflow cells with a
+bare `if s >= seq_len: break`: no counter, no warning. A run could have been training on a fraction
+of each neighbourhood and looked perfectly healthy. Measured with `scripts/probe_seq_len.py`
+(fanout `[12,12]`, `seq_len=512`), reporting demanded cells/seed:
+
+| dataset | median | p90 | max | seeds over cap | cells kept |
+|---|---|---|---|---|---|
+| rel-f1 (3 tasks) | 249–288 | 290–336 | **374** | 0.0% | **100%** |
+| rel-trial (3 tasks) | 71–109 | 113–317 | **317** | 0.0% | **100%** |
+
+**Nothing is truncated on either DB.** rel-trial is in fact the *sparsest* — site-success has a median
+of 109 cells/seed against a 512 cap, and study-adverse 71. So the two worst tasks are not
+information-starved by the cap; they simply are not learning from what they already get, which
+sharpens cause 3 (underfitting) rather than competing with it.
+
+It also means the losses are not explained by neighbourhood size: rel-trial gets *less* context per
+seed than rel-f1 and loses, while rel-f1 gets the most and wins 3/3. (rel-event measurement pending —
+its loader is slow; it is the one DB where a large fanout could still overflow.)
+
+Related size facts, for the record: train rows are site-success 151,407 and study-adverse 43,335 —
+the two **largest** training sets are two of the three losses, so this is not a shortage of labels or
+of optimizer steps either. Distinct column names: rel-f1 **45**, rel-event **134**. We win where the
+schema is *least* diverse, which is the opposite of what a schema-routing mechanism should predict.
+
 ## 5. lr fragility, and a fixed 10-epoch budget
 
 Cells beating RT: **33/69 at lr=3e-4 vs 15/71 at 1e-3**; depth is irrelevant (25/72 at 2 blocks vs
