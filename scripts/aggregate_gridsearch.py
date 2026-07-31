@@ -167,10 +167,10 @@ def main() -> int:
                 if v is None:
                     line += f"{'--':>10} "
                 else:
-                    mark = ""
-                    if lb.beats(v, rt, ttype):
-                        mark = "*"          # beats RT (from scratch)
-                    line += f"{v:>9.4f}{mark:1} " if ttype == "regression" else f"{v:>9.2f}{mark:1} "
+                    # `*` beats RT (from scratch), `+` beats GelGT — GelGT is the harder bar on most
+                    # tasks, so a cell marked only `*` is a weaker result than it looks.
+                    mark = ("*" if lb.beats(v, rt, ttype) else "") + ("+" if lb.beats(v, gel, ttype) else "")
+                    line += f"{v:>9.4f}{mark:<2}" if ttype == "regression" else f"{v:>9.2f}{mark:<2}"
             print(line)
         if args.spread:
             for name in grids:
@@ -187,7 +187,7 @@ def main() -> int:
         print(f"    {labels.get(c, c):>16} " + " ".join(f"{wins[name][c]:>10}" for name in grids))
 
     # ---- how each encoder's best-per-task compares to the external baselines -------------------
-    print("\n### best-of-grid per task vs the leaderboard  (* = beats RT from scratch)")
+    print("\n### best-of-grid per task vs the leaderboard  (* beats RT from scratch, + beats GelGT)")
     for name, recs in grids.items():
         beat_rt = beat_gel = n = 0
         for task in tasks:

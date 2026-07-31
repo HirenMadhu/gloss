@@ -14,23 +14,31 @@ user-attendance) could still move a per-task best, so treat those two rows as pr
 
 ## Best config per task, vs the leaderboard
 
-**bold** = beats RT (from scratch).
+`W/L` is against **RT (from scratch) / GelGT** respectively. Neither is protocol-matched to this grid
+(see caveats); both are published numbers.
 
-| task | metric | RT | GelGT | headline 256/8 | qwen best (config) | harrier best (config) |
-|---|---|---|---|---|---|---|
-| rel-f1/driver-dnf | AUROC↑ | 78.7 | 76.1 | 71.37 | **83.77** (128/4 @ 3e-4) | **83.51** (128/2 @ 3e-4) |
-| rel-f1/driver-top3 | AUROC↑ | 82.7 | 84.1 | 89.69 | **91.15** (256/2 @ 3e-4) | **92.00** (128/2 @ 3e-4) |
-| rel-f1/driver-position | NMAE↓ | 0.4775 | 0.5315 | 0.4735 | **0.4073** (128/2 @ 1e-3) | **0.3950** (256/2 @ 1e-3) |
-| rel-trial/study-outcome | AUROC↑ | 68.6 | 72.5 | 60.91 | **70.06** (128/4 @ 3e-4) | **69.19** (256/4 @ 3e-4) |
-| rel-trial/study-adverse | NMAE↓ | 0.1306 | 0.1255 | 0.1763 | 0.1547 (256/2 @ 3e-4) | 0.1549 (128/2 @ 3e-4) |
-| rel-trial/site-success | NMAE↓ | 0.7341 | 0.7324 | 0.9670 | 0.8775 (128/4 @ 3e-4) | 0.8210 (256/4 @ 3e-4) |
-| rel-event/user-repeat | AUROC↑ | 79.7 | 83.6 | 67.93 | 78.83 (256/2 @ 3e-4) | 79.45 (128/4 @ 3e-4) |
-| rel-event/user-ignore | AUROC↑ | 85.1 | 87.8 | 82.41 | **89.77** (256/4 @ 1e-3) | **86.84** (256/2 @ 1e-3) |
-| rel-event/user-attendance | NMAE↓ | 0.504 | 0.3167 | 0.5536 | **0.3974** (128/2 @ 3e-4) | **0.3853** (128/4 @ 1e-3) |
+| task | metric | RT | GelGT | headline 256/8 | qwen best (config) | vs RT/Gel | harrier best (config) | vs RT/Gel |
+|---|---|---|---|---|---|---|---|---|
+| rel-f1/driver-dnf | AUROC↑ | 78.7 | 76.1 | 71.37 | 83.77 (128/4 @ 3e-4) | **W / W** | 83.51 (128/2 @ 3e-4) | **W / W** |
+| rel-f1/driver-top3 | AUROC↑ | 82.7 | 84.1 | 89.69 | 91.15 (256/2 @ 3e-4) | **W / W** | 92.00 (128/2 @ 3e-4) | **W / W** |
+| rel-f1/driver-position | NMAE↓ | 0.4775 | 0.5315 | 0.4735 | 0.4073 (128/2 @ 1e-3) | **W / W** | 0.3950 (256/2 @ 1e-3) | **W / W** |
+| rel-trial/study-outcome | AUROC↑ | 68.6 | 72.5 | 60.91 | 70.06 (128/4 @ 3e-4) | W / L | 69.19 (256/4 @ 3e-4) | W / L |
+| rel-trial/study-adverse | NMAE↓ | 0.1306 | 0.1255 | 0.1763 | 0.1547 (256/2 @ 3e-4) | L / L | 0.1549 (128/2 @ 3e-4) | L / L |
+| rel-trial/site-success | NMAE↓ | 0.7341 | 0.7324 | 0.9670 | 0.8775 (128/4 @ 3e-4) | L / L | 0.8210 (256/4 @ 3e-4) | L / L |
+| rel-event/user-repeat | AUROC↑ | 79.7 | 83.6 | 67.93 | 78.83 (256/2 @ 3e-4) | L / L | 79.45 (128/4 @ 3e-4) | L / L |
+| rel-event/user-ignore | AUROC↑ | 85.1 | 87.8 | 82.41 | 89.77 (256/4 @ 1e-3) | **W / W** | 86.84 (256/2 @ 1e-3) | W / L |
+| rel-event/user-attendance | NMAE↓ | 0.504 | 0.3167 | 0.5536 | 0.3974 (128/2 @ 3e-4) | W / L | 0.3853 (128/4 @ 1e-3) | W / L |
 
-**Both encoders beat RT (from scratch) on 6 of 9** (qwen also beats GelGT on 4/9, harrier on 3/9).
-The three losses are the *same three* for both encoders: user-repeat (a near-tie, 79.45 vs 79.7) and
-the two rel-trial regressions, site-success and study-adverse, which lose by a wide margin.
+**Both encoders beat RT on 6 of 9; against GelGT it is qwen 4/9 and harrier 3/9.**
+
+The three losses are the *same three* for both encoders and lose to **both** methods: user-repeat (a
+near-tie vs RT, 79.45 vs 79.7) and the two rel-trial regressions, site-success and study-adverse,
+which lose by a wide margin.
+
+GelGT is the harder bar and it splits the wins along a clean line: **the three rel-f1 tasks beat both
+methods**, everything else either splits or loses. The two tasks that beat RT but lose to GelGT are
+study-outcome (70.06 vs 72.5) and user-attendance (0.3974 vs 0.3167) — the latter is the widest GelGT
+margin on the board, so it is the single "win" that most overstates itself when only RT is quoted.
 
 ## The capacity confound is confirmed — and it was mostly the learning rate
 
