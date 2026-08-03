@@ -1,6 +1,7 @@
 """The value-free relational signature (hermetic, synthetic dual-FK fixture)."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from gloss.data.collate import to_cell_batch
@@ -67,3 +68,23 @@ def test_signature_changes_with_column():
     a = zr[cols == int(cols.min())][0]
     b = zr[cols == int(cols.max())][0]
     assert not torch.allclose(a, b)
+
+
+@pytest.mark.parametrize("time_mode", ["buckets", "rope"])
+def test_column_signature_works_in_both_time_modes_and_is_value_free(time_mode):
+    """`column_signature()` is the diagnostics' way to ask "which expert does column c route to?"
+    without a batch. It must exist under BOTH time modes: the old inline version reached for
+    `recency_emb`, which only exists under `buckets`, so `specialization_probe` raised
+    AttributeError under `rope` — the mode the two-level runs use — and the method's central claim
+    went unmeasured because of it.
+    """
+    torch.manual_seed(0)
+    C, d_text, d_sig = 7, 16, 8
+    name = torch.randn(C, d_text)
+    modality = torch.randint(0, 3, (C,))
+    sig = RelationalSignature(name, modality, n_stypes=3, d_sig=d_sig, time_mode=time_mode)
+    z = sig.column_signature()
+    assert z.shape == (C, d_sig)
+    assert torch.isfinite(z).all()
+    # one row per column, and distinct column names must not collapse to one point
+    assert len({tuple(r.round(decimals=4).tolist()) for r in z}) > 1

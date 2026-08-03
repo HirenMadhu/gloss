@@ -54,11 +54,12 @@ def specialization_probe(model) -> dict[int, int]:
     moe = next((m for m in model.substrate.modules() if isinstance(m, MoEFFN)), None)
     if moe is None:
         return {}
-    C = int(sig.name_emb.shape[0])
-    rec = torch.zeros(C, dtype=torch.long, device=sig.name_emb.device)
-    z = sig.norm(sig.schema_proj(sig.name_emb) + sig.stype_emb(sig.modality_id) + sig.recency_emb(rec))
+    # Ask the signature for the column table rather than rebuilding it here: this used to inline
+    # `sig.recency_emb(zeros)`, which only exists under time_mode="buckets" and raised AttributeError
+    # under "rope" — the mode the two-level runs actually use, so the probe was dead on arrival.
+    z = sig.column_signature()                                # [C, d_sig]
     expert = moe._logits(z).argmax(dim=-1)                    # [C]
-    return {i: int(expert[i]) for i in range(C)}
+    return {i: int(expert[i]) for i in range(int(z.shape[0]))}
 
 
 @torch.no_grad()

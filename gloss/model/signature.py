@@ -71,6 +71,28 @@ class RelationalSignature(nn.Module):
         bins = bucket + 1                                                   # 1..n_recency
         return torch.where(cb.is_timed, bins, torch.zeros_like(bins)).long()
 
+    @torch.no_grad()
+    def column_signature(self) -> Tensor:
+        """-> ``[C, d_sig]``: every column's signature at the **untimed** recency state.
+
+        The per-column half of ``forward`` with the time term held at its context-independent
+        "unknown Δ" value — bin 0 under ``buckets``, the all-zero sinusoid pair under ``rope``.
+        Diagnostics use it to ask which expert a *column* routes to without a batch, and it must be
+        derived here rather than reconstructed by a caller: ``recency_emb`` only exists under
+        ``buckets``, so a caller that reaches for it works on one time mode and raises
+        ``AttributeError`` on the other.
+        """
+        name = self.name_emb                                                 # [C, d_text]
+        z = self.schema_proj(name) + self.stype_emb(self.modality_id)        # [C, d_sig]
+        if self.time_mode == "buckets":
+            zero = torch.zeros(name.shape[0], dtype=torch.long, device=name.device)
+            z = z + self.recency_emb(zero)
+        else:
+            untimed = torch.zeros(name.shape[0], dtype=torch.bool, device=name.device)
+            tau = torch.zeros(name.shape[0], device=name.device)
+            z = z + self.w_tau(self.ladder.feats(tau, untimed, untimed).to(z.dtype))
+        return self.norm(z)
+
     def forward(self, cb: CellBatch) -> Tensor:
         col = cb.col_idxs.clamp(min=0)                                       # [B, S] (pad -1 -> 0)
         B, S = col.shape

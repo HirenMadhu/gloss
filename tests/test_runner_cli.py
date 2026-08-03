@@ -13,6 +13,7 @@ next knob added to the parser is covered by the same failure.
 """
 from __future__ import annotations
 
+import itertools
 import sys
 from pathlib import Path
 
@@ -79,6 +80,7 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         # is fine only while the two agree, and they drift
         "lr_set": "default", "optimizer": "adamw", "weight_decay": 0.01,
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
+        "grid_set": "default", "patience": 3,
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -263,3 +265,67 @@ def test_list_and_run_path_agree_on_the_lr_set(monkeypatch, tmp_path, capsys):
                                       "--seeds", "1", "--out-dir", str(tmp_path)])
     assert rg.main() == 0
     assert int(capsys.readouterr().out.strip()) == len(rg.jobs(1, "two_level", "regression", "extended"))
+
+
+def test_default_grid_set_is_the_shape_product_so_queued_arrays_keep_their_indexing():
+    """LOAD-BEARING, same reason as the lr-set test. `GRID_SETS['default']` replaced an inline
+    `product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS)`; if it ever stops equalling that product — or
+    if the shape/lr nesting order flips — every already-run array's config_idx means something else
+    and the completed results silently mis-join to their configs.
+    """
+    rg = _load("run_gridsearch")
+    assert rg.GRID_SETS["default"] == list(
+        itertools.product(rg.TWO_LEVEL_D_MODEL, rg.TWO_LEVEL_N_BLOCKS))
+    assert [(c["d_model"], c["n_blocks"], c["lr"]) for c in rg.two_level_grid()] == [
+        (128, 2, 3e-4), (128, 2, 1e-3), (128, 4, 3e-4), (128, 4, 1e-3),
+        (256, 2, 3e-4), (256, 2, 1e-3), (256, 4, 3e-4), (256, 4, 1e-3)]
+    # the large-batch arm: 128/2 only (the config the batch probe cleared for 512 unaccumulated)
+    assert rg.GRID_SETS["small"] == [(128, 2)]
+    assert [(c["d_model"], c["n_blocks"], c["lr"]) for c in rg.two_level_grid("scaled", "small")] == [
+        (128, 2, 3e-4), (128, 2, 1e-3), (128, 2, 3e-3)]
+    assert len(rg.jobs(1, "two_level", "all", "scaled", "small")) == 27
+    assert rg.LR_SETS["scaled"][0] == 3.0e-4, "keep the unscaled lr as an in-arm control"
+    with pytest.raises(ValueError, match="unknown grid_set"):
+        rg.two_level_grid("default", "nope")
+
+
+def test_list_and_run_path_agree_on_the_grid_set(monkeypatch, tmp_path, capsys):
+    rg = _load("run_gridsearch")
+    monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", "--list", "--arch", "two_level",
+                                      "--lr-set", "scaled", "--grid-set", "small",
+                                      "--seeds", "1", "--out-dir", str(tmp_path)])
+    assert rg.main() == 0
+    assert int(capsys.readouterr().out.strip()) == 27
+
+    seen = {}
+    monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
+    monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", "--index", "0", "--arch", "two_level",
+                                      "--lr-set", "scaled", "--grid-set", "small", "--epochs", "80",
+                                      "--patience", "24", "--seeds", "1", "--out-dir", str(tmp_path)])
+    assert rg.main() == 0
+    assert seen.get("grid_set") == "small" and seen.get("patience") == 24
+    assert seen.get("epochs") == 80
+
+
+def test_router_diagnostics_never_kills_a_run_and_reports_collapse():
+    """The diagnostic is bolted onto a run whose real product is the test metric, so a failure inside
+    it must degrade to a recorded string, not an exception — otherwise wiring in a *measurement*
+    could destroy the *result*. Also pins the collapse semantics: entropy_norm is 1.0 for uniform
+    usage and ->0 when one expert takes everything, so the field can be read without the E it came
+    from."""
+    import math
+
+    rg = _load("run_gridsearch")
+
+    class Boom:
+        def parameters(self):
+            raise RuntimeError("no params")
+
+    out = rg.router_diagnostics(Boom(), None, None, seq_len=8, max_fk=2, batch_size=2)
+    assert "router_error" in out and "no params" in out["router_error"]
+    assert not any(k.startswith("router_usage") for k in out)
+
+    # entropy_norm semantics, computed the way the helper does
+    for usage, expect in (([0.25] * 4, 1.0), ([1.0, 0.0, 0.0, 0.0], 0.0)):
+        ent = -sum(u * math.log(max(u, 1e-9)) for u in usage)
+        assert round(ent / math.log(4), 3) == expect

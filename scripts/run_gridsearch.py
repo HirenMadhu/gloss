@@ -64,16 +64,36 @@ TWO_LEVEL_LR = [3.0e-4, 1.0e-3]
 #: and GelGT trains at 1e-4. It is a SEPARATE set rather than an edit to TWO_LEVEL_LR because
 #: changing that list re-maps every array index — arrays already queued would silently run a
 #: different experiment (amendments.md §9.3).
-LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3]}
+#: `scaled` is for LARGE-BATCH runs. Going 64 -> 512 is 8x, and the optimum lr moves UP with batch
+#: size (linear scaling says 8x -> 2.4e-3, sqrt scaling 2.8x -> 8.5e-4). It keeps 3e-4 as the
+#: unscaled control so "the lr moved" and "big batches help" stay separable.
+LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3],
+           "scaled": [3.0e-4, 1.0e-3, 3.0e-3]}
+
+#: Swept `(d_model, n_blocks)` pairs. `default` MUST stay equal to
+#: `product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS)` or every queued array's index->job map shifts
+#: (amendments.md §9.3); `tests/test_runner_cli.py` pins that.
+#:
+#: `small` is 128/2 alone — the ONLY config `scripts/probe_batch_size.py` measured as fitting batch
+#: 512 without gradient accumulation (38.3 GiB; 256/4 OOMs above 256). That restriction is not a
+#: budget compromise, it is required for the experiment to mean anything on the binary tasks: the
+#: pairwise AUC surrogate forms its pairs WITHIN a batch, so accum=2 at batch 256 would leave the
+#: pair count at 256's level while looking like 512 in the record.
+GRID_SETS = {"default": list(itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS)),
+             "small": [(128, 2)]}
 
 
-def two_level_grid(lr_set: str = "default") -> list[dict]:
+def two_level_grid(lr_set: str = "default", grid_set: str = "default") -> list[dict]:
     try:
         lrs = LR_SETS[lr_set]
     except KeyError:
         raise ValueError(f"unknown lr_set {lr_set!r}; expected one of {sorted(LR_SETS)}") from None
+    try:
+        shapes = GRID_SETS[grid_set]
+    except KeyError:
+        raise ValueError(f"unknown grid_set {grid_set!r}; expected one of {sorted(GRID_SETS)}") from None
     grid = []
-    for dm, nb, lr in itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS, lrs):
+    for (dm, nb), lr in itertools.product(shapes, lrs):
         grid.append(dict(d_model=dm, n_blocks=nb, n_heads=8, d_ff=dm * 4,
                          num_experts=4, enc_channels=dm, lr=lr))
     return grid
@@ -102,14 +122,15 @@ TASK_SETS = {
 
 
 def jobs(seeds: int, arch: str = "rt", task_set: str = "all",
-         lr_set: str = "default") -> list[tuple]:
+         lr_set: str = "default", grid_set: str = "default") -> list[tuple]:
     """Flat (config_idx, cfg, dataset, task, seed) list the array iterates by index.
 
-    `task_set` changes the index->job mapping, so it MUST be passed identically to `--list` and to
-    `run_index` — see the §9.3 comment in `main`. Results for different task sets therefore belong in
-    different `--out-dir`s: index 0 means a different job under each.
+    `task_set` / `lr_set` / `grid_set` all change the index->job mapping, so each MUST be passed
+    identically to `--list` and to `run_index` — see the §9.3 comment in `main`. Results for
+    different settings therefore belong in different `--out-dir`s: index 0 means a different job
+    under each.
     """
-    g = two_level_grid(lr_set) if arch == "two_level" else arch_grid()
+    g = two_level_grid(lr_set, grid_set) if arch == "two_level" else arch_grid()
     try:
         tasks = TASK_SETS[task_set]
     except KeyError:
@@ -118,6 +139,75 @@ def jobs(seeds: int, arch: str = "rt", task_set: str = "all",
             for ci, cfg in enumerate(g)
             for (ds, tk) in tasks
             for s in range(seeds)]
+
+
+def router_diagnostics(module, bundle, task, *, seq_len: int, max_fk: int,
+                       batch_size: int, n_batches: int = 4) -> dict:
+    """Expert usage / entropy / column-partition size for the trained router, from a few VAL batches.
+
+    Wired in because the method's central claim — that routing on the relational signature
+    *specialises* the experts — has never once been measured (`results/WHY_NOT_RT.md` §2): the
+    diagnostics existed but nothing called them, and the grid saves no checkpoints, so every finished
+    run so far is unprobeable after the fact. If usage has collapsed onto one expert then MoRE is RT
+    with a wider FFN and no other number here means much.
+
+    VAL, not train (routing on data the model fit tells you less) and not test (which we only touch
+    once, through `task.evaluate`). Failures are recorded, never raised: a diagnostic must not be able
+    to destroy the run's actual result.
+    """
+    import torch
+
+    from gloss.data.collate import to_cell_batch
+    from gloss.data.graph import make_loader
+    from gloss.eval.diagnostics import expert_usage, mean_active_experts, specialization_probe
+
+    out: dict = {}
+    try:
+        device = next(module.parameters()).device
+        loader = make_loader(bundle, task, "val", num_neighbors=None,
+                             batch_size=batch_size, shuffle=False, num_workers=0)
+        cbs = []
+        for raw in loader:
+            cbs.append(to_cell_batch(raw, bundle, task.entity_table,
+                                     seq_len=seq_len, max_fk=max_fk).to(device))
+            if len(cbs) >= n_batches:
+                break
+    except Exception as exc:
+        return {"router_error": f"batches: {exc!r}"}
+
+    # Each probe is guarded SEPARATELY. Under one shared try/except a single stale probe returned
+    # `router_error` for the whole record and silently took the two working ones with it — which is
+    # exactly what a CPU smoke run caught before these arrays launched.
+    def _probe(key, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            out[f"{key}_error"] = repr(exc)
+            return None
+
+    with torch.no_grad():
+        usage_ent = _probe("router_usage", lambda: expert_usage(module.model, cbs))
+        kbar = _probe("router_mean_active_k", lambda: mean_active_experts(module.model, cbs))
+        part = _probe("router_specialization", lambda: specialization_probe(module.model))
+
+    if usage_ent is not None and usage_ent[0] is not None:
+        usage, entropy = usage_ent
+        u = usage.tolist()
+        n_exp = len(u)
+        out.update(router_usage=u, router_entropy=entropy,
+                   # uniform usage has entropy log(E); 1.0 = balanced, ->0 = collapsed onto one
+                   router_entropy_norm=entropy / math.log(n_exp) if n_exp > 1 else float("nan"),
+                   router_max_usage=max(u))
+    elif usage_ent is not None:
+        out["router_usage_error"] = "no MoEFFN in this model"
+    if kbar is not None:
+        out["router_mean_active_k"] = kbar
+    if part is not None:
+        # how many DISTINCT experts the columns partition into: 1 == the router learned nothing
+        # column-specific, whatever the aggregate gate mass looks like
+        out["router_columns_probed"] = len(part)
+        out["router_distinct_experts"] = len(set(part.values())) if part else 0
+    return out
 
 
 def init_batch(cfg: dict) -> int:
@@ -136,7 +226,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               binary_loss: str = "bce", lr_set: str = "default",
               optimizer: str = "adamw", weight_decay: float = 0.01,
               target_scaling: str = "zscore", clamp_pct: float | None = None,
-              batch_size: int | None = None, accum: int = 1) -> dict:
+              batch_size: int | None = None, accum: int = 1,
+              grid_set: str = "default", patience: int = 3) -> dict:
     import numpy as np
     import torch
 
@@ -146,7 +237,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
     from gloss.eval.test_eval import evaluate_split, score_pred
     from gloss.train.finetune import name_embeddings, target_stats, task_kind, train_prebuilt
 
-    J = jobs(seeds, arch, task_set, lr_set)
+    J = jobs(seeds, arch, task_set, lr_set, grid_set)
     if index >= len(J):
         print(f"index {index} >= grid size {len(J)}; nothing to do")
         return {}
@@ -188,6 +279,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                 seed=seed, num_workers=num_workers, lr=lr, regression_loss=regression_loss,
                 binary_loss=binary_loss, optimizer=optimizer, weight_decay=weight_decay,
                 target_scaling=target_scaling, clamp_pct=clamp_pct, accumulate_grad_batches=accum,
+                patience=patience,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -206,10 +298,16 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            "lr_set": lr_set, "optimizer": optimizer, "weight_decay": weight_decay,
            "target_scaling": target_scaling if kind == "regression" else None,
            "clamp_pct": clamp_pct if kind == "regression" else None, "accum": accum,
+           # epochs/patience used to be un-stamped, so a 10-epoch run and an 80-epoch run were
+           # indistinguishable from their JSON — the same gap the objective stamps above closed.
+           # A large-batch arm is defined as much by its epoch budget as by its batch size.
+           "epochs": epochs, "patience": patience, "grid_set": grid_set,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
+    rec.update(router_diagnostics(module, bundle, task, seq_len=seq_len, max_fk=max_fk,
+                                  batch_size=bs))
     try:
         # Score UNCLAMPED and keep the raw predictions, then apply the clamp to the same array. One
         # trained model yields both numbers, so the clamp's eval effect is isolated from any change
@@ -326,7 +424,15 @@ def main() -> int:
                     help="regression objective (binary tasks ignore it). mse = every result before "
                          "2026-07-31; l1 aligns training with RelBench's MAE metric")
     ap.add_argument("--lr-set", default="default", choices=sorted(LR_SETS),
-                    help="extended adds lr=1e-4 (12 configs, not 8). CHANGES index->job: new --out-dir")
+                    help="extended adds lr=1e-4 (12 configs, not 8); scaled adds 3e-3 for "
+                         "large-batch runs. CHANGES index->job: new --out-dir")
+    ap.add_argument("--grid-set", default="default", choices=sorted(GRID_SETS),
+                    help="swept (d_model, n_blocks) pairs; small = 128/2 only, the config that fits "
+                         "batch 512 unaccumulated. CHANGES index->job: new --out-dir")
+    ap.add_argument("--patience", type=int, default=3,
+                    help="early-stop patience in EPOCHS. Scale it with --epochs when the batch "
+                         "grows: at 8x the batch an epoch is 1/8 the steps, so patience 3 would "
+                         "stop 8x earlier in step terms and undo the point of the longer budget")
     ap.add_argument("--optimizer", default="adamw", choices=["adamw", "adam"],
                     help="adam + --weight-decay 1e-5 reproduces GelGT's optimizer")
     ap.add_argument("--weight-decay", type=float, default=0.01, help="0.01 = ours, 1e-5 = GelGT")
@@ -350,7 +456,7 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = REPO / out_dir
     if args.list:
-        print(len(jobs(args.seeds, args.arch, args.tasks, args.lr_set)))
+        print(len(jobs(args.seeds, args.arch, args.tasks, args.lr_set, args.grid_set)))
         return 0
     if args.aggregate:
         print(aggregate(out_dir))
@@ -370,7 +476,8 @@ def main() -> int:
                     task_set=args.tasks, regression_loss=args.reg_loss,
                     binary_loss=args.bin_loss, lr_set=args.lr_set, optimizer=args.optimizer,
                     weight_decay=args.weight_decay, target_scaling=args.target_scaling,
-                    clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum)
+                    clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum,
+                    grid_set=args.grid_set, patience=args.patience)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0
