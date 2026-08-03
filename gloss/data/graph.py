@@ -97,7 +97,27 @@ def _patch_multiembedding_offset() -> None:
                     "layout above once it is understood. Do NOT guess a repair — a wrong rebase "
                     "silently corrupts embeddings instead of crashing."
                 )
-        return _orig_validate(self)
+        try:
+            return _orig_validate(self)
+        except AssertionError as exc:
+            # We got here with the guard above NOT firing, i.e. `int(off[0]) == 0`, yet torch_frame's
+            # `assert self.offset[0] == 0` still failed. Those two cannot both be true of the same
+            # tensor, so the premise is wrong somewhere and guessing a repair would be the second
+            # wrong guess on this bug. Dump the state instead — worker stdout is discarded, so it has
+            # to ride on the exception. 11 tasks across 5 arrays died here AFTER the zero-column fix.
+            off_now = self.offset
+            raise RuntimeError(
+                "MultiEmbeddingTensor validate() failed AFTER the offset patch let it through: "
+                f"offset={None if off_now is None else off_now.tolist()[:8]} "
+                f"dtype={None if off_now is None else off_now.dtype} "
+                f"shape={None if off_now is None else tuple(off_now.shape)} "
+                f"numel={None if off_now is None else int(off_now.numel())} "
+                f"values={None if self.values is None else tuple(self.values.shape)} "
+                f"num_cols={getattr(self, 'num_cols', None)} "
+                f"num_rows={getattr(self, 'num_rows', None)} "
+                f"guard_saw={None if off_now is None or not off_now.numel() else int(off_now[0])}. "
+                "Do NOT guess a repair from this message alone — read the layout first."
+            ) from exc
 
     _MET.validate = _validate
     _MET._gloss_offset_patch = True
