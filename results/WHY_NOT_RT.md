@@ -157,3 +157,29 @@ this lr-sensitive at 10 fixed epochs is being measured partly on its optimizatio
    never-run-dense rule. Without it no result can be attributed to the MoE.
 5. Multi-seed confirmation of the winning configs; the grid is 1 seed and the headline showed cv to
    28.5%.
+
+## 6. site-success cannot be model-selected — val and test rank configs independently (2026-08-03)
+
+`tl_gelgt_qwen` produced a site-success test NMAE of **0.6956**, beating both RT (0.7341) and GelGT
+(0.7324) — the first time anything cracked that task. It does **not** survive honest selection, and
+the reason is worth recording because it applies to how every number here gets read.
+
+Over the 40 L1/GelGT-style configs that scored site-success:
+
+| set | Spearman(val_mae, test_nmae) | n |
+|---|---|---|
+| all configs | **+0.764** | 40 |
+| excluding collapsed runs (test_nmae >= 0.95) | **−0.199** | 22 |
+
+18 of 40 configs sit at test_nmae ~0.971, i.e. exactly the constant-predictor floor — collapsed.
+Those dominate the pooled correlation: val agrees with test only about *which runs died*. Among the
+22 that actually learned, val ranks them **slightly negatively** against test. The val-best config
+(val_mae 0.3585) scores 0.8686 on test; the test-best (0.6956) is **rank 13 of 40 on val**.
+
+So 0.6956 is a lottery ticket drawn from 40 tries, not a result. Selecting on val — the only
+protocol that is not cheating — gives **0.8686, a loss to RT**. Reported here rather than in the
+headline table for that reason.
+
+Consequence for the whole comparison: pooling arms and taking a per-task best inflates. Across all
+arms to date, best-of-any-arm beats RT **8/9 selecting on test** but only **6/9 selecting on val**
+(GelGT: 6/9 vs 4/9). The val-selected number is the one to quote.
