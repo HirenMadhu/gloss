@@ -73,8 +73,11 @@ arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, w
   Cell experts are **routed-only** (`use_shared=False`); row experts are **shared + routed**. That
   asymmetry is intentional: the cell `+S` arm measured only mildly positive, on regression alone.
 - **Frozen text encoder, cached.** Column-name embeddings are computed offline with **`Qwen/Qwen3-Embedding-4B`**
-  (`d_text`≈2560; config-swappable; `HashEncoder` for dev/tests) and cached to `data/schema_cache/`. **No LM
-  forward passes in training** — gather the frozen `[C, d_text]` name table by column id.
+  (`d_text`≈2560; config-swappable; `HashEncoder` for dev/tests) and cached to `$GLOSS_SCHEMA_CACHE` (see
+  *Cache locations* below — **not** the repo's `data/schema_cache/`, which is only the unset-env fallback).
+  **No LM forward passes in training** — gather the frozen `[C, d_text]` name table by column id. Note
+  `EmbeddingCache` computes-and-writes on a miss rather than failing, so a wrong cache root degrades to a
+  silent LM load at train time instead of an error.
 - **Value-free routing = leak-free by construction.** The signature is a pure function of a cell's own
   `(column, modality, recency)`; no neighborhood/global statistic enters the router. Recency uses **fixed,
   context-independent** buckets — or, behind `time.mode: rope`, a fixed-frequency ladder
@@ -164,11 +167,38 @@ the cached real dataset (MoRE-level tests need real stype stats → rel-f1-guard
 
 ## The datasets
 
-First DB = **rel-f1** (cached at `~/.cache/relbench/rel-f1`; **5 entity tasks**: `driver-dnf`/`driver-top3`
-binary, `driver-position`/`qualifying-position`/`results-position` regression). The headline spans the **three
+First DB = **rel-f1** (**5 entity tasks**: `driver-dnf`/`driver-top3` binary,
+`driver-position`/`qualifying-position`/`results-position` regression). The headline spans the **three
 smallest** by rows — **rel-f1, rel-stack, rel-trial** — all entity (classification + regression) tasks,
-TEST-set reported. `entity_tasks()` enumerates them and excludes link/recommendation. **rel-stack is not cached
-yet** (download + `build_schema_cache.sh` before the SLURM array). rel-trial and rel-event are cached.
+TEST-set reported. `entity_tasks()` enumerates them and excludes link/recommendation.
+
+### Cache locations — there are TWO roots, and only one of them is real for SLURM
+
+`scripts/env.sh` redirects every cache to scratch, and **every SLURM script sources it**:
+
+```
+RELBENCH_CACHE_DIR=$HOME/scratch60/gloss/relbench      # NOT ~/.cache/relbench
+GLOSS_SCHEMA_CACHE=$HOME/scratch60/gloss/schema_cache  # NOT <repo>/data/schema_cache
+GLOSS_GRAPH_CACHE=$HOME/scratch60/gloss/graph_cache
+HF_HOME=$HOME/scratch60/gloss/hf
+```
+
+`gloss/utils/paths.py` falls back to the **repo-relative** `data/schema_cache/` when the env var is unset —
+which is what a plain `.venv/bin/python …` in a login shell gets. So the two roots disagree, and the repo one
+is the misleading one: `data/schema_cache/rel-stack/name_emb_qwen.pt` exists but **no job will ever read it**,
+while `data/schema_cache/rel-trial/` is missing its qwen file even though the qwen grid ran rel-trial fine.
+**Always check `$HOME/scratch60/gloss/schema_cache` before concluding a dataset is uncached**, and `source
+scripts/env.sh` before any local run meant to share state with SLURM.
+
+Some entries under the scratch roots are **symlinks into `~/.cache/relbench`** (rel-avito, rel-stack) or into
+`~/scratch60/relbench` (rel-event) rather than copies — done to avoid re-downloading data already on disk.
+Home is the tight quota (~125 GiB) and is where `~/.cache/relbench` lives; scratch60 has ~20 TB. **New
+downloads must go to the scratch root**, never home.
+
+Leaderboard coverage (7 DBs): rel-f1 / rel-trial / rel-event are fully cached; rel-avito / rel-stack /
+rel-hm / rel-amazon were prepped later via `sbatch scripts/prep.sh --datasets <ds> --encoder qwen`
+(`prep.sh` pins `h100:1`; override with `--gpus=1` so a schema-cache build can take an a40 instead of
+competing with training).
 
 ## Commands
 
@@ -177,7 +207,9 @@ Use `.venv/bin/python`.
 ```bash
 .venv/bin/python scripts/run_train.py --dry-run                              # sample a cell batch, forward MoRE(signature)
 .venv/bin/python scripts/run_train.py --train --route-on signature --test    # one arm + TEST eval (--encoder hash|qwen)
+source scripts/env.sh                                                        # FIRST, for any local run sharing state with SLURM
 .venv/bin/python scripts/build_schema_cache.py                               # cache Qwen column-name embeddings (prereq)
+sbatch --gpus=1 scripts/prep.sh --datasets rel-hm --encoder qwen             # download + task tables + graph + schema, one DB
 .venv/bin/python scripts/run_ablation.py --list                              # ablation grid size
 .venv/bin/python scripts/run_ablation.py --index N                           # one (dataset,task,signal,seed) arm
 .venv/bin/python scripts/run_ablation.py --aggregate                         # per-(dataset,task) table, Δ vs dense
