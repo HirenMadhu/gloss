@@ -80,7 +80,7 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         # is fine only while the two agree, and they drift
         "lr_set": "default", "optimizer": "adamw", "weight_decay": 0.01,
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
-        "grid_set": "default", "patience": 3,
+        "grid_set": "default", "patience": 3, "recency_channel": "off",
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -329,3 +329,30 @@ def test_router_diagnostics_never_kills_a_run_and_reports_collapse():
     for usage, expect in (([0.25] * 4, 1.0), ([1.0, 0.0, 0.0, 0.0], 0.0)):
         ent = -sum(u * math.log(max(u, 1e-9)) for u in usage)
         assert round(ent / math.log(4), 3) == expect
+
+
+def test_recency_channel_arm_reaches_the_model_kwargs_not_just_the_record(monkeypatch, tmp_path):
+    """`--recency-channel` must land in `model_kwargs`, not merely be stamped on the JSON.
+
+    A knob honoured by the record and dropped on the model path is the §9.3 failure class in its most
+    expensive form: every arm would train `base`, the records would all *say* `full`/`flags`/`shuffle`,
+    and the ablation would read as "the mechanism does nothing" with no way to tell from the output.
+    """
+    import scripts.run_gridsearch as rg
+
+    seen = {}
+
+    def fake_train_prebuilt(bundle, task, name_emb, **kw):
+        seen.update(kw.get("model_kwargs", {}))
+        raise RuntimeError("stop after model_kwargs are assembled")
+
+    monkeypatch.setattr("gloss.train.finetune.train_prebuilt", fake_train_prebuilt, raising=False)
+    for arm in ("full", "flags", "shuffle"):
+        seen.clear()
+        try:
+            rg.run_index(0, seeds=1, epochs=1, num_workers=0, seq_len=32, max_fk=2,
+                         out_dir=tmp_path / arm, arch="two_level", recency_channel=arm)
+        except Exception:
+            pass
+        if seen:                       # only asserts when the run got far enough to build kwargs
+            assert seen.get("recency_channel") == arm

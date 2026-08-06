@@ -220,6 +220,7 @@ class TwoLevelSubstrate(nn.Module):
         n_heads: int = 8,
         max_hop: int = 8,
         ladder: TimeLadder | None = None,
+        recency_channel: str = "off",
         **block_kw,
     ):
         super().__init__()
@@ -227,6 +228,20 @@ class TwoLevelSubstrate(nn.Module):
         self.row_sig = RowSignature(table_name_emb, role_name_emb, self.ladder,
                                     d_sig=d_sig, max_hop=max_hop)
         self.w_u = nn.Linear(d_model + d_sig, d_model, bias=False)
+        # The recency order-statistic channel reads the *truncation window* of each role's sampled
+        # child set. It is injected into the row token ONCE, before block 0's row attention, and only
+        # ever into the value path — `s` (what both routers read) is built above and never sees it.
+        self.recency_channel = recency_channel
+        if recency_channel != "off":
+            from .recency_stats import RecencyOrderChannel
+
+            # Built inside a FORKED RNG so constructing it does not advance the global stream. Without
+            # this, `x_full` and `base` at the same seed get different weights for every parameter
+            # created after this point, and the arms stop being paired -- which would quietly turn an
+            # init difference into "the mechanism helped".
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                self.x_channel = RecencyOrderChannel(d_model, role_name_emb, mode=recency_channel)
         self.blocks = nn.ModuleList(
             TwoLevelBlock(d_model, d_ff, d_sig, self.ladder, col_name_emb, role_name_emb,
                           n_heads=n_heads, **block_kw)
@@ -244,6 +259,10 @@ class TwoLevelSubstrate(nn.Module):
     def forward(self, x: Tensor, cb, *, z: Tensor | None = None):
         s = self.row_sig(cb)                          # [B,R,d_sig] — computed ONCE, reused per block
         u = self._init_rows(x, s, cb)
+        x_diag: dict = {}
+        if self.recency_channel != "off":
+            h_x, x_diag = self.x_channel(cb)          # already scaled by alpha (init 0)
+            u = u + h_x
         masks = build_relational_masks(cb) if self.needs_masks else None
 
         h = x
@@ -257,4 +276,5 @@ class TwoLevelSubstrate(nn.Module):
             aux_row_total = aux_row_total + aux_row
             diags.append(diag)
         aux = aux_cell_total + aux_row_total
-        return h, u, aux, {"aux_cell": aux_cell_total, "aux_row": aux_row_total, "blocks": diags}
+        return h, u, aux, {"aux_cell": aux_cell_total, "aux_row": aux_row_total, "blocks": diags,
+                           **x_diag}

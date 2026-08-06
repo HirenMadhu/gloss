@@ -67,7 +67,11 @@ TWO_LEVEL_LR = [3.0e-4, 1.0e-3]
 #: `scaled` is for LARGE-BATCH runs. Going 64 -> 512 is 8x, and the optimum lr moves UP with batch
 #: size (linear scaling says 8x -> 2.4e-3, sqrt scaling 2.8x -> 8.5e-4). It keeps 3e-4 as the
 #: unscaled control so "the lr moved" and "big batches help" stay separable.
-LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3],
+#: `single` pins the one lr that was val-selected on the most tasks (6 of 9) in the b512/80ep
+#: multi-seed run. It exists so a MECHANISM ablation can spend its whole array on arms rather than on
+#: an lr axis: the arms are compared as a paired delta at a fixed config, where the lr is a held
+#: constant, not a thing being selected.
+LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3], "single": [3.0e-4],
            "scaled": [3.0e-4, 1.0e-3, 3.0e-3]}
 
 #: Swept `(d_model, n_blocks)` pairs. `default` MUST stay equal to
@@ -210,6 +214,44 @@ def router_diagnostics(module, bundle, task, *, seq_len: int, max_fk: int,
     return out
 
 
+def x_channel_diagnostics(module, bundle, task, *, seq_len: int, max_fk: int,
+                          batch_size: int, n_batches: int = 4) -> dict:
+    """§5 instrumentation for the recency order-statistic channel, on **val**.
+
+    The two numbers that matter are invisible in the accuracy column:
+
+    * ``x_kappa_max`` drifting toward 0 means the soft max collapsed to a **mean** — no order
+      statistic is being computed and the arm silently stopped testing the hypothesis. Compare
+      against the init (+4.0 / -4.0), which is what makes drift readable from a single final value.
+    * ``x_alpha`` staying near 0 means the channel is unused and the arm is a no-op.
+
+    Wrapped per-probe like ``router_diagnostics``: a diagnostic must never take down a finished run.
+    """
+    import torch
+
+    try:
+        model = module.model
+        ch = getattr(getattr(model, "substrate", None), "x_channel", None)
+        if ch is None:
+            return {"x_channel_error": "no x_channel on this model"}
+        device = next(module.parameters()).device
+        loader = make_loader(bundle, task, "val", num_neighbors=None,
+                             batch_size=batch_size, shuffle=False, num_workers=0)
+        out: dict = {}
+        with torch.no_grad():
+            for raw in loader:
+                cb = to_cell_batch(raw, bundle, task.entity_table,
+                                   seq_len=seq_len, max_fk=max_fk).to(device)
+                _, out = ch(cb)
+                break
+        for k in ("x_kappa_max", "x_kappa_min", "x_alpha"):
+            out[k] = float(getattr(ch, k.replace("x_", "")).detach())
+        out["x_kappa_max_init"], out["x_kappa_min_init"] = 4.0, -4.0
+        return out
+    except Exception as exc:
+        return {"x_channel_error": repr(exc)}
+
+
 def init_batch(cfg: dict) -> int:
     """Per-config starting batch (MoE dense-combine runs all experts on all tokens -> ~M x FFN mem)."""
     heavy = cfg["d_model"] * cfg["n_blocks"] * cfg["num_experts"] * cfg["d_ff"]
@@ -227,7 +269,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               optimizer: str = "adamw", weight_decay: float = 0.01,
               target_scaling: str = "zscore", clamp_pct: float | None = None,
               batch_size: int | None = None, accum: int = 1,
-              grid_set: str = "default", patience: int = 3) -> dict:
+              grid_set: str = "default", patience: int = 3,
+              recency_channel: str = "off") -> dict:
     import numpy as np
     import torch
 
@@ -268,6 +311,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                   table_name_emb=build_table_name_embeddings(bundle, enc, kind="query"),
                   role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
                   **TWO_LEVEL_PHASES[phase])
+        mk["recency_channel"] = recency_channel
 
     bs = batch_size or init_batch(cfg)
     module = metrics = None
@@ -302,12 +346,16 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # indistinguishable from their JSON — the same gap the objective stamps above closed.
            # A large-batch arm is defined as much by its epoch budget as by its batch size.
            "epochs": epochs, "patience": patience, "grid_set": grid_set,
+           "recency_channel": recency_channel,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
     rec.update(router_diagnostics(module, bundle, task, seq_len=seq_len, max_fk=max_fk,
                                   batch_size=bs))
+    if recency_channel != "off":
+        rec.update(x_channel_diagnostics(module, bundle, task, seq_len=seq_len, max_fk=max_fk,
+                                         batch_size=bs))
     try:
         # Score UNCLAMPED and keep the raw predictions, then apply the clamp to the same array. One
         # trained model yields both numbers, so the clamp's eval effect is isolated from any change
@@ -433,6 +481,14 @@ def main() -> int:
                     help="early-stop patience in EPOCHS. Scale it with --epochs when the batch "
                          "grows: at 8x the batch an epoch is 1/8 the steps, so patience 3 would "
                          "stop 8x earlier in step terms and undo the point of the longer budget")
+    # The recency order-statistic arms. This does NOT change the index->job map (it is not part of
+    # `jobs()`), so each arm needs its own --out-dir, not a shared one: index 0 means the same
+    # (config, task, seed) under every arm and the skip-if-done guard keys on index alone.
+    ap.add_argument("--recency-channel", default="off",
+                    choices=["off", "full", "flags", "shuffle"],
+                    help="row-level recency order-statistic channel: off=base | full=the mechanism | "
+                         "flags=saturation/exists/untimed only (is the win the age, or just knowing "
+                         "it truncated?) | shuffle=real features, Delta permuted across seeds (placebo)")
     ap.add_argument("--optimizer", default="adamw", choices=["adamw", "adam"],
                     help="adam + --weight-decay 1e-5 reproduces GelGT's optimizer")
     ap.add_argument("--weight-decay", type=float, default=0.01, help="0.01 = ours, 1e-5 = GelGT")
@@ -477,7 +533,8 @@ def main() -> int:
                     binary_loss=args.bin_loss, lr_set=args.lr_set, optimizer=args.optimizer,
                     weight_decay=args.weight_decay, target_scaling=args.target_scaling,
                     clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum,
-                    grid_set=args.grid_set, patience=args.patience)
+                    grid_set=args.grid_set, patience=args.patience,
+                    recency_channel=args.recency_channel)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0
