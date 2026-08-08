@@ -156,33 +156,83 @@ class RowPool(nn.Module):
             self.w_o = nn.Linear(self.slots * self.d_h, d_model, bias=False)
 
     def _membership(self, cb, R: int) -> Tensor:
-        """``[B, R, S]`` bool — cell `i` belongs to row `r` and is not padding."""
+        """``[B, R, S]`` bool — cell `i` belongs to row `r` and is not padding.
+
+        Kept only as the reference the segment-softmax path in :meth:`forward` is tested against; it
+        is deliberately *not* used at runtime, because materializing it is the whole problem below.
+        """
         rows = torch.arange(R, device=cb.cell_row.device).view(1, R, 1)
         return (cb.cell_row.unsqueeze(1) == rows) & (~cb.is_padding).unsqueeze(1)
 
+    def _groups(self, cb, R: int) -> tuple[Tensor, Tensor]:
+        """``(valid [B,S], flat_group_id [B*S])`` — the row each cell belongs to, flattened over B.
+
+        Cells past `MAX_ROWS` truncation (``row >= R``) and padding cells (``node_idxs == -1``) are
+        dropped, matching what ``_membership`` silently did by never matching them.
+        """
+        row_of = cb.cell_row                                              # [B,S]; pad = -1
+        valid = (~cb.is_padding) & (row_of >= 0) & (row_of < R)
+        idx = row_of.clamp(0, R - 1)                                      # safe index; masked below
+        base = torch.arange(cb.cell_row.shape[0], device=row_of.device).unsqueeze(1) * R
+        return valid, (base + idx).reshape(-1)
+
     def forward(self, h: Tensor, u: Tensor, s: Tensor, cb) -> Tensor:
-        """``h [B,S,d]``, ``u [B,R,d]``, ``s [B,R,d_sig]`` -> updated ``u [B,R,d]`` (residual)."""
+        """``h [B,S,d]``, ``u [B,R,d]``, ``s [B,R,d_sig]`` -> updated ``u [B,R,d]`` (residual).
+
+        Implemented as a **segment softmax over cells grouped by row**, not as dense ``[B,R,M,S]``
+        attention. Every cell belongs to exactly one row, so of a dense score tensor precisely `1/R`
+        of the entries survive the membership mask — at B=256, R=160, M=4, S=512 that is 84M scores
+        (~336 MB fp32, kept for backward, twice) of which 99.4% are `-inf`. The grouped form computes
+        the same softmax over the same sets in ``[B,S,M]``, so it is exact rather than an
+        approximation; `test_row_pool.py` pins it against `_membership` above.
+
+        One honest cost: the two `index_add` reductions use CUDA atomics, so this path is
+        run-to-run non-deterministic in the last bits where the einsum was not. That is covered by
+        `seed_everything(..., deterministic_torch=True)`, which has deterministic implementations for
+        both.
+        """
         B, R, _ = u.shape
-        member = self._membership(cb, R)                                  # [B,R,S]
+        S = h.shape[1]
+        M, dh = self.slots, self.d_h
+        n_groups = B * R
+        valid, flat_g = self._groups(cb, R)                               # [B,S], [B*S]
 
         if self.mode == "mean":
-            cnt = member.sum(-1, keepdim=True).clamp_min(1)
-            return u + (member.to(h.dtype) @ h) / cnt
+            d = h.shape[-1]
+            w = valid.to(h.dtype).unsqueeze(-1)
+            acc = h.new_zeros(n_groups, d).index_add(0, flat_g, (h * w).reshape(-1, d))
+            cnt = h.new_zeros(n_groups).index_add(0, flat_g, w.reshape(-1)).clamp_min(1)
+            return u + (acc / cnt.unsqueeze(-1)).view(B, R, d)
 
         q_in = {"signature": s, "hidden": u, "hybrid": torch.cat([u, s], dim=-1)}[self.mode]
-        q = self.w_q(q_in).view(B, R, self.slots, self.d_h)               # [B,R,M,dh]
+        q = self.w_q(q_in).view(B, R, M, dh)                              # [B,R,M,dh]
         k = self.w_k(self.col_name_emb[cb.col_idxs.clamp_min(0)])         # [B,S,dh]
         v = self.w_v(h)                                                   # [B,S,dh]
 
-        scores = torch.einsum("brmd,bsd->brms", q, k) / self.d_h ** 0.5
-        scores = scores.masked_fill(~member.unsqueeze(2), float("-inf"))
-        # a row with no cells would be all -inf -> NaN after softmax; zero it explicitly
-        empty = ~member.any(-1)                                           # [B,R]
-        a = torch.softmax(scores, dim=-1)
-        a = torch.where(empty.view(B, R, 1, 1), torch.zeros_like(a), a)
+        # Each cell scores against ITS OWN row's queries only, so gather q by row rather than
+        # broadcasting it over all R.
+        idx = flat_g.view(B, S) - torch.arange(B, device=h.device).unsqueeze(1) * R
+        q_cell = q.gather(1, idx.view(B, S, 1, 1).expand(B, S, M, dh))    # [B,S,M,dh]
+        scores = torch.matmul(q_cell.reshape(B * S, M, dh),
+                              k.reshape(B * S, dh, 1)).view(B, S, M) / dh ** 0.5
+        # finfo.min rather than -inf: an all-masked group would otherwise give (-inf) - (-inf) = NaN
+        # in the shift below, and NaN survives the zeroing that a finite sentinel does not need.
+        neg = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~valid.unsqueeze(-1), neg)
 
-        pooled = torch.einsum("brms,bsd->brmd", a, v).reshape(B, R, self.slots * self.d_h)
-        return u + self.w_o(pooled)
+        gm = scores.new_full((n_groups, M), neg).scatter_reduce(
+            0, flat_g.unsqueeze(-1).expand(-1, M), scores.detach().reshape(-1, M),
+            reduce="amax", include_self=True)
+        e = torch.exp(scores - gm.index_select(0, flat_g).view(B, S, M))
+        e = torch.where(valid.unsqueeze(-1), e, torch.zeros_like(e))
+        den = e.new_zeros(n_groups, M).index_add(0, flat_g, e.reshape(-1, M))
+        # a row with no cells has den == 0 and no valid cell pointing at it -> its pooled value stays
+        # exactly 0, which is what the dense path's explicit `empty` zeroing did.
+        a = e / den.index_select(0, flat_g).view(B, S, M).clamp_min(torch.finfo(e.dtype).tiny)
+
+        contrib = torch.matmul(a.reshape(B * S, M, 1), v.reshape(B * S, 1, dh))   # [B*S,M,dh]
+        pooled = contrib.new_zeros(n_groups, M, dh).index_add(0, flat_g, contrib)
+        return u + self.w_o(pooled.view(B, R, M * dh))
 
 
 class RowAttention(nn.Module):
