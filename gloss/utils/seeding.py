@@ -14,6 +14,12 @@ def seed_everything(seed: int = 0, *, deterministic_torch: bool = False) -> int:
     that assert exact numerical invariances, e.g. scale-equivariance).
     """
     os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic_torch:
+        # cuBLAS picks a reduction split per call from a shared workspace; without a pinned workspace
+        # its GEMMs stay non-reproducible and `use_deterministic_algorithms` raises on them. Read once
+        # when the cuBLAS handle is created (first matmul), so it must be set before any CUDA work —
+        # which is why it lives here and not at the call site.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     try:

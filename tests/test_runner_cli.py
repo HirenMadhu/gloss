@@ -81,9 +81,39 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         "lr_set": "default", "optimizer": "adamw", "weight_decay": 0.01,
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
         "grid_set": "default", "patience": 3, "recency_channel": "off",
+        "select": "argmax", "select_window": 5, "deterministic": False,
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
+
+
+def test_select_flags_reach_train_prebuilt_and_the_record(monkeypatch, tmp_path):
+    """`--select` must reach the TRAINER, not only the JSON.
+
+    Same failure class as the dead `x_channel_diagnostics` and §9.3: a knob that is parsed and stamped
+    on the record but dropped before the call produces a directory of runs labelled `select=ma` that
+    every one of them ran `argmax`. That is worse than not having the flag, because the label lies.
+    """
+    rg = _load("run_gridsearch")
+    from gloss.train.finetune import SELECT_MODES
+
+    seen = {}
+    monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
+
+    def run(*extra):
+        seen.clear()
+        monkeypatch.setattr(sys, "argv", ["run_gridsearch.py", "--index", "0",
+                                          "--out-dir", str(tmp_path), *extra])
+        return rg.main()
+
+    assert run("--select", "ma", "--select-window", "7", "--deterministic") == 0
+    assert seen["select"] == "ma" and seen["select_window"] == 7 and seen["deterministic"] is True
+
+    # every implemented mode must be reachable from the CLI, and nothing else may be
+    for mode in SELECT_MODES:
+        assert run("--select", mode) == 0 and seen["select"] == mode
+    with pytest.raises(SystemExit):
+        run("--select", "movingaverage")
 
 
 def test_task_set_changes_the_index_mapping_consistently(monkeypatch, tmp_path):
@@ -356,3 +386,27 @@ def test_recency_channel_arm_reaches_the_model_kwargs_not_just_the_record(monkey
             pass
         if seen:                       # only asserts when the run got far enough to build kwargs
             assert seen.get("recency_channel") == arm
+
+
+@pytest.mark.parametrize("fn_name", ["router_diagnostics", "x_channel_diagnostics"])
+def test_diagnostics_helpers_resolve_every_name_they_reference(fn_name):
+    """A diagnostic that raises NameError is caught by its own guard and reported as a *string*, so
+    the run succeeds and the instrumentation is simply absent.
+
+    `x_channel_diagnostics` shipped referencing `make_loader`/`to_cell_batch`, which are imported
+    INSIDE `router_diagnostics` and therefore not module-level names. Every completed x-arm recorded
+    `x_channel_error: NameError(...)` instead of kappa/alpha -- the two numbers that decide whether
+    the arm tested the hypothesis at all. Compile-time name resolution catches this without a GPU.
+    """
+    import inspect
+
+    rg = _load("run_gridsearch")
+    fn = getattr(rg, fn_name)
+    src = inspect.getsource(fn)
+    local_imports = {n for n in ("make_loader", "to_cell_batch", "expert_usage",
+                                 "mean_active_experts", "specialization_probe", "torch", "math")
+                     if f"import {n}" in src or f", {n}" in src or f"{n},\n" in src}
+    referenced = {n for n in ("make_loader", "to_cell_batch") if f"{n}(" in src}
+    missing = {n for n in referenced
+               if n not in local_imports and n not in fn.__globals__ and n not in dir(rg)}
+    assert not missing, f"{fn_name} references undefined name(s) {missing}"

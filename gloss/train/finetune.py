@@ -80,32 +80,137 @@ def target_clamp(task, lo_pct: float = 2.0, hi_pct: float = 98.0) -> tuple[float
     return float(lo), float(hi)
 
 
-class _BestValState(pl.Callback):
-    """Keep the best-val model weights (in memory, on CPU — no disk checkpoint) and the val metrics at
-    that epoch, so a run reports / evaluates its best-val model rather than the last epoch."""
+SELECT_MODES = ("argmax", "ma", "swa")
 
-    def __init__(self, monitor: str, mode: str):
+
+class _BestValState(pl.Callback):
+    """Keep the selected model weights (in memory, on CPU — no disk checkpoint) and the val metrics at
+    that epoch, so a run reports / evaluates a val-selected model rather than the last epoch.
+
+    **Everything here reads VAL only.** TEST is still touched exactly once, afterwards, on whatever
+    checkpoint this picks (`eval/test_eval.py`); `select` changes *which* val statistic is maximised,
+    never *what* the selection is allowed to see.
+
+    ``select``:
+
+    ``argmax``
+        The historical behaviour: the single best-val epoch.
+    ``ma``
+        Select on a ``window``-epoch **moving average** of the monitored metric, and restore the
+        weights of the window's *centre* epoch.
+    ``swa``
+        **Average the weights** of the ``window`` best-val epochs.
+
+    Why anything other than ``argmax``: ``val(t) = signal(t) + noise(t)``, and an argmax over ~80
+    epochs preferentially lands on epochs whose *noise* was large and positive. That is a max-of-noise
+    estimator — it both overestimates val and makes the choice unstable, which is how a last-bit CUDA
+    difference (`utils/seeding.py`, `deterministic_torch`) turns into a 2.12 AUC test swing across two
+    runs at the same seed. Averaging ``window`` adjacent epochs cuts the noise variance ~``window``x
+    while barely blurring a signal that moves slowly late in training.
+
+    ``swa`` weight-averaging is safe here only because every norm in the model is ``RMSNorm`` — there
+    are no running batch statistics to invalidate. Its val metrics are unknown until the averaged
+    weights are re-scored, which `train_prebuilt` does with one extra val pass.
+    """
+
+    def __init__(self, monitor: str, mode: str, *, select: str = "argmax", window: int = 3):
+        if select not in SELECT_MODES:
+            raise ValueError(f"unknown select {select!r}; expected one of {SELECT_MODES}")
+        if window < 1:
+            raise ValueError(f"select window must be >= 1, got {window}")
         self.monitor = monitor
         self.mode = mode
-        self.best_score: float | None = None
+        self.select = select
+        self.window = 1 if select == "argmax" else window
+        self.best_score: float | None = None          # the SELECTED score (smoothed under `ma`)
         self.best_state: dict | None = None
         self.best_metrics: dict = {}
+        self.raw_best_score: float | None = None      # always the plain argmax, kept as a fallback
+        self._raw_best: tuple[dict, dict] | None = None
+        self._ring: list[tuple[float, dict, dict]] = []   # `ma`: the last `window` epochs
+        self._top: list[tuple[float, dict, dict]] = []    # `swa`: the `window` best epochs
+        self.n_scored = 0
+        self._done = False
+
+    def _better(self, a: float, b: float | None) -> bool:
+        return b is None or (a > b if self.mode == "max" else a < b)
+
+    @staticmethod
+    def _snapshot(pl_module, trainer) -> tuple[dict, dict]:
+        state = {k: v.detach().cpu().clone() for k, v in pl_module.state_dict().items()}
+        metrics = {k: float(v) for k, v in trainer.callback_metrics.items() if k.startswith("val/")}
+        return state, metrics
 
     def on_validation_end(self, trainer, pl_module) -> None:
+        # `swa` re-scores its averaged weights with a post-fit `trainer.validate`, which fires this
+        # hook again. Without the latch that pass would enter the ring/top-k as if it were another
+        # training epoch and could overwrite the very selection it was called to measure.
+        if self._done:
+            return
         score = trainer.callback_metrics.get(self.monitor)
         if score is None:
             return
         score = float(score)
         if score != score:                       # NaN guard (e.g. single-class val subsample)
             return
-        better = self.best_score is None or (
-            score > self.best_score if self.mode == "max" else score < self.best_score
-        )
-        if better:
-            self.best_score = score
-            self.best_state = {k: v.detach().cpu().clone() for k, v in pl_module.state_dict().items()}
-            self.best_metrics = {k: float(v) for k, v in trainer.callback_metrics.items()
-                                 if k.startswith("val/")}
+        self.n_scored += 1
+
+        # `ma` needs every epoch's weights (the centre of a window that only becomes best later);
+        # `argmax`/`swa` only ever need an epoch that is currently good enough to keep, so they clone
+        # conditionally — a full CPU clone is ~120 MB at 30M params and is not worth doing 80x.
+        snap = None
+        if self.select == "ma":
+            snap = self._snapshot(pl_module, trainer)
+            self._ring.append((score, *snap))
+            del self._ring[:-self.window]
+            if len(self._ring) == self.window:
+                smoothed = sum(s for s, _, _ in self._ring) / self.window
+                if self._better(smoothed, self.best_score):
+                    self.best_score = smoothed
+                    _, self.best_state, self.best_metrics = self._ring[self.window // 2]
+        elif self.select == "swa":
+            # the WORST of the kept set: smallest score when maximising, largest when minimising
+            worst = min(self._top, key=lambda t: -t[0] if self.mode == "min" else t[0],
+                        default=None)
+            if len(self._top) < self.window or self._better(score, worst[0]):
+                snap = self._snapshot(pl_module, trainer)
+                self._top.append((score, *snap))
+                self._top.sort(key=lambda t: -t[0] if self.mode == "max" else t[0])
+                del self._top[self.window:]
+
+        if self._better(score, self.raw_best_score):
+            self.raw_best_score = score
+            self._raw_best = snap or self._snapshot(pl_module, trainer)
+            if self.select == "argmax":
+                self.best_score = score
+                self.best_state, self.best_metrics = self._raw_best
+
+    def finalize(self) -> bool:
+        """Resolve the selection. Returns True iff the weights need a fresh val pass to be scored.
+
+        Falls back to the plain argmax whenever the chosen mode had too few epochs to act on — a run
+        that early-stops after 2 epochs must still return a model, not None.
+        """
+        self._done = True
+        if self.select == "swa" and len(self._top) > 1:
+            states = [s for _, s, _ in self._top]
+            avg = {}
+            for k, v in states[0].items():
+                if v.is_floating_point():
+                    acc = v.double().clone()
+                    for other in states[1:]:
+                        acc += other[k].double()
+                    avg[k] = (acc / len(states)).to(v.dtype)
+                else:
+                    avg[k] = v.clone()          # ints/bools (e.g. step counters) take the best epoch's
+            self.best_state = avg
+            self.best_score = self._top[0][0]
+            self.best_metrics = {}              # unknown until the averaged model is re-scored
+            return True
+        if self.best_state is None and self._raw_best is not None:
+            self.best_score = self.raw_best_score
+            self.best_state, self.best_metrics = self._raw_best
+        return False
 
 
 def train_prebuilt(
@@ -137,12 +242,15 @@ def train_prebuilt(
     target_scaling: str = "zscore",
     clamp_pct: float | None = None,
     accumulate_grad_batches: int = 1,
+    select: str = "argmax",
+    select_window: int = 3,
+    deterministic: bool = False,
 ):
     """Train one run on a PREBUILT bundle + name table (the ablation reuses these across arms so the
     graph and the frozen name embeddings are built once)."""
     from ..utils.seeding import seed_everything
 
-    seed_everything(seed)
+    seed_everything(seed, deterministic_torch=deterministic)
     kind = task_kind(task)
     # `raw` trains on the unstandardized target (GelGT does this). Under L1 that is only a per-task
     # rescale of the loss — i.e. a different EFFECTIVE lr per task — not a different optimum; under
@@ -170,7 +278,7 @@ def train_prebuilt(
     # early-stop on the primary metric. The held-out TEST eval (eval/test_eval.py) then scores the best-val
     # model. No disk checkpoint — MoRELitModule.__init__ takes the (unserializable) bundle + name table.
     monitor, mode = ("val/auroc", "max") if kind == "binary" else ("val/mae", "min")
-    best = _BestValState(monitor, mode)
+    best = _BestValState(monitor, mode, select=select, window=select_window)
     callbacks: list = [best]
     if early_stop:
         callbacks.append(pl.callbacks.EarlyStopping(monitor=monitor, mode=mode, patience=patience,
@@ -193,9 +301,22 @@ def train_prebuilt(
     trainer.fit(module, dm)
     module.clamp = clamp          # carried to the TEST eval (eval/test_eval.py)
     metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
+    needs_rescore = best.finalize()
     if best.best_state is not None:
-        module.load_state_dict(best.best_state)      # restore best-val weights for downstream TEST eval
-        metrics.update(best.best_metrics)            # report best-val (not last-epoch) val metrics
+        module.load_state_dict(best.best_state)      # restore selected weights for downstream TEST eval
+        metrics.update(best.best_metrics)            # report selected-epoch (not last-epoch) val metrics
+    if needs_rescore:
+        # `swa` produced weights no epoch ever had, so its val metrics do not exist yet. Score them
+        # on VAL (never test) so cross-config selection still compares like with like.
+        trainer.validate(module, dm, verbose=False)
+        metrics.update({k: float(v) for k, v in trainer.callback_metrics.items()
+                        if k.startswith("val/")})
+    metrics["select/mode"] = float(SELECT_MODES.index(select))
+    metrics["select/n_epochs_scored"] = float(best.n_scored)
+    if best.raw_best_score is not None:
+        # The plain argmax kept alongside the selected score: the gap between them is the size of the
+        # max-of-noise bias this mode is meant to remove, measured per run rather than assumed.
+        metrics["select/raw_best"] = float(best.raw_best_score)
     return module, metrics
 
 

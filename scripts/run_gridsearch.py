@@ -229,6 +229,9 @@ def x_channel_diagnostics(module, bundle, task, *, seq_len: int, max_fk: int,
     """
     import torch
 
+    from gloss.data.collate import to_cell_batch
+    from gloss.data.graph import make_loader
+
     try:
         model = module.model
         ch = getattr(getattr(model, "substrate", None), "x_channel", None)
@@ -270,7 +273,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               target_scaling: str = "zscore", clamp_pct: float | None = None,
               batch_size: int | None = None, accum: int = 1,
               grid_set: str = "default", patience: int = 3,
-              recency_channel: str = "off") -> dict:
+              recency_channel: str = "off", select: str = "argmax",
+              select_window: int = 5, deterministic: bool = False) -> dict:
     import numpy as np
     import torch
 
@@ -323,7 +327,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                 seed=seed, num_workers=num_workers, lr=lr, regression_loss=regression_loss,
                 binary_loss=binary_loss, optimizer=optimizer, weight_decay=weight_decay,
                 target_scaling=target_scaling, clamp_pct=clamp_pct, accumulate_grad_batches=accum,
-                patience=patience,
+                patience=patience, select=select, select_window=select_window,
+                deterministic=deterministic,
             )
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -347,10 +352,19 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # A large-batch arm is defined as much by its epoch budget as by its batch size.
            "epochs": epochs, "patience": patience, "grid_set": grid_set,
            "recency_channel": recency_channel,
+           # Which VAL statistic chose the checkpoint. Two records with the same config and different
+           # `select` are different experiments, and without this stamp they are indistinguishable —
+           # the same gap that made epochs/patience un-stamped runs unreadable above.
+           "select": select, "select_window": select_window, "deterministic": deterministic,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
     rec.update({f"val_{k.split('/')[-1]}": v for k, v in metrics.items() if k.startswith("val/")})
+    # `select_raw_best` is the plain argmax score alongside the selected one: their gap MEASURES the
+    # max-of-noise bias per run instead of assuming it, so a `select` arm can be judged on whether the
+    # bias it removes was real.
+    rec.update({f"select_{k.split('/')[-1]}": v for k, v in metrics.items()
+                if k.startswith("select/") and k != "select/mode"})
     rec.update(router_diagnostics(module, bundle, task, seq_len=seq_len, max_fk=max_fk,
                                   batch_size=bs))
     if recency_channel != "off":
@@ -451,6 +465,11 @@ def aggregate(out_dir: Path) -> str:
 
 
 def main() -> int:
+    # Imported here, not at module scope: `--list` must stay fast, and `finetune` pulls in
+    # pytorch_lightning. Taking the tuple from the source of truth keeps the CLI choices from drifting
+    # out of sync with the modes the callback actually implements.
+    from gloss.train.finetune import SELECT_MODES
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", type=int, default=None)
     ap.add_argument("--list", action="store_true", help="print array size and exit")
@@ -505,6 +524,20 @@ def main() -> int:
     ap.add_argument("--bin-loss", default="bce", choices=["bce", "auc"],
                     help="binary objective (regression tasks ignore it). bce = every result before "
                          "2026-07-31; auc is a pairwise squared-hinge AUROC surrogate")
+    # VAL-only checkpoint selection. Test is still read exactly once, afterwards, on whatever this
+    # picks — `select` changes which val statistic is maximised, never what selection may see.
+    ap.add_argument("--select", default="argmax", choices=list(SELECT_MODES),
+                    help="val checkpoint selection. argmax = every result before 2026-08-08, and a "
+                         "max-of-noise estimator over ~80 epochs; ma = moving average of the monitored "
+                         "val metric, keep the window's centre epoch; swa = average the weights of the "
+                         "window best-val epochs. Does NOT change index->job: use a new --out-dir")
+    ap.add_argument("--select-window", type=int, default=5,
+                    help="epochs in the ma/swa window. Smoothing helps up to a point and then hurts "
+                         "(a window spanning the optimum blurs it); 5 measured best for ma, 3 for swa")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="force deterministic CUDA kernels. Slower, but pins the atomicAdd summation "
+                         "order that otherwise makes two runs at the SAME seed diverge — run it twice "
+                         "against two non-deterministic runs to size that noise floor")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
 
@@ -534,7 +567,8 @@ def main() -> int:
                     weight_decay=args.weight_decay, target_scaling=args.target_scaling,
                     clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum,
                     grid_set=args.grid_set, patience=args.patience,
-                    recency_channel=args.recency_channel)
+                    recency_channel=args.recency_channel, select=args.select,
+                    select_window=args.select_window, deterministic=args.deterministic)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0
