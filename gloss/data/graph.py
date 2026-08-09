@@ -30,20 +30,66 @@ MP_PAD, MP_SELF, MP_MULTIHOP = 0, 1, 2
 FK_NONE = 0  # fk_role_id for self / non-adjacent / >1-hop pairs
 
 
-def _patch_multiembedding_offset() -> None:
-    """Repair a ``MultiEmbeddingTensor`` whose leading ``offset`` is non-zero before torch_frame's
-    ``validate`` asserts ``offset[0]==0`` and crashes the batch.
+_MET_REREAD_TRIES = 3
 
-    With ``num_workers>0`` (DataLoader IPC), rel-event embedding columns occasionally come back from a
-    worker with the column ``offset`` shifted by a constant while the ``values`` buffer is intact — a
-    serialization/view artifact (``num_workers=0`` never triggers it; the stored TensorFrames are clean).
-    Column ``j``'s embedding is ``values[:, offset[j]:offset[j+1]]``, so subtracting ``offset[0]`` and
-    keeping the referenced value-columns is **content-preserving**: per-column embeddings are byte-identical.
-    It is a strict **no-op** when ``offset[0]==0`` (every normal batch), so it can only turn a crash into
-    the correct result — never change a batch that already succeeds. Genuinely corrupt METs (values shorter
-    than the offsets reference) raise a **diagnostic** ``RuntimeError`` carrying the actual layout rather
-    than being silently repaired — see the ``else`` branch below for why the message, not a print, is
-    the only thing that escapes a worker.
+#: Per-process tally of which repair path fired. **Not** aggregated across DataLoader workers (each
+#: is its own process and its counters die with it), so this is only readable under
+#: ``num_workers=0`` — which is exactly the configuration you reproduce this bug in.
+MET_REPAIRS = {"reread": 0, "rebase": 0}
+
+
+def met_repair_counts() -> dict[str, int]:
+    """Copy of :data:`MET_REPAIRS`. A non-zero ``rebase`` means embeddings were *rewritten*."""
+    return dict(MET_REPAIRS)
+
+
+def _met_failed_checks(off, values, num_cols) -> list[str]:
+    """torch_frame's four ``MultiEmbeddingTensor.validate`` asserts, named and evaluated one by one.
+
+    Upstream ``validate`` is a bare ``assert`` chain, so a failure says only "an assert fired". Naming
+    them is what produced the diagnosis in the docstring below: on 2026-08-08 four jobs died there
+    against tensors that satisfy **all four**.
+    """
+    bad: list[str] = []
+    n = 0 if num_cols is None else int(num_cols)
+    if off is None or off.numel() == 0 or int(off.reshape(-1)[0]) != 0:
+        bad.append("offset[0]==0")
+    # upstream uses `len(offset)`, which raises TypeError on a 0-dim tensor rather than asserting —
+    # so read size(0) defensively and let the `offset.ndim==1` check below name that case instead.
+    if off is None or off.ndim < 1 or off.shape[0] != n + 1:
+        bad.append("len(offset)==num_cols+1")
+    if off is None or off.ndim != 1:
+        bad.append("offset.ndim==1")
+    if values is None or not (values.ndim == 2 or values.numel() == 0):
+        bad.append("values.ndim==2 or values.numel()==0")
+    return bad
+
+
+def _patch_multiembedding_offset() -> None:
+    """Survive a ``MultiEmbeddingTensor`` that fails torch_frame's ``validate`` under ``num_workers>0``.
+
+    **Re-read before repairing.** The original patch assumed the leading ``offset`` was genuinely
+    shifted by a constant and rebased it. The 2026-08-08 failures falsify that premise: four jobs
+    (``29054792_7``, ``29054796_1``, ``29054798_{1,5}``) raised out of ``validate`` while the dumped
+    layout satisfied every one of the four asserts —
+
+    ``offset=[0,32,64,96,128] num_cols=4 values=(512,128)`` and three like it.
+
+    An assert cannot fail on a tensor that satisfies it, so the tensor's **storage changed between
+    the assert and the dump**: a DataLoader shared-memory reuse race (which also explains why this
+    is exclusive to ``num_workers>0`` and why the stored TensorFrames are clean on disk). That makes
+    the transient garbage read, not a shifted offset, the likely cause of the *original* symptom too
+    — in which case every rebase this patch performed silently rewrote correct embeddings.
+
+    So the order is now: **check → re-read → rebase → raise**, and re-reading is tried first because
+    it cannot corrupt anything (it reads the same storage a second time), whereas rebasing can. The
+    rebase is kept as a last resort but is now narrowed to the case where ``offset[0]==0`` is the
+    *only* surviving failure, and it bumps :data:`MET_REPAIRS` so a run can tell whether it happened.
+
+    Column ``j``'s embedding is ``values[:, offset[j]:offset[j+1]]``, so when a rebase is genuinely
+    warranted, subtracting ``offset[0]`` and keeping the referenced value-columns is content-preserving.
+    Anything that survives all three stages raises a **diagnostic** ``RuntimeError`` naming the failed
+    checks — an exception is the only thing that crosses the worker boundary; ``print`` does not.
     Forked DataLoader workers inherit this patch (applied at import, before any loader is built)."""
     try:
         from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor as _MET
@@ -54,70 +100,83 @@ def _patch_multiembedding_offset() -> None:
     _orig_validate = _MET.validate
 
     def _validate(self):
-        # Column j's embedding is values[:, offset[j]:offset[j+1]]; the per-column dims (offset diffs) and
-        # the values buffer are intact, only offset's base is shifted by k. Rebasing offset by k restores
-        # offset[0]==0 content-preservingly. Two observed value layouts (T = true total dim = offset[-1]-k):
-        #   * values width == T      : buffer already correct, just rebase offset (the common rel-event case)
+        nc = getattr(self, "num_cols", None)
+        first = _met_failed_checks(self.offset, self.values, nc)
+        if not first:
+            return _orig_validate(self)          # the overwhelmingly common path, untouched
+
+        # --- 1. RE-READ. A shared-memory race resolves in microseconds, so a fresh read of the same
+        # storage is usually already correct. `.clone()` is the re-read; it can only observe the
+        # buffer a second time, never alter it, which is why it is tried before any repair.
+        for _ in range(_MET_REREAD_TRIES):
+            off = self.offset
+            if off is None:
+                break
+            fresh = off.clone()
+            if not _met_failed_checks(fresh, self.values, nc):
+                # Pin the good read: `_row_index_select` forwards `offset` by reference, so leaving
+                # the racy tensor in place would hand the same hazard to every child.
+                object.__setattr__(self, "offset", fresh)
+                MET_REPAIRS["reread"] += 1
+                return _orig_validate(self)
+
+        # --- 2. REBASE (last resort). Only when a persistently non-zero base is the *sole* problem;
+        # any other broken invariant means the tensor is not merely shifted and a rebase would be a
+        # guess. T = true total dim = offset[-1] - k. Two value layouts have ever been observed:
+        #   * values width == T      : buffer already correct, just rebase offset
         #   * values width == k + T  : k orphan leading value-columns, drop them then rebase
-        # Any other width is genuinely inconsistent -> fall through to the original assertion (no silent fix).
         off = self.offset
-        if off is not None and off.numel() and int(off[0]) != 0:
+        bad = _met_failed_checks(off, self.values, nc)
+        if not bad:
+            # Healed between the loop's `.clone()` and this read — same race, one beat later.
+            MET_REPAIRS["reread"] += 1
+            return _orig_validate(self)
+        if bad == ["offset[0]==0"] and off is not None and off.numel():
             k = int(off[0])
             if off.numel() == 1:
-                # ZERO-COLUMN MET. torch_frame's own `validate` requires
-                # `len(offset) == num_cols + 1`, so a 1-element offset means num_cols == 0: there is
-                # no column whose embedding `values[:, offset[j]:offset[j+1]]` could be addressed, so
-                # rebasing to [0] cannot lose data — there is no data. `values` is left untouched
-                # (nothing indexes it) and still satisfies `ndim == 2 or numel() == 0`.
-                #
-                # This case used to fall through the `numel() >= 2` guard straight into
-                # `assert self.offset[0] == 0`, and it is what killed 29030571_{15,25,71} — three
-                # rel-event grid tasks, on three different configs. `_row_index_select` forwards the
-                # parent's `offset` verbatim, so a rebased parent hands its non-zero base down.
+                # ZERO-COLUMN MET: `len(offset) == num_cols + 1` with a 1-element offset means
+                # num_cols == 0, so no column's embedding can be addressed and rebasing to [0] cannot
+                # lose data — there is none. `values` is untouched and still satisfies its check.
+                # This case killed 29030571_{15,25,71} before it was handled.
                 object.__setattr__(self, "offset", off - k)
+                MET_REPAIRS["rebase"] += 1
                 return _orig_validate(self)
-            T = int(off[-1]) - k; w = int(self.values.shape[1])
+            T = int(off[-1]) - k
+            w = int(self.values.shape[1])
             if w == k + T:
                 object.__setattr__(self, "values", self.values[:, k:])
                 object.__setattr__(self, "offset", off - k)
-            elif w == T:
+                MET_REPAIRS["rebase"] += 1
+                return _orig_validate(self)
+            if w == T:
                 object.__setattr__(self, "offset", off - k)
-            else:
-                # Still un-normalisable. torch_frame's own `assert self.offset[0] == 0` would fire next
-                # with no numbers attached, and inside a DataLoader worker that is all the log ever
-                # shows — which is why four grid runs told us nothing. Raise the layout instead:
-                # exceptions cross the worker boundary with their message, `print()` does not.
-                raise RuntimeError(
-                    "MultiEmbeddingTensor offset could not be rebased (unrecognised layout): "
-                    f"n_cols={int(off.numel()) - 1} k={k} T={T} values={tuple(self.values.shape)} "
-                    f"w-T={w - T} w-(k+T)={w - (k + T)} "
-                    f"col_dims={(off[1:] - off[:-1]).tolist()[:8]}. "
-                    "This only occurs with num_workers>0 (a DataLoader IPC artifact); rerun with "
-                    "--num-workers 0 to get past it, and extend _patch_multiembedding_offset for the "
-                    "layout above once it is understood. Do NOT guess a repair — a wrong rebase "
-                    "silently corrupts embeddings instead of crashing."
-                )
-        try:
-            return _orig_validate(self)
-        except AssertionError as exc:
-            # We got here with the guard above NOT firing, i.e. `int(off[0]) == 0`, yet torch_frame's
-            # `assert self.offset[0] == 0` still failed. Those two cannot both be true of the same
-            # tensor, so the premise is wrong somewhere and guessing a repair would be the second
-            # wrong guess on this bug. Dump the state instead — worker stdout is discarded, so it has
-            # to ride on the exception. 11 tasks across 5 arrays died here AFTER the zero-column fix.
-            off_now = self.offset
+                MET_REPAIRS["rebase"] += 1
+                return _orig_validate(self)
             raise RuntimeError(
-                "MultiEmbeddingTensor validate() failed AFTER the offset patch let it through: "
-                f"offset={None if off_now is None else off_now.tolist()[:8]} "
-                f"dtype={None if off_now is None else off_now.dtype} "
-                f"shape={None if off_now is None else tuple(off_now.shape)} "
-                f"numel={None if off_now is None else int(off_now.numel())} "
-                f"values={None if self.values is None else tuple(self.values.shape)} "
-                f"num_cols={getattr(self, 'num_cols', None)} "
-                f"num_rows={getattr(self, 'num_rows', None)} "
-                f"guard_saw={None if off_now is None or not off_now.numel() else int(off_now[0])}. "
-                "Do NOT guess a repair from this message alone — read the layout first."
-            ) from exc
+                "MultiEmbeddingTensor offset could not be rebased (unrecognised layout): "
+                f"n_cols={int(off.numel()) - 1} k={k} T={T} values={tuple(self.values.shape)} "
+                f"w-T={w - T} w-(k+T)={w - (k + T)} "
+                f"col_dims={(off[1:] - off[:-1]).tolist()[:8]}. "
+                f"survived {_MET_REREAD_TRIES} re-reads, so this is not the shared-memory race. "
+                "Rerun with --num-workers 0 to get past it, and extend _patch_multiembedding_offset "
+                "for the layout above once it is understood. Do NOT guess a repair — a wrong rebase "
+                "silently corrupts embeddings instead of crashing."
+            )
+
+        # --- 3. GIVE UP, loudly and with the layout attached.
+        raise RuntimeError(
+            "MultiEmbeddingTensor.validate() failed and neither a re-read nor a rebase fixed it. "
+            f"failed_checks_on_entry={first} failed_checks_after_{_MET_REREAD_TRIES}_rereads={bad} "
+            f"offset={None if off is None else off.tolist()[:8]} "
+            f"dtype={None if off is None else off.dtype} "
+            f"shape={None if off is None else tuple(off.shape)} "
+            f"values={None if self.values is None else tuple(self.values.shape)} "
+            f"num_cols={nc} num_rows={getattr(self, 'num_rows', None)} "
+            f"repairs_so_far={met_repair_counts()}. "
+            "An EMPTY failed_checks list means the tensor was valid by the time it was inspected — "
+            "that is the shared-memory race, and the re-read loop above is what should have caught "
+            "it. Do NOT guess a repair from this message alone."
+        )
 
     _MET.validate = _validate
     _MET._gloss_offset_patch = True
