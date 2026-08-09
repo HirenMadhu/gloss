@@ -345,6 +345,27 @@ def test_list_and_run_path_agree_on_the_grid_set(monkeypatch, tmp_path, capsys):
     assert seen.get("epochs") == 80
 
 
+def test_every_experiment_defining_knob_is_stamped_on_the_record():
+    """A knob that changes what gets trained but not what gets written makes two different
+    experiments indistinguishable in their JSON.
+
+    `seq_len` went un-stamped for the whole project because it was effectively a constant; the
+    moment the max-S arrays gave each DB its own cap it became the axis the experiment was *about*,
+    and every record would have been silently unreadable. This generalises that: any new `run_index`
+    parameter that describes the experiment must land on the record, and the test names it if not.
+    """
+    import inspect
+
+    rg = _load("run_gridsearch")
+    src = inspect.getsource(rg.run_index)
+    # these describe HOW the job was run, not WHAT experiment it is: rerunning with more workers or
+    # into a different directory does not make it a different measurement
+    exempt = {"index", "out_dir", "num_workers", "seeds"}
+    missing = [p for p in inspect.signature(rg.run_index).parameters
+               if p not in exempt and f'"{p}"' not in src]
+    assert not missing, f"run_index knobs never written to the record: {missing}"
+
+
 def test_router_diagnostics_never_kills_a_run_and_reports_collapse():
     """The diagnostic is bolted onto a run whose real product is the test metric, so a failure inside
     it must degrade to a recorded string, not an exception — otherwise wiring in a *measurement*

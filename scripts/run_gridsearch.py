@@ -361,6 +361,12 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # The attention backend is numerically equivalent but not bit-identical, so two records
            # that differ only here are still different measurements — stamp it like the rest.
            "cell_attn_backend": cell_attn_backend,
+           # seq_len went un-stamped until 2026-08-09, when it stopped being a global constant: the
+           # max-S arrays give each DB its own cap (rel-f1 384, rel-trial 384, rel-event 3456, from
+           # the measured max cells/seed). Without this, a 3456 run and a 512 run are identical in
+           # the JSON while differing on the one axis the experiment is about — the same gap that
+           # made epochs/patience-unstamped runs unreadable.
+           "seq_len": seq_len, "max_fk": max_fk,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
