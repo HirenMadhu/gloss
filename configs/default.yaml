@@ -57,6 +57,10 @@ model:
     cell:
       attention: four_mask     # four_mask (Phase 0a) | full (Phase 0b: 4 score matrices -> 1)
       rope_time: false         # Phase 1 t2 turns this on
+      # HOW that attention is computed, not WHICH mask it uses. flex needs attention: full, and
+      # gives up bit-exact --deterministic (its backward uses atomics). Its payoff scales with the
+      # block grid: ~1.2-1.3x end-to-end at seq_len 512, but it is what makes 1536 affordable.
+      backend: sdpa            # sdpa | flex   (gloss/model/flex_cell.py)
       # cell.ffn is NOT a switch here: it follows moe.route_on, because the cell MoE is the EXISTING
       # mechanism and stays unchanged. The MoE lives at BOTH levels (§3.7).
     row:

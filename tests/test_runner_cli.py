@@ -82,6 +82,7 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
         "grid_set": "default", "patience": 3, "recency_channel": "off",
         "select": "argmax", "select_window": 5, "deterministic": False,
+        "cell_attn_backend": "sdpa",
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -108,6 +109,13 @@ def test_select_flags_reach_train_prebuilt_and_the_record(monkeypatch, tmp_path)
 
     assert run("--select", "ma", "--select-window", "7", "--deterministic") == 0
     assert seen["select"] == "ma" and seen["select_window"] == 7 and seen["deterministic"] is True
+
+    assert run("--cell-attn-backend", "flex") == 0
+    assert seen["cell_attn_backend"] == "flex"
+    # flex's backward accumulates with atomics, so a run stamped `deterministic: true` while using
+    # it would be claiming a reproducibility it does not have. Refuse the combination outright.
+    with pytest.raises(SystemExit):
+        run("--cell-attn-backend", "flex", "--deterministic")
 
     # every implemented mode must be reachable from the CLI, and nothing else may be
     for mode in SELECT_MODES:
@@ -386,6 +394,35 @@ def test_recency_channel_arm_reaches_the_model_kwargs_not_just_the_record(monkey
             pass
         if seen:                       # only asserts when the run got far enough to build kwargs
             assert seen.get("recency_channel") == arm
+
+
+def test_cell_attn_backend_reaches_the_model_kwargs_not_just_the_record(monkeypatch, tmp_path):
+    """Same §9.3 guard for the attention backend.
+
+    This one fails quietly in the *opposite* direction from the x-channel: a dropped
+    `cell_attn_backend` means the flex run silently trains on SDPA, so it neither crashes nor
+    changes the numbers — it just reports a memory/throughput win that never happened, which is the
+    entire reason for running it.
+    """
+    import scripts.run_gridsearch as rg
+
+    seen = {}
+
+    def fake_train_prebuilt(bundle, task, name_emb, **kw):
+        seen.update(kw.get("model_kwargs", {}))
+        raise RuntimeError("stop after model_kwargs are assembled")
+
+    monkeypatch.setattr("gloss.train.finetune.train_prebuilt", fake_train_prebuilt, raising=False)
+    for backend in ("sdpa", "flex"):
+        seen.clear()
+        try:
+            rg.run_index(0, seeds=1, epochs=1, num_workers=0, seq_len=32, max_fk=2,
+                         out_dir=tmp_path / backend, arch="two_level",
+                         cell_attn_backend=backend)
+        except Exception:
+            pass
+        if seen:
+            assert seen.get("cell_attn_backend") == backend
 
 
 @pytest.mark.parametrize("fn_name", ["router_diagnostics", "x_channel_diagnostics"])

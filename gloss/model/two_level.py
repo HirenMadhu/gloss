@@ -26,10 +26,17 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .flex_cell import (FLEX_MIN_HEAD_DIM, HAS_FLEX, build_cell_block_mask, cell_score_mod,
+                        flex_cell_attention)
 from .moe import MoEFFN, SwiGLU
 from .row_level import Broadcast, RMSNorm, RowAttention, RowMoE, RowPool, RowSignature
 from .rt_substrate import REL_ORDER, MaskedAttention, build_relational_masks
 from .time_encoding import TimeLadder
+
+#: How the cell attention is *computed*. Orthogonal to ``cell_attention``, which is what mask
+#: topology it computes: ``four_mask`` is RT's four masks, ``full`` is the single collapsed one, and
+#: only ``full`` has a flex backend (the four-mask path is Phase 0a's frozen RT parity guard).
+CELL_BACKENDS = ("sdpa", "flex")
 
 
 class CellAttention(nn.Module):
@@ -49,27 +56,43 @@ class CellAttention(nn.Module):
       packing is where the rest of the win is.
     """
 
-    def __init__(self, d_model: int, n_heads: int, ladder: TimeLadder, *, rope_time: bool = True):
+    def __init__(self, d_model: int, n_heads: int, ladder: TimeLadder, *, rope_time: bool = True,
+                 backend: str = "sdpa"):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
+        if backend not in CELL_BACKENDS:
+            raise ValueError(f"unknown cell_attn_backend {backend!r}; expected one of {CELL_BACKENDS}")
+        if backend == "flex" and not HAS_FLEX:
+            raise RuntimeError("cell_attn_backend='flex' needs torch>=2.5 with flex_attention")
+        if backend == "flex" and d_model // n_heads < FLEX_MIN_HEAD_DIM:
+            # `tl.dot` cannot take an embedding dim below 16, and inductor only says so ~40 lines
+            # into a lowering dump, at the first backward of a training run. Say it here instead.
+            # d_model=128/n_heads=8 sits exactly on the limit; halving d_model or doubling the heads
+            # from the current grid would cross it.
+            raise ValueError(
+                f"cell_attn_backend='flex' needs d_model//n_heads >= {FLEX_MIN_HEAD_DIM}, got "
+                f"{d_model}//{n_heads} = {d_model // n_heads}. Use fewer heads, a wider d_model, "
+                f"or backend='sdpa'."
+            )
         self.h = n_heads
         self.d_h = d_model // n_heads
         self.ladder = ladder
         self.rope_time = rope_time
+        self.backend = backend
         self.n_rot = min(2 * ladder.n_freq, self.d_h - self.d_h % 2)
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: Tensor, cb) -> Tensor:
+    def forward(self, x: Tensor, cb, block_mask=None) -> Tensor:
         B, S, _ = x.shape
         q = self.wq(x).view(B, S, self.h, self.d_h).transpose(1, 2)
         k = self.wk(x).view(B, S, self.h, self.d_h).transpose(1, 2)
         v = self.wv(x).view(B, S, self.h, self.d_h).transpose(1, 2)
 
-        bias = None
+        clamped = None
         if self.rope_time:
             tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time)
             theta = self.ladder.theta(tau, cb.is_timed)              # [B,S,n_freq]
@@ -79,6 +102,22 @@ class CellAttention(nn.Module):
             # theta=0 alone reads as "Delta=0, maximally recent" for untimed cells AND for cells
             # whose Delta was clamped (§9.10); the additive flags are what separate the three states.
             clamped = self.ladder.was_clamped(cb.seed_time.unsqueeze(1), cb.row_time) & cb.is_timed
+
+        if self.backend == "flex":
+            # The bias is an outer product of two per-token boolean vectors, so flex expresses it as
+            # a score_mod and never builds the [B,S,S] tensor the SDPA path below has to.
+            if block_mask is None:
+                block_mask = build_cell_block_mask(cb.is_padding)
+            score_mod = None
+            if clamped is not None:
+                score_mod = cell_score_mod(cb.is_timed, clamped,
+                                           self.ladder.b_untimed, self.ladder.b_clamped,
+                                           dtype=x.dtype)
+            out = flex_cell_attention(q, k, v, block_mask=block_mask, score_mod=score_mod)
+            return self.wo(out.transpose(1, 2).reshape(B, S, -1))
+
+        bias = None
+        if clamped is not None:
             bias = self.ladder.time_bias(cb.is_timed, cb.is_timed,
                                          clamped, clamped).unsqueeze(1).to(x.dtype)
 
@@ -109,6 +148,7 @@ class TwoLevelBlock(nn.Module):
         n_heads: int = 8,
         cell_attention: str = "full",
         cell_rope_time: bool = True,
+        cell_attn_backend: str = "sdpa",
         cell_ffn: str = "moe",
         cell_route_dim: int | None = None,
         cell_num_experts: int = 4,
@@ -128,6 +168,11 @@ class TwoLevelBlock(nn.Module):
         super().__init__()
         if cell_attention not in ("full", "four_mask"):
             raise ValueError(f"unknown cell.attention {cell_attention!r}")
+        if cell_attn_backend == "flex" and cell_attention != "full":
+            raise ValueError(
+                "cell_attn_backend='flex' requires cell_attention='full'. The four_mask path is "
+                "Phase 0a's RT parity guard and must stay byte-comparable to rt_substrate.py."
+            )
         self.cell_attention = cell_attention
         self.cell_ffn_mode = cell_ffn
         self.row_ffn_mode = row_ffn
@@ -135,7 +180,8 @@ class TwoLevelBlock(nn.Module):
         # --- 1. cell attention ---
         self.cell_norm = RMSNorm(d_model)
         if cell_attention == "full":
-            self.cell_attn = CellAttention(d_model, n_heads, ladder, rope_time=cell_rope_time)
+            self.cell_attn = CellAttention(d_model, n_heads, ladder, rope_time=cell_rope_time,
+                                           backend=cell_attn_backend)
         else:
             # Phase 0a: keep RT's four masked attentions verbatim, so the only change is row tokens
             self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model) for l in REL_ORDER})
@@ -162,11 +208,11 @@ class TwoLevelBlock(nn.Module):
             self.row_ffn = SwiGLU(d_model, d_ff)
         self.broadcast = Broadcast(d_model, mode=broadcast)
 
-    def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, masks=None):
+    def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, masks=None, block_mask=None):
         """-> ``(h, u, aux_cell, aux_row, diag)``. Aux is split by LEVEL, deliberately."""
         # 1. cell attention
         if self.cell_attention == "full":
-            h = h + self.cell_attn(self.cell_norm(h), cb)
+            h = h + self.cell_attn(self.cell_norm(h), cb, block_mask)
         else:
             for l in REL_ORDER:
                 h = h + self.attns[l](self.norms[l](h), masks[l])
@@ -248,6 +294,9 @@ class TwoLevelSubstrate(nn.Module):
             for _ in range(n_blocks)
         )
         self.needs_masks = block_kw.get("cell_attention", "full") == "four_mask"
+        # Padding does not change between blocks, and `create_block_mask` is the expensive part of
+        # the flex path — so it is built once per FORWARD here and handed to every block.
+        self.needs_block_mask = block_kw.get("cell_attn_backend", "sdpa") == "flex"
 
     def _init_rows(self, h: Tensor, s: Tensor, cb) -> Tensor:
         B, R, _ = s.shape
@@ -264,6 +313,7 @@ class TwoLevelSubstrate(nn.Module):
             h_x, x_diag = self.x_channel(cb)          # already scaled by alpha (init 0)
             u = u + h_x
         masks = build_relational_masks(cb) if self.needs_masks else None
+        block_mask = build_cell_block_mask(cb.is_padding) if self.needs_block_mask else None
 
         h = x
         aux = x.new_zeros(())
@@ -271,7 +321,7 @@ class TwoLevelSubstrate(nn.Module):
         aux_row_total = x.new_zeros(())
         diags: list[dict] = []
         for blk in self.blocks:
-            h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, masks)
+            h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, masks, block_mask)
             aux_cell_total = aux_cell_total + aux_cell
             aux_row_total = aux_row_total + aux_row
             diags.append(diag)

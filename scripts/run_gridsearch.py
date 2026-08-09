@@ -274,7 +274,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               batch_size: int | None = None, accum: int = 1,
               grid_set: str = "default", patience: int = 3,
               recency_channel: str = "off", select: str = "argmax",
-              select_window: int = 5, deterministic: bool = False) -> dict:
+              select_window: int = 5, deterministic: bool = False,
+              cell_attn_backend: str = "sdpa") -> dict:
     import numpy as np
     import torch
 
@@ -316,6 +317,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                   role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
                   **TWO_LEVEL_PHASES[phase])
         mk["recency_channel"] = recency_channel
+        mk["cell_attn_backend"] = cell_attn_backend
 
     bs = batch_size or init_batch(cfg)
     module = metrics = None
@@ -356,6 +358,9 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # `select` are different experiments, and without this stamp they are indistinguishable —
            # the same gap that made epochs/patience un-stamped runs unreadable above.
            "select": select, "select_window": select_window, "deterministic": deterministic,
+           # The attention backend is numerically equivalent but not bit-identical, so two records
+           # that differ only here are still different measurements — stamp it like the rest.
+           "cell_attn_backend": cell_attn_backend,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
@@ -468,6 +473,7 @@ def main() -> int:
     # Imported here, not at module scope: `--list` must stay fast, and `finetune` pulls in
     # pytorch_lightning. Taking the tuple from the source of truth keeps the CLI choices from drifting
     # out of sync with the modes the callback actually implements.
+    from gloss.model.two_level import CELL_BACKENDS
     from gloss.train.finetune import SELECT_MODES
 
     ap = argparse.ArgumentParser()
@@ -538,8 +544,18 @@ def main() -> int:
                     help="force deterministic CUDA kernels. Slower, but pins the atomicAdd summation "
                          "order that otherwise makes two runs at the SAME seed diverge — run it twice "
                          "against two non-deterministic runs to size that noise floor")
+    ap.add_argument("--cell-attn-backend", default="sdpa", choices=list(CELL_BACKENDS),
+                    help="how the cell attention is computed (two_level + cell_attention=full only). "
+                         "flex drops the [B,S,S] bias+mask tensors and skips all-padding blocks; it "
+                         "is numerically equivalent but NOT bit-identical, and not compatible with "
+                         "--deterministic. The win scales with seq_len, so it matters at 1024+")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
+    if args.deterministic and args.cell_attn_backend == "flex":
+        # flex's backward accumulates with atomics, so the run would silently not be reproducible
+        # while the record claims `deterministic: true`. Refuse rather than stamp a false claim.
+        ap.error("--deterministic and --cell-attn-backend flex are mutually exclusive: flex's "
+                 "backward uses atomics and cannot be made bit-exact")
 
     out_dir = Path(args.out_dir)
     if not out_dir.is_absolute():
@@ -568,7 +584,8 @@ def main() -> int:
                     clamp_pct=args.clamp_pct, batch_size=args.batch_size, accum=args.accum,
                     grid_set=args.grid_set, patience=args.patience,
                     recency_channel=args.recency_channel, select=args.select,
-                    select_window=args.select_window, deterministic=args.deterministic)
+                    select_window=args.select_window, deterministic=args.deterministic,
+                    cell_attn_backend=args.cell_attn_backend)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0
