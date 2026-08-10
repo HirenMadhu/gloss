@@ -275,7 +275,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
               grid_set: str = "default", patience: int = 3,
               recency_channel: str = "off", select: str = "argmax",
               select_window: int = 5, deterministic: bool = False,
-              cell_attn_backend: str = "sdpa") -> dict:
+              cell_attn_backend: str = "sdpa", broadcast: str | None = None) -> dict:
     import numpy as np
     import torch
 
@@ -318,6 +318,8 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
                   **TWO_LEVEL_PHASES[phase])
         mk["recency_channel"] = recency_channel
         mk["cell_attn_backend"] = cell_attn_backend
+        if broadcast:                      # None = keep whatever the phase preset chose
+            mk["broadcast"] = broadcast
 
     bs = batch_size or init_batch(cfg)
     module = metrics = None
@@ -366,7 +368,7 @@ def run_index(index, *, seeds, epochs, num_workers, seq_len, max_fk, out_dir,
            # the measured max cells/seed). Without this, a 3456 run and a 512 run are identical in
            # the JSON while differing on the one axis the experiment is about — the same gap that
            # made epochs/patience-unstamped runs unreadable.
-           "seq_len": seq_len, "max_fk": max_fk,
+           "seq_len": seq_len, "max_fk": max_fk, "broadcast": broadcast,
            "task_set": task_set, **cfg, "k": 2}
     if arch == "two_level":
         rec["phase"] = phase
@@ -479,7 +481,7 @@ def main() -> int:
     # Imported here, not at module scope: `--list` must stay fast, and `finetune` pulls in
     # pytorch_lightning. Taking the tuple from the source of truth keeps the CLI choices from drifting
     # out of sync with the modes the callback actually implements.
-    from gloss.model.two_level import CELL_BACKENDS
+    from gloss.model.two_level import BROADCAST_MODES, CELL_BACKENDS
     from gloss.train.finetune import SELECT_MODES
 
     ap = argparse.ArgumentParser()
@@ -555,6 +557,12 @@ def main() -> int:
                          "flex drops the [B,S,S] bias+mask tensors and skips all-padding blocks; it "
                          "is numerically equivalent but NOT bit-identical, and not compatible with "
                          "--deterministic. The win scales with seq_len, so it matters at 1024+")
+    ap.add_argument("--broadcast", default=None, choices=list(BROADCAST_MODES),
+                    help="how the row level writes back to cells (two_level only); overrides the "
+                         "phase preset. `attention` replaces the additive own-row broadcast with "
+                         "row->cell cross-attention, so a cell can weight a PARTICULAR "
+                         "FK-adjacent row instead of receiving one pre-averaged vector. Read "
+                         "r2c_own_row_mass in the record: ~1.0 means it collapsed back to additive")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
     if args.deterministic and args.cell_attn_backend == "flex":
@@ -591,7 +599,7 @@ def main() -> int:
                     grid_set=args.grid_set, patience=args.patience,
                     recency_channel=args.recency_channel, select=args.select,
                     select_window=args.select_window, deterministic=args.deterministic,
-                    cell_attn_backend=args.cell_attn_backend)
+                    cell_attn_backend=args.cell_attn_backend, broadcast=args.broadcast)
     print({k: rec.get(k) for k in ("config_idx", "dataset", "task", "seed", "task_type",
                                    "batch_size", "test_roc_auc", "test_nmae")})
     return 0

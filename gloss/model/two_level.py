@@ -29,7 +29,8 @@ from torch import Tensor, nn
 from .flex_cell import (FLEX_MIN_HEAD_DIM, HAS_FLEX, build_cell_block_mask, cell_score_mod,
                         flex_cell_attention)
 from .moe import MoEFFN, SwiGLU
-from .row_level import Broadcast, RMSNorm, RowAttention, RowMoE, RowPool, RowSignature
+from .row_level import (Broadcast, RMSNorm, RowAttention, RowMoE, RowPool, RowSignature,
+                        RowToCellAttention)
 from .rt_substrate import REL_ORDER, MaskedAttention, build_relational_masks
 from .time_encoding import TimeLadder
 
@@ -37,6 +38,10 @@ from .time_encoding import TimeLadder
 #: topology it computes: ``four_mask`` is RT's four masks, ``full`` is the single collapsed one, and
 #: only ``full`` has a flex backend (the four-mask path is Phase 0a's frozen RT parity guard).
 CELL_BACKENDS = ("sdpa", "flex")
+
+#: How the row level writes back to cells (§3.6). ``additive``/``film``/``none`` hand every cell of a
+#: row the same vector; ``attention`` lets the cell choose which FK-adjacent row to read.
+BROADCAST_MODES = ("additive", "film", "none", "attention")
 
 
 class CellAttention(nn.Module):
@@ -206,7 +211,15 @@ class TwoLevelBlock(nn.Module):
         else:
             self.row_ffn_norm = RMSNorm(d_model)
             self.row_ffn = SwiGLU(d_model, d_ff)
-        self.broadcast = Broadcast(d_model, mode=broadcast)
+        # `attention` is the only mode that returns a diag, so the block branches on it below rather
+        # than on isinstance — keep the two in step if a third stateful mode ever appears.
+        self.broadcast_mode = broadcast
+        if broadcast == "attention":
+            self.broadcast = RowToCellAttention(d_model, d_sig, role_name_emb, ladder,
+                                                n_heads=n_heads, role_bias=role_bias,
+                                                time_bias=time_bias)
+        else:
+            self.broadcast = Broadcast(d_model, mode=broadcast)
 
     def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, masks=None, block_mask=None):
         """-> ``(h, u, aux_cell, aux_row, diag)``. Aux is split by LEVEL, deliberately."""
@@ -242,7 +255,11 @@ class TwoLevelBlock(nn.Module):
             aux_row = u.new_zeros(())
 
         # 6. high -> low
-        h = self.broadcast(h, u, cb)
+        if self.broadcast_mode == "attention":
+            h, b_diag = self.broadcast(h, u, cb)
+            diag = {**diag, **b_diag}
+        else:
+            h = self.broadcast(h, u, cb)
         return h, u, aux_cell, aux_row, diag
 
 

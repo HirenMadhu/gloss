@@ -82,7 +82,7 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
         "grid_set": "default", "patience": 3, "recency_channel": "off",
         "select": "argmax", "select_window": 5, "deterministic": False,
-        "cell_attn_backend": "sdpa",
+        "cell_attn_backend": "sdpa", "broadcast": None,
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -112,6 +112,10 @@ def test_select_flags_reach_train_prebuilt_and_the_record(monkeypatch, tmp_path)
 
     assert run("--cell-attn-backend", "flex") == 0
     assert seen["cell_attn_backend"] == "flex"
+
+    # None (not "additive") is the default, so the phase preset stays in charge unless overridden
+    assert run() == 0 and seen["broadcast"] is None
+    assert run("--broadcast", "attention") == 0 and seen["broadcast"] == "attention"
     # flex's backward accumulates with atomics, so a run stamped `deterministic: true` while using
     # it would be claiming a reproducibility it does not have. Refuse the combination outright.
     with pytest.raises(SystemExit):

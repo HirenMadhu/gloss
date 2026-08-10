@@ -73,7 +73,12 @@ model:
       top_k: 2
       lambda_ortho: 0.5
       lambda_balance: 0.01     # M·Σ_e f_e p_e, over VALID rows only
-    broadcast: additive        # additive | film | none
+    # additive/film/none hand every cell of a row the SAME vector — its own row's, already averaged
+    # over neighbours by row attention, so a cell cannot ask for a particular neighbour. `attention`
+    # makes step 6 a real row->cell cross-attention (cells query, rows are keys/values, masked to
+    # FK-adjacent rows, same name-derived gamma as row attention). Read `r2c_own_row_mass`: ~1.0
+    # means the cell ignored its neighbours and this collapsed back to additive.
+    broadcast: additive        # additive | film | none | attention
     head:
       mode: row_token          # row_token (§3.8) | seed_cells (kept for the Phase 0 parity check)
 
