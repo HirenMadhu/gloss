@@ -83,8 +83,16 @@ LR_SETS = {"default": TWO_LEVEL_LR, "extended": [1.0e-4, 3.0e-4, 1.0e-3], "singl
 #: budget compromise, it is required for the experiment to mean anything on the binary tasks: the
 #: pairwise AUC surrogate forms its pairs WITHIN a batch, so accum=2 at batch 256 would leave the
 #: pair count at 256's level while looking like 512 in the record.
+#: `large` is 256/4 alone (d_ff = 1024). It exists because the max-S arrays all ran `small`, and the
+#: pooled cross-grid table shows the best-ever result on 3 of the 9 tasks — both rel-f1 binaries and
+#: user-ignore — came from 256/4, with user-ignore going 83.72 -> 89.77 against 128/2. So the
+#: reported max-S numbers may be measuring an under-capacity model rather than the architecture.
+#: NOTE the batch-size interaction the `small` docstring above describes still applies in reverse:
+#: 256/4 OOMs above batch 256, so a `large` run cannot hold batch 512 fixed, and the pairwise AUC
+#: surrogate's pair count moves with it. A `large` binary number is therefore NOT paired with a
+#: `small` one at batch 512 — it is comparable to the leaderboard, not to our own 128/2 arm.
 GRID_SETS = {"default": list(itertools.product(TWO_LEVEL_D_MODEL, TWO_LEVEL_N_BLOCKS)),
-             "small": [(128, 2)]}
+             "small": [(128, 2)], "large": [(256, 4)]}
 
 
 def two_level_grid(lr_set: str = "default", grid_set: str = "default") -> list[dict]:

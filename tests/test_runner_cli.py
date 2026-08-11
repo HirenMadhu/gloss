@@ -327,6 +327,15 @@ def test_default_grid_set_is_the_shape_product_so_queued_arrays_keep_their_index
         (128, 2, 3e-4), (128, 2, 1e-3), (128, 2, 3e-3)]
     assert len(rg.jobs(1, "two_level", "all", "scaled", "small")) == 27
     assert rg.LR_SETS["scaled"][0] == 3.0e-4, "keep the unscaled lr as an in-arm control"
+    # the capacity arm: 256/4, d_ff = 4*d_model = 1024. Adding a KEY is index-safe (the maps of
+    # `default`/`small` are untouched); editing either of those lists would not be.
+    assert rg.GRID_SETS["large"] == [(256, 4)]
+    assert [(c["d_model"], c["n_blocks"], c["d_ff"], c["enc_channels"], c["lr"])
+            for c in rg.two_level_grid("single", "large")] == [(256, 4, 1024, 256, 3e-4)]
+    # the capacity arm must be index-COMPATIBLE with the max-S `small` arm it is compared against,
+    # or the two out-dirs' 00000.json files are different (dataset, task, seed) and the join is wrong
+    assert ([j[2:] for j in rg.jobs(3, "two_level", "all", "single", "large")]
+            == [j[2:] for j in rg.jobs(3, "two_level", "all", "single", "small")])
     with pytest.raises(ValueError, match="unknown grid_set"):
         rg.two_level_grid("default", "nope")
 
