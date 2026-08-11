@@ -102,6 +102,66 @@ def test_a_transient_failure_is_repaired_by_reread_not_rebase(monkeypatch):
     assert torch.equal(met.values, values), "a re-read repair must not touch the value buffer"
 
 
+def test_upstream_asserting_on_a_tensor_our_checks_accept_is_retried(monkeypatch):
+    """The 29063436_{25,26} failure, as a test.
+
+    Our pre-check read ``offset[0]`` and saw 0; torch_frame's ``validate`` read the *same tensor*
+    microseconds later and saw non-zero, and the AssertionError propagated because the "our checks
+    passed" branch called upstream unguarded. Two reads of one tensor disagreeing is itself the proof
+    of the race, so there is no fast path that can skip the retry — which is what this pins.
+    """
+    calls = {"n": 0}
+    real = G._MET_ORIG_VALIDATE
+
+    def flaky(met):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AssertionError                 # upstream's bare `assert self.offset[0] == 0`
+        return real(met)
+
+    monkeypatch.setattr(G, "_MET_ORIG_VALIDATE", flaky)
+    values = torch.randn(8, 64)
+    met = make_met([0, 32, 64], values.clone())
+
+    assert calls["n"] == 2, "upstream was not retried"
+    assert G.MET_REPAIRS == {"reread": 1, "rebase": 0}
+    assert torch.equal(met.offset, torch.tensor([0, 32, 64]))
+    assert torch.equal(met.values, values), "a retry must not touch the value buffer"
+
+
+def test_a_retry_detaches_the_offset_from_the_shared_segment(monkeypatch):
+    """`_row_index_select` forwards `offset` by reference, so leaving the racy tensor in place would
+    hand the identical hazard to every child. The repaired tensor must be a private copy."""
+    calls = {"n": 0}
+    real = G._MET_ORIG_VALIDATE
+
+    def flaky(met):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AssertionError
+        return real(met)
+
+    monkeypatch.setattr(G, "_MET_ORIG_VALIDATE", flaky)
+    off = torch.tensor([0, 32, 64])
+    met = MET(num_rows=8, num_cols=2, values=torch.randn(8, 64), offset=off)
+    assert met.offset is not off
+    assert met.offset.data_ptr() != off.data_ptr()
+
+
+def test_a_permanently_asserting_tensor_still_raises_rather_than_looping(monkeypatch):
+    """The retry is bounded: a genuinely broken tensor must surface, not spin."""
+    calls = {"n": 0}
+
+    def always(met):
+        calls["n"] += 1
+        raise AssertionError
+
+    monkeypatch.setattr(G, "_MET_ORIG_VALIDATE", always)
+    with pytest.raises(RuntimeError, match="neither a re-read nor a rebase"):
+        make_met([0, 32, 64], torch.randn(8, 64))
+    assert calls["n"] == G._MET_REREAD_TRIES
+
+
 def test_a_persistent_shift_still_rebases_and_preserves_each_column():
     """When the base really is shifted and stays shifted, the old repair is still available."""
     values = torch.randn(8, 64)                       # w == T == 64, so only the base moves

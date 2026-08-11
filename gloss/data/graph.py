@@ -30,7 +30,13 @@ MP_PAD, MP_SELF, MP_MULTIHOP = 0, 1, 2
 FK_NONE = 0  # fk_role_id for self / non-adjacent / >1-hop pairs
 
 
-_MET_REREAD_TRIES = 3
+_MET_REREAD_TRIES = 8
+
+#: torch_frame's own ``MultiEmbeddingTensor.validate``, captured when the patch is installed. It lives
+#: at module scope rather than in the closure so a test can make it raise on a tensor our own checks
+#: accept — which is the ``29063436_{25,26}`` failure, and is not reproducible by patching
+#: :func:`_met_failed_checks`.
+_MET_ORIG_VALIDATE = None
 
 #: Per-process tally of which repair path fired. **Not** aggregated across DataLoader workers (each
 #: is its own process and its counters die with it), so this is only readable under
@@ -97,28 +103,41 @@ def _patch_multiembedding_offset() -> None:
         return
     if getattr(_MET, "_gloss_offset_patch", False):
         return
-    _orig_validate = _MET.validate
+    global _MET_ORIG_VALIDATE
+    _MET_ORIG_VALIDATE = _MET.validate
 
     def _validate(self):
         nc = getattr(self, "num_cols", None)
         first = _met_failed_checks(self.offset, self.values, nc)
-        if not first:
-            return _orig_validate(self)          # the overwhelmingly common path, untouched
+        raced = bool(first)
 
-        # --- 1. RE-READ. A shared-memory race resolves in microseconds, so a fresh read of the same
-        # storage is usually already correct. `.clone()` is the re-read; it can only observe the
-        # buffer a second time, never alter it, which is why it is tried before any repair.
+        # --- 1. VALIDATE, RETRYING THROUGH THE RACE.
+        # The retry has to wrap torch_frame's `validate` itself, not merely precede it. An earlier
+        # version only retried when OUR checks failed and called upstream unguarded otherwise — and
+        # 29063436_{25,26} died exactly there: our read of `offset[0]` saw 0, upstream's read of the
+        # SAME tensor saw non-zero microseconds later. Two reads of one tensor disagreeing is proof
+        # of the race on its own, and it means "our checks passed" is not a safe fast path.
+        #
+        # `.clone()` is the re-read. It cannot corrupt anything (it only observes the storage a
+        # second time) and it also DETACHES us from the shared segment, so every later reader —
+        # including the children `_row_index_select` hands this offset to by reference — sees a
+        # stable value instead of the same hazard.
         for _ in range(_MET_REREAD_TRIES):
-            off = self.offset
-            if off is None:
-                break
-            fresh = off.clone()
-            if not _met_failed_checks(fresh, self.values, nc):
-                # Pin the good read: `_row_index_select` forwards `offset` by reference, so leaving
-                # the racy tensor in place would hand the same hazard to every child.
-                object.__setattr__(self, "offset", fresh)
-                MET_REPAIRS["reread"] += 1
-                return _orig_validate(self)
+            if _met_failed_checks(self.offset, self.values, nc):
+                if self.offset is None:
+                    break
+                object.__setattr__(self, "offset", self.offset.clone())
+                continue
+            try:
+                out = _MET_ORIG_VALIDATE(self)
+                if raced:
+                    MET_REPAIRS["reread"] += 1
+                return out
+            except AssertionError:
+                raced = True
+                if self.offset is None:
+                    break
+                object.__setattr__(self, "offset", self.offset.clone())
 
         # --- 2. REBASE (last resort). Only when a persistently non-zero base is the *sole* problem;
         # any other broken invariant means the tensor is not merely shifted and a rebase would be a
@@ -127,10 +146,6 @@ def _patch_multiembedding_offset() -> None:
         #   * values width == k + T  : k orphan leading value-columns, drop them then rebase
         off = self.offset
         bad = _met_failed_checks(off, self.values, nc)
-        if not bad:
-            # Healed between the loop's `.clone()` and this read — same race, one beat later.
-            MET_REPAIRS["reread"] += 1
-            return _orig_validate(self)
         if bad == ["offset[0]==0"] and off is not None and off.numel():
             k = int(off[0])
             if off.numel() == 1:
@@ -140,18 +155,18 @@ def _patch_multiembedding_offset() -> None:
                 # This case killed 29030571_{15,25,71} before it was handled.
                 object.__setattr__(self, "offset", off - k)
                 MET_REPAIRS["rebase"] += 1
-                return _orig_validate(self)
+                return _MET_ORIG_VALIDATE(self)
             T = int(off[-1]) - k
             w = int(self.values.shape[1])
             if w == k + T:
                 object.__setattr__(self, "values", self.values[:, k:])
                 object.__setattr__(self, "offset", off - k)
                 MET_REPAIRS["rebase"] += 1
-                return _orig_validate(self)
+                return _MET_ORIG_VALIDATE(self)
             if w == T:
                 object.__setattr__(self, "offset", off - k)
                 MET_REPAIRS["rebase"] += 1
-                return _orig_validate(self)
+                return _MET_ORIG_VALIDATE(self)
             raise RuntimeError(
                 "MultiEmbeddingTensor offset could not be rebased (unrecognised layout): "
                 f"n_cols={int(off.numel()) - 1} k={k} T={T} values={tuple(self.values.shape)} "
@@ -173,9 +188,10 @@ def _patch_multiembedding_offset() -> None:
             f"values={None if self.values is None else tuple(self.values.shape)} "
             f"num_cols={nc} num_rows={getattr(self, 'num_rows', None)} "
             f"repairs_so_far={met_repair_counts()}. "
-            "An EMPTY failed_checks list means the tensor was valid by the time it was inspected — "
-            "that is the shared-memory race, and the re-read loop above is what should have caught "
-            "it. Do NOT guess a repair from this message alone."
+            f"An EMPTY failed_checks list means torch_frame's validate asserted "
+            f"{_MET_REREAD_TRIES} times running on a tensor that reads as valid to us — a "
+            "PERSISTENT disagreement, not the transient shared-memory race the loop above absorbs, "
+            "so re-reading will not help and the premise needs re-deriving. Do NOT guess a repair."
         )
 
     _MET.validate = _validate
