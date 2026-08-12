@@ -24,10 +24,17 @@ from ..data.graph import GraphBundle
 from ..text.schema import build_column_modality_ids
 from .column_encoder import CellEncoder
 from .heads import RowTokenHead
+from .schema_free_encoder import SchemaFreeCellEncoder
 from .signature import RelationalSignature
 from .two_level import TwoLevelSubstrate
 
 ROUTE_ONS = ("signature", "dense")
+
+#: How a cell's VALUE is projected. ``per_column`` is torch_frame's stype encoders, which keep
+#: per-column weights (10.6M on rel-trial at d_text=384) and therefore cannot transfer; ``schema_free``
+#: shares one projection per datatype, RT-style, leaving zero learned parameters sized by the schema.
+#: ``per_column`` stays the default because every reported result was measured on it.
+CELL_ENCODERS = ("per_column", "schema_free")
 
 
 class MoRE(nn.Module):
@@ -48,11 +55,15 @@ class MoRE(nn.Module):
         k: int = 2,
         table_name_emb=None,
         role_name_emb=None,
+        cat_name_emb=None,
+        cell_encoder: str = "per_column",
         max_hop: int = 8,
         **two_level_kw,
     ):
         super().__init__()
         assert route_on in ROUTE_ONS, f"unknown route_on={route_on!r}"
+        if cell_encoder not in CELL_ENCODERS:
+            raise ValueError(f"unknown cell_encoder {cell_encoder!r}; expected {CELL_ENCODERS}")
         if table_name_emb is None or role_name_emb is None:
             raise ValueError(
                 "MoRE needs table_name_emb and role_name_emb (build them with "
@@ -60,7 +71,13 @@ class MoRE(nn.Module):
                 "scripts/build_schema_cache.py caches them)."
             )
         self.route_on = route_on
-        self.encoder = CellEncoder(bundle, name_emb, d_model=d_model, enc_channels=enc_channels)
+        self.cell_encoder_kind = cell_encoder
+        if cell_encoder == "schema_free":
+            self.encoder = SchemaFreeCellEncoder(bundle, name_emb, cat_name_emb,
+                                                 d_model=d_model, enc_channels=enc_channels)
+        else:
+            self.encoder = CellEncoder(bundle, name_emb, d_model=d_model,
+                                       enc_channels=enc_channels)
         modality_id, n_stypes = build_column_modality_ids(bundle)
         self.signature = RelationalSignature(name_emb, modality_id, n_stypes, d_sig=d_sig)
         self.substrate = TwoLevelSubstrate(
@@ -80,6 +97,10 @@ class MoRE(nn.Module):
         Exposed so :class:`~gloss.model.mlm_head.MaskedCellHead` can tie its logits to it instead of
         owning a vocabulary-shaped output layer of its own.
         """
+        if self.cell_encoder_kind == "schema_free":
+            # One frozen, schema-independent table of category-LABEL embeddings, so the decode head
+            # scores against real semantics on a database it never saw instead of untrained vectors.
+            return self.encoder.category_table(node_type)
         enc = self.encoder.cell_encoders
         if node_type not in enc:
             return None

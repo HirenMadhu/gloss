@@ -131,6 +131,14 @@ def build_column_target_spec(bundle, cell_encoder=None) -> ColumnTargetSpec:
 
     vocab = column_vocab(bundle)
     C = len(vocab)
+    # The schema-free encoder ties to ONE global, frozen category-label table and already publishes
+    # the per-column base as a [C] buffer; torch_frame's encoder instead uses per-TABLE offsets into
+    # a learned per-table embedding. Both are "where this column's classes start", but in different
+    # tables, so the head must be told which one it is scoring against.
+    global_cat_base = getattr(cell_encoder, "cat_base", None)
+    if global_cat_base is not None and int(global_cat_base.numel()) != C:
+        global_cat_base = None
+
     maskable = torch.zeros(C, dtype=torch.bool)
     stype = torch.zeros(C, dtype=torch.long)
     within = torch.full((C,), -1, dtype=torch.long)
@@ -148,7 +156,8 @@ def build_column_target_spec(bundle, cell_encoder=None) -> ColumnTargetSpec:
         tf = bundle.data[nt].tf
         stats = bundle.col_stats_dict[nt]
         tid = bundle.node_type_id[nt]
-        offsets = _cat_offsets(cell_encoder, nt) if cell_encoder is not None else None
+        offsets = (None if global_cat_base is not None or cell_encoder is None
+                   else _cat_offsets(cell_encoder, nt))
         running = 1                                # row 0 of the shared table is the NaN slot
         for st, cols in tf.col_names_dict.items():
             sid = stype_id(st)
@@ -175,7 +184,7 @@ def build_column_target_spec(bundle, cell_encoder=None) -> ColumnTargetSpec:
                             f"col_stats cumsum says {running}. The decode head ties its logits to "
                             f"this slice, so a mismatch trains against the wrong classes."
                         )
-                    cat_base[gid] = base
+                    cat_base[gid] = int(global_cat_base[gid]) if global_cat_base is not None else base
                     running += k
                     maskable[gid] = k >= 2
 

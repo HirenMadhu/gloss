@@ -47,13 +47,16 @@ class MaskedCellHead(nn.Module):
     """
 
     def __init__(self, d_model: int, enc_channels: int, *, lambda_cat: float = 1.0,
-                 huber_delta: float = 1.0):
+                 huber_delta: float = 1.0, d_cat: int | None = None):
         super().__init__()
         self.lambda_cat = lambda_cat
         self.huber_delta = huber_delta
         self.norm = RMSNorm(d_model)
         self.num_head = nn.Linear(d_model, 1)
-        self.cat_proj = nn.Linear(d_model, enc_channels)
+        # `d_cat` is the width of the table the logits tie to: `enc_channels` for torch_frame's
+        # learned per-DB category embedding, or `d_text` for the schema-free encoder's frozen
+        # category-LABEL table. Either way the head owns no vocabulary-shaped parameter.
+        self.cat_proj = nn.Linear(d_model, d_cat if d_cat is not None else enc_channels)
         # Zero-init the numerical decoder, as RT does: the first prediction is then exactly the
         # column mean (0 in z-space), so early training cannot be dominated by a random readout of a
         # heavy-tailed column.

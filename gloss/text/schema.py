@@ -106,6 +106,55 @@ def role_name_embeddings_with_none(bundle: GraphBundle, encode, *, kind: str = "
     return torch.cat([torch.zeros(1, emb.shape[-1], dtype=emb.dtype), emb], dim=0)
 
 
+# ---------------------------------------------------------------------------------------------
+# Category LABELS as text — the value-side counterpart of the column-name table.
+#
+# torch_frame turns `phase = "Phase 3"` into the integer 4 at materialization and looks 4 up in an
+# `nn.Embedding` learned from scratch **per database**. The string never reaches the model, so index
+# 4 means nothing on any other schema and the categorical path can never transfer. Embedding the
+# label's text instead makes it frozen DATA — regenerable on an unseen database with no gradients,
+# exactly like the column-name table — and puts "Phase 3" near "Phase III" across databases.
+#
+# Cheap: 383 distinct category values across the six built RelBench DBs, ~0.6 MB at d=384.
+# ---------------------------------------------------------------------------------------------
+
+
+def category_value_text(node_type: str, column: str, value) -> str:
+    """The string embedded for one category. Table- and column-qualified, so ``"other"`` under two
+    different columns lands at two different points rather than colliding."""
+    return f"table {node_type}, column {column}, value {value}"
+
+
+def category_index(bundle) -> tuple[dict[tuple[str, str], tuple[int, int]], list[str]]:
+    """-> ``({(table, column): (base, n_cat)}, texts)`` over a **global** category vocabulary.
+
+    Row 0 of the table is reserved for missing/unknown, mirroring torch_frame's own NaN slot, so a
+    category id ``i`` of column ``c`` lives at ``base[c] + i`` and an unseen value can fall back to 0.
+    The offsets are global rather than per-table (torch_frame's are per-table) because the frozen
+    table is one tensor for the whole database.
+    """
+    from torch_frame import categorical
+    from torch_frame.data.stats import StatType
+
+    index: dict[tuple[str, str], tuple[int, int]] = {}
+    texts: list[str] = [""]                                   # row 0 = unknown / missing
+    for nt in bundle.node_types:
+        tf = bundle.data[nt].tf
+        cols = tf.col_names_dict.get(categorical, [])
+        for c in cols:
+            values = bundle.col_stats_dict[nt][c][StatType.COUNT][0]
+            index[(nt, c)] = (len(texts), len(values))
+            texts.extend(category_value_text(nt, c, v) for v in values)
+    return index, texts
+
+
+def build_category_name_embeddings(bundle, encode, *, kind: str = "document") -> Tensor:
+    """Frozen ``[1 + total_categories, d_text]`` table of category-label embeddings (row 0 = zero)."""
+    _index, texts = category_index(bundle)
+    emb = _embed(texts[1:], encode, kind) if len(texts) > 1 else torch.zeros(0, 1)
+    return torch.cat([torch.zeros(1, emb.shape[-1], dtype=emb.dtype), emb], dim=0)
+
+
 def _embed(texts: list[str], encode, kind: str) -> Tensor:
     emb = encode(texts, kind=kind)
     if not torch.is_tensor(emb):

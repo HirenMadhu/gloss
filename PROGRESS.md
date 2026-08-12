@@ -277,3 +277,41 @@ twice.
 *Measured model scale* at 10 blocks / d512 / ff2048 / 8+2 cell / 4+1 row: **513.0M total, 261.3M
 active per token** (dense combine would activate all 513M). With `--num-shared 0` at both levels:
 418.6M / 166.9M. All 10 blocks are structurally identical and carry the full six sublayers.
+
+**Schema-free cell encoder [done].** `gloss/model/schema_free_encoder.py`, selected by
+`MoRE(cell_encoder='schema_free')`; `per_column` stays the default because every reported result was
+measured on it.
+
+The RT cell token `x = W_v·Enc_dtype(v) + W_name·name_c` is unchanged — only the FIRST term moves.
+torch_frame's stype encoders keep **per-column** weights, and at `d_text=384` that is 10.6M on
+rel-trial (2.07% of a 514M model), 96% of it the 47 separate `Linear(384,512)` in
+`LinearEmbeddingEncoder`. None of it can transfer. Now each stype gets ONE shared projection, RT-style
+(`W_d` is datatype-specific, not column-specific), and everything that must stay per-column becomes
+frozen DATA regenerable without gradients: numerical `(v-mu_c)/sigma_c` -> shared `Linear(1,e)`;
+categorical -> frozen **category-LABEL embedding** -> shared `Linear(d_text,e)`; text -> one shared
+`Linear(d_val,e)`; timestamp -> **one GLOBAL year mean/std** for the whole DB (per-column `YEAR_RANGE`
+would feed inconsistent scales through a shared weight) + calendar-cyclic fields.
+
+`text/schema.py` gains `category_index` / `build_category_name_embeddings`: `phase = "Phase 3"` used to
+become the integer 4 and index an `nn.Embedding` learned per database, so the string never reached the
+model and index 4 meant nothing elsewhere. Now it embeds `"table studies, column phase, value Phase 3"`
+with the frozen encoder — the value-side counterpart of the column-name table. **383 distinct category
+values across the six built DBs, ~0.6 MB.** The masked-cell head reties to it (`MaskedCellHead(d_cat=)`)
+and `build_column_target_spec` reads the encoder's global `cat_base` when present.
+
+**Result: a rel-f1 model and a rel-trial model have IDENTICAL state_dicts** — 143 keys each, zero
+non-shared, zero differing shapes — and rel-f1's weights load onto rel-trial with `strict=True`. That
+is stronger than the trunk/adapter split it replaces: LODO re-initializes **nothing**, and Phase 4's
+`SchemaAdapter` is no longer needed. Multi-DB training becomes "same weights, swap the frozen tables".
+
+*Caveat to measure, not assume:* all numerical columns now share one `Linear(1,e)`, so the only thing
+separating `price of product` from `age of customer` is `W_name·name_c`. That is RT's bet and it is the
+same signal the router already routes on, but it is a real capacity reduction and is why `per_column`
+is kept as the comparison arm.
+
+*Found on the way:* the CACHED rel-f1 hash bundle and a freshly built one disagree on `races.year`
+(numerical vs categorical) — `get_stype_proposal` infers from a 1000-row sample, so a cache built at a
+different time can carry a different schema. Stable across repeated calls today; the cache is
+authoritative and `run_pretrain.py` always uses it.
+
+DoD: `pytest` **327 passed**.
