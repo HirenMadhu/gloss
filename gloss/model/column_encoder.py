@@ -149,9 +149,13 @@ class CellEncoder(nn.Module):
             b_idx, s_idx, row_idx, col_idx = cb.cell_placement[nt]
             b_idx, s_idx = b_idx.to(dev), s_idx.to(dev)
             row_idx, col_idx = row_idx.to(dev), col_idx.to(dev)
-            h[b_idx, s_idx] = cell[row_idx, col_idx]
+            # `.to(h.dtype)`: under `precision='bf16-mixed'` the stype encoders return bf16 while `h`
+            # is the fp32 accumulator, and an index_put across dtypes raises rather than promoting.
+            # Keeping the scatter buffer in fp32 is also the right call numerically — autocast recasts
+            # at the next matmul anyway, so nothing is gained by narrowing it here.
+            h[b_idx, s_idx] = cell[row_idx, col_idx].to(h.dtype)
         if cell_mask is not None:
             cm = cell_mask.to(dev).unsqueeze(-1)
-            h = torch.where(cm, self.masked_token(cb), h)
+            h = torch.where(cm, self.masked_token(cb).to(h.dtype), h)
         mask = (~cb.is_padding).to(dev).unsqueeze(-1)
         return h * mask

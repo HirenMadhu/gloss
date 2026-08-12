@@ -85,7 +85,8 @@ def main() -> int:
     from gloss.data.graph import build_gloss_graph
     from gloss.eval.ablation import entity_tasks
     from gloss.text.cache import EmbeddingCache, HashEncoder, QwenEncoder, make_text_encoder
-    from gloss.text.schema import build_column_name_embeddings
+    from gloss.text.schema import (build_column_name_embeddings, build_role_name_embeddings,
+                                   build_table_name_embeddings)
     from gloss.utils.paths import graph_cache_dir, schema_cache_path
 
     # Build the (expensive) frozen encoder ONCE and reuse it across datasets; the underlying model loads
@@ -115,9 +116,17 @@ def main() -> int:
         _report_value_dims(bundle, ds)
         cache_path = schema_cache_path(ds, safe)
         enc = EmbeddingCache(base_encoder, cache_path)
+        # ALL THREE name tables, not just columns. This script used to build only the column table,
+        # so rel-hm / rel-stack / rel-avito / rel-amazon ended up with column-only qwen caches — and
+        # because `EmbeddingCache` computes-and-writes on a miss instead of failing, the row level's
+        # table/role lookups would not error, they would silently load Qwen3-Embedding-4B in the
+        # middle of training (four times over, under 4-GPU DDP). P0.4; see amendments.md.
         emb = build_column_name_embeddings(bundle, enc, kind="query")
-        print(f"[{ds}] schema cache: name_emb {tuple(emb.shape)} -> {cache_path} "
-              f"(encoder={args.encoder})", flush=True)
+        tab = build_table_name_embeddings(bundle, enc, kind="query")
+        role = build_role_name_embeddings(bundle, enc, kind="query")
+        print(f"[{ds}] schema cache -> {cache_path} (encoder={args.encoder}): "
+              f"columns {tuple(emb.shape)} tables {tuple(tab.shape)} roles {tuple(role.shape)}",
+              flush=True)
         # Free this dataset's graph/embeddings (the encoder/model is kept, reused next loop).
         del emb, bundle, enc
         gc.collect()

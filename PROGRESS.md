@@ -232,3 +232,48 @@ DoD: `pytest` **304 passed**, twice (`test_masking.py` 14, `test_pretrain_head.p
 on padding / unmaskable / NaN cells; targets match a hand gather through `cell_placement`; a masked
 cell's routing signature `z` is **bit-identical** to the unmasked one (the property the method rests
 on); the objective overfits one batch on CPU.
+
+**Phase 3 — label-free loader, pretrain loop, checkpoints, wandb [done; GATE PASSED].**
+`gloss/data/pretrain_loader.py`, `gloss/train/pretrain.py`, `scripts/run_pretrain.py`.
+
+*Loader.* Same sampler as finetuning (`time_attr`, `temporal_strategy='last'`, `disjoint=True`) — RT
+also uses an identical sampler at both stages — but seeded from ordinary table rows with an explicit
+`input_time` and no transform. PyG writes `seed_time` from `input_time` with no task machinery
+involved, verified on both timed and **untimed** seed tables. One table per batch (so `entity_table`
+and `row_is_root` stay well defined), interleaved by `RoundRobinLoader` with a **deterministic**
+schedule — every DDP rank must pick the same table at the same step or the per-table encoders leave
+different parameters unused on different ranks.
+
+*Seed tables are weighted by MASKABLE rows.* The payoff is measured: on the task-driven loader rel-f1
+yields **zero** seed targets (entity table `drivers` has no maskable column); on this one every seed
+gets one, because `drivers`/`constructors` are excluded as seed sources and still appear as
+neighbours. Train seed times are capped at `val_timestamp`, so with `row_time <= seed_time` no
+val/test-period cell can enter a pretraining batch — asserted, since the graph is materialized
+`upto_test_timestamp=False` and nothing else would catch it.
+
+*Loop.* First LR schedule in the repo (linear warmup 20% -> linear decay, written out rather than
+`OneCycleLR`, whose defaults silently start at `max_lr/25` and cycle beta1). First disk checkpoints:
+`PretrainCheckpoint` writes a **portable trunk** and **per-DB adapters** separately, plus
+optimizer/scheduler/step for the 16 h SLURM wall, atomically renamed. `load_trunk` reports
+`missing_adapter` and `missing_portable` apart — a trunk file never contains adapter keys, so
+conflating them makes the report useless exactly on a LODO target. bf16-mixed; aux weighted once
+(`loop.py:86`'s lambda-squared is left alone there so finetune baselines do not move).
+
+*Verified portability.* Diffed a model built on rel-f1 (9 tables / 13 roles / 45 columns) against
+rel-trial (15 / 15 / 103): of the keys in both, **zero differ in shape**; every non-shared key is under
+`encoder.cell_encoders`. A separate scan for any learned tensor dimensioned by `C` / `n_tables` / `K`
+found **0 hits** outside `cell_encoders`. A rel-f1 trunk loads onto a rel-trial model and produces a
+finite forward on a rel-trial batch.
+
+*Two bugs this found.* `split_state_dict` matched `startswith("encoder.cell_encoders.")` against
+LightningModule keys prefixed `model.`, classifying every adapter tensor as portable — now a substring
+match, with a regression test. And under autocast the sparse path's `index_add` raises where the dense
+path's `+` promotes (RMSNorm is not an autocast op, so `x` is fp32 while the experts return bf16).
+
+*GATE (rel-f1, 300 steps, flex + sparse + 8 routed/2 shared, qwen names, minilm cell text):*
+`train/mlm` 0.195, `val/loss` **0.170**, 1.74 it/s, wandb run `ustlrwcm`. DoD: `pytest` **320 passed**,
+twice.
+
+*Measured model scale* at 10 blocks / d512 / ff2048 / 8+2 cell / 4+1 row: **513.0M total, 261.3M
+active per token** (dense combine would activate all 513M). With `--num-shared 0` at both levels:
+418.6M / 166.9M. All 10 blocks are structurally identical and carry the full six sublayers.

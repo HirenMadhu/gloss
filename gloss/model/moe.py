@@ -76,7 +76,11 @@ def sparse_combine(
             continue
         xe = xf.index_select(0, idx)
         ge = gf.index_select(0, idx)[:, e:e + 1]
-        y = y.index_add(0, idx, ge * expert(xe))
+        # `.to(y.dtype)` is required, not defensive: under autocast the experts return bf16 while
+        # `x` (out of an RMSNorm, which autocast does not list) is fp32, and `index_add` demands
+        # matching scalar types where the dense path's `+` would have promoted silently. Accumulating
+        # the mixture in the wider dtype is also the numerically better choice.
+        y = y.index_add(0, idx, (ge * expert(xe)).to(y.dtype))
     return y.view_as(x)
 
 
@@ -103,7 +107,7 @@ def apply_shared(x: Tensor, shared, *, valid: Tensor | None = None) -> Tensor:
         acc = shared[0](xe)
         for m in shared[1:]:
             acc = acc + m(xe)
-        y = y.index_add(0, idx, acc)
+        y = y.index_add(0, idx, acc.to(y.dtype))     # see sparse_combine: autocast dtype mismatch
     return y.view_as(x)
 
 

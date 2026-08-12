@@ -16,3 +16,8 @@ export GLOSS_SCHEMA_CACHE="${GLOSS_SCHEMA_CACHE:-$HOME/scratch60/gloss/schema_ca
 
 # HF auth token (harrier is MIT / ungated, but this avoids anonymous download rate limits).
 export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
+
+# Pretraining checkpoints + wandb run dirs. NOT home: a 520M-param AdamW state is ~7 GB per
+# checkpoint and home's quota is ~125 GiB.
+export GLOSS_CKPT_DIR="${GLOSS_CKPT_DIR:-$HOME/scratch60/gloss/ckpt}"
+export WANDB_DIR="${WANDB_DIR:-$HOME/scratch60/gloss/wandb}"
