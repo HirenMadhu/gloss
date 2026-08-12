@@ -47,6 +47,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--row-num-experts", type=int, default=4)
     ap.add_argument("--row-num-shared", type=int, default=1)
     ap.add_argument("--dispatch", default="sparse", choices=["dense", "sparse"])
+    ap.add_argument("--cell-encoder", default="schema_free", choices=["per_column", "schema_free"],
+                    help="schema_free shares one projection per datatype, so the ENTIRE model "
+                         "transfers to an unseen schema; per_column is torch_frame's per-column "
+                         "encoders (10.6M non-transferable params on rel-trial) kept as the "
+                         "comparison arm.")
     ap.add_argument("--cell-attn-backend", default="flex", choices=["sdpa", "flex"])
     ap.add_argument("--grad-checkpoint", action="store_true")
     ap.add_argument("--no-mean-aux", action="store_true",
@@ -109,9 +114,10 @@ def main() -> int:
     datasets = resolve_datasets(args)
     if len(datasets) > 1:
         raise SystemExit(
-            f"--datasets resolved to {datasets}. Multi-DB pretraining needs the SchemaAdapter trunk "
-            "(Phase 4): the pytorch-frame stype encoders are sized per database, so one model cannot "
-            "yet hold several. Single-DB runs work now; pass exactly one dataset.")
+            f"--datasets resolved to {datasets}. The MODEL is no longer the obstacle — with "
+            "--cell-encoder schema_free its state_dict is identical across schemas — but the loader "
+            "and the frozen name/label tables are still built per bundle, so one process holds one "
+            "database. Multi-DB is the next phase; pass exactly one dataset for now.")
     ds = datasets[0]
     run = args.run_name or f"{ds}-d{args.d_model}b{args.n_blocks}e{args.num_experts}s{args.seed}"
     seed_everything(args.seed)
@@ -125,10 +131,14 @@ def main() -> int:
     bundle = build_gloss_graph(ds, cache_dir=cache, text_encoder=args.text_encoder)
 
     enc = _name_encoder(ds, encoder=args.encoder, d_text=2560 if args.encoder == "qwen" else 64)
-    from gloss.text.schema import build_column_name_embeddings
+    from gloss.text.schema import build_category_name_embeddings, build_column_name_embeddings
     name_emb = build_column_name_embeddings(bundle, enc, kind="query")
     tab = build_table_name_embeddings(bundle, enc, kind="query")
     role = role_name_embeddings_with_none(bundle, enc, kind="query")
+    # Category LABELS as text. Cheap (383 distinct values corpus-wide) and cached like the rest, but
+    # only the schema-free encoder consumes it.
+    cat = (build_category_name_embeddings(bundle, enc, kind="query")
+           if args.cell_encoder == "schema_free" else None)
 
     model_kwargs = dict(
         d_model=args.d_model, n_blocks=args.n_blocks, n_heads=args.n_heads, d_ff=args.d_ff,
@@ -137,6 +147,7 @@ def main() -> int:
         row_num_shared=args.row_num_shared, dispatch=args.dispatch,
         cell_attn_backend=args.cell_attn_backend, grad_checkpoint=args.grad_checkpoint,
         mean_aux=not args.no_mean_aux, table_name_emb=tab, role_name_emb=role,
+        cell_encoder=args.cell_encoder, cat_name_emb=cat,
     )
     module = MoREPretrainLitModule(
         bundle, name_emb, model_kwargs=model_kwargs, p_random=args.p_random,

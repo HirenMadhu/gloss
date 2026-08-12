@@ -119,8 +119,14 @@ class MoREPretrainLitModule(pl.LightningModule):
         mk.pop("d_text", None)
         self.model = MoRE(bundle, name_emb, route_on=route_on, **mk)
         self.spec = build_column_target_spec(bundle, self.model.encoder)
+        # Tie the head to whatever category table the chosen encoder exposes: torch_frame's learned
+        # per-DB embedding (width `enc_channels`) or the schema-free encoder's frozen LABEL table
+        # (width `d_text`). Getting this wrong is a silent shape error only at the first masked
+        # categorical cell, which may be many steps in.
+        probe = self.model.category_table(next(iter(bundle.node_types), ""))
         self.head = MaskedCellHead(self.model.encoder.d_model, self.model.encoder.enc_channels,
-                                   lambda_cat=lambda_cat)
+                                   lambda_cat=lambda_cat,
+                                   d_cat=None if probe is None else int(probe.shape[-1]))
         self._t0 = time.time()
         self._cells = 0
 
