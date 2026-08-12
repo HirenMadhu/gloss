@@ -23,10 +23,10 @@ import math
 import statistics as stats
 from pathlib import Path
 
-ROUTING_SIGNALS = ("signature", "hidden", "value", "identity", "dense", "dense_wide")
+ROUTING_SIGNALS = ("signature", "dense")
 # Display order for the tables — the six canonical arms plus hybrid (=signature+hidden). Architecture-
 # addition variants (e.g. ``signature+S``) sort after these, alphabetically.
-ROUTER_DISPLAY = ("dense", "dense_wide", "signature", "hybrid", "hidden", "value", "identity")
+ROUTER_DISPLAY = ("dense", "signature")
 DEFAULT_DATASETS = ("rel-f1", "rel-stack", "rel-trial")
 # The 9 entity tasks RT (from scratch) / GelGT report on the RelBench leaderboard (the only ones with an
 # external baseline to compare against). `--tasks leaderboard` restricts a run to these.

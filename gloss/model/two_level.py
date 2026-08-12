@@ -3,18 +3,17 @@
 Composes the row-level operators from :mod:`gloss.model.row_level` with the cell level into the
 six-sublayer block of §3.9::
 
-    1. cell attention        (temporal RoPE, pad mask)   -- or the four RT masks, for Phase 0a
-    2. cell FFN              (MoEFFN, unchanged)
+    1. cell attention        (temporal RoPE, padding-only mask)
+    2. cell FFN              (MoEFFN, routed on the cell signature)
     3. low->high  RowPool
     4. row attention         (RoPE + name-derived role bias)
-    5. row FFN               (RowMoE)
+    5. row FFN               (RowMoE, shared + routed)
     6. high->low  Broadcast
 
-``rt_substrate.py`` is deliberately left untouched and reachable, so ``arch: rt`` can A/B against
-this and the §6 parity guard keeps working. Every stage here is switchable, because each phase in §5
-must be independently ablatable — Phase 0a runs this module with the cell level configured to behave
-exactly like RT (``cell.attention: four_mask``, ``cell.rope_time: false``), which is what isolates
-the row-token addition.
+**This is the adopted configuration, and the only one.** The phase-0a/0b ablation ladder (four RT
+masks, no cell RoPE, bucket time, mean pooling, no row biases, dense row FFN) and the single-level
+``arch: rt`` substrate are retired to ``archive/multi-level/``; every reported two-level result used
+the settings hard-wired here, so the switches only ever had one live value.
 
 **The MoE is at BOTH levels.** The cell FFN stays the existing ``MoEFFN`` routed on the cell
 signature; the row FFN is a ``RowMoE`` routed on the row signature. Aux terms are returned *split by
@@ -29,19 +28,14 @@ from torch import Tensor, nn
 from .flex_cell import (FLEX_MIN_HEAD_DIM, HAS_FLEX, build_cell_block_mask, cell_score_mod,
                         flex_cell_attention)
 from .moe import MoEFFN, SwiGLU
-from .row_level import (Broadcast, RMSNorm, RowAttention, RowMoE, RowPool, RowSignature,
-                        RowToCellAttention)
-from .rt_substrate import REL_ORDER, MaskedAttention, build_relational_masks
+from .row_level import Broadcast, RMSNorm, RowAttention, RowMoE, RowPool, RowSignature
 from .time_encoding import TimeLadder
 
-#: How the cell attention is *computed*. Orthogonal to ``cell_attention``, which is what mask
-#: topology it computes: ``four_mask`` is RT's four masks, ``full`` is the single collapsed one, and
-#: only ``full`` has a flex backend (the four-mask path is Phase 0a's frozen RT parity guard).
+#: How the cell attention is *computed*. ``flex`` is the adopted backend — it is what makes
+#: ``seq_len=3456`` on rel-event fit (19.8 GiB vs SDPA's 53.0 at B=64). ``sdpa`` is numerically
+#: equivalent and stays as the reference the flex path is TESTED against: flex_attention needs CUDA
+#: and ``head_dim >= 16``, so without sdpa there is no CPU test path at all.
 CELL_BACKENDS = ("sdpa", "flex")
-
-#: How the row level writes back to cells (§3.6). ``additive``/``film``/``none`` hand every cell of a
-#: row the same vector; ``attention`` lets the cell choose which FK-adjacent row to read.
-BROADCAST_MODES = ("additive", "film", "none", "attention")
 
 
 class CellAttention(nn.Module):
@@ -61,8 +55,7 @@ class CellAttention(nn.Module):
       packing is where the rest of the win is.
     """
 
-    def __init__(self, d_model: int, n_heads: int, ladder: TimeLadder, *, rope_time: bool = True,
-                 backend: str = "sdpa"):
+    def __init__(self, d_model: int, n_heads: int, ladder: TimeLadder, *, backend: str = "sdpa"):
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
@@ -83,7 +76,6 @@ class CellAttention(nn.Module):
         self.h = n_heads
         self.d_h = d_model // n_heads
         self.ladder = ladder
-        self.rope_time = rope_time
         self.backend = backend
         self.n_rot = min(2 * ladder.n_freq, self.d_h - self.d_h % 2)
         self.wq = nn.Linear(d_model, d_model, bias=False)
@@ -97,49 +89,40 @@ class CellAttention(nn.Module):
         k = self.wk(x).view(B, S, self.h, self.d_h).transpose(1, 2)
         v = self.wv(x).view(B, S, self.h, self.d_h).transpose(1, 2)
 
-        clamped = None
-        if self.rope_time:
-            tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time)
-            theta = self.ladder.theta(tau, cb.is_timed)              # [B,S,n_freq]
-            th = theta.unsqueeze(1)
-            q = self.ladder.rotate(q, th, self.n_rot)
-            k = self.ladder.rotate(k, th, self.n_rot)
-            # theta=0 alone reads as "Delta=0, maximally recent" for untimed cells AND for cells
-            # whose Delta was clamped (§9.10); the additive flags are what separate the three states.
-            clamped = self.ladder.was_clamped(cb.seed_time.unsqueeze(1), cb.row_time) & cb.is_timed
+        # temporal RoPE — always on (`cell.rope_time: false` was the phase-0 arm and is retired)
+        tau = self.ladder.tau_from_times(cb.seed_time.unsqueeze(1), cb.row_time)
+        theta = self.ladder.theta(tau, cb.is_timed)                  # [B,S,n_freq]
+        th = theta.unsqueeze(1)
+        q = self.ladder.rotate(q, th, self.n_rot)
+        k = self.ladder.rotate(k, th, self.n_rot)
+        # theta=0 alone reads as "Delta=0, maximally recent" for untimed cells AND for cells whose
+        # Delta was clamped (§9.10); the additive flags are what separate the three states.
+        clamped = self.ladder.was_clamped(cb.seed_time.unsqueeze(1), cb.row_time) & cb.is_timed
 
         if self.backend == "flex":
             # The bias is an outer product of two per-token boolean vectors, so flex expresses it as
             # a score_mod and never builds the [B,S,S] tensor the SDPA path below has to.
             if block_mask is None:
                 block_mask = build_cell_block_mask(cb.is_padding)
-            score_mod = None
-            if clamped is not None:
-                score_mod = cell_score_mod(cb.is_timed, clamped,
-                                           self.ladder.b_untimed, self.ladder.b_clamped,
-                                           dtype=x.dtype)
+            score_mod = cell_score_mod(cb.is_timed, clamped,
+                                       self.ladder.b_untimed, self.ladder.b_clamped, dtype=x.dtype)
             out = flex_cell_attention(q, k, v, block_mask=block_mask, score_mod=score_mod)
             return self.wo(out.transpose(1, 2).reshape(B, S, -1))
 
-        bias = None
-        if clamped is not None:
-            bias = self.ladder.time_bias(cb.is_timed, cb.is_timed,
-                                         clamped, clamped).unsqueeze(1).to(x.dtype)
-
+        bias = self.ladder.time_bias(cb.is_timed, cb.is_timed,
+                                     clamped, clamped).unsqueeze(1).to(x.dtype)
         real = ~cb.is_padding                                        # [B,S]
         mask = (real.unsqueeze(2) & real.unsqueeze(1)).unsqueeze(1)  # [B,1,S,S]
-        if bias is None:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        else:
-            # a float bias and a bool mask cannot both go to SDPA, so fold the mask into the bias
-            attn = bias.masked_fill(~mask, float("-inf"))
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn)
-        out = torch.nan_to_num(out)                                  # all-pad rows -> 0, not NaN
+        # a float bias and a bool mask cannot both go to SDPA, so fold the mask into the bias
+        attn = bias.masked_fill(~mask, float("-inf"))
+        out = torch.nan_to_num(F.scaled_dot_product_attention(q, k, v, attn_mask=attn))
         return self.wo(out.transpose(1, 2).reshape(B, S, -1))
 
 
 class TwoLevelBlock(nn.Module):
-    """The six-sublayer block of §3.9. Every stage switchable so each phase is ablatable alone."""
+    """The six-sublayer block of §3.9: cell attention, cell FFN, RowPool, row attention, row FFN,
+    Broadcast. The phase-0a/0b ablation switches are retired — every switch is pinned to the `full`
+    preset that every reported two-level result used."""
 
     def __init__(
         self,
@@ -151,48 +134,26 @@ class TwoLevelBlock(nn.Module):
         role_name_emb: Tensor,
         *,
         n_heads: int = 8,
-        cell_attention: str = "full",
-        cell_rope_time: bool = True,
         cell_attn_backend: str = "sdpa",
         cell_ffn: str = "moe",
         cell_route_dim: int | None = None,
         cell_num_experts: int = 4,
         cell_k: int = 2,
-        pool_query: str = "hybrid",
         pool_slots: int = 4,
-        role_bias: str = "name_derived",
-        time_bias: str = "rope",
-        row_ffn: str = "moe",
         row_num_experts: int = 4,
         row_k: int = 2,
         row_use_shared: bool = True,
         lambda_ortho: float = 0.5,
         lambda_balance: float = 0.01,
-        broadcast: str = "additive",
     ):
         super().__init__()
-        if cell_attention not in ("full", "four_mask"):
-            raise ValueError(f"unknown cell.attention {cell_attention!r}")
-        if cell_attn_backend == "flex" and cell_attention != "full":
-            raise ValueError(
-                "cell_attn_backend='flex' requires cell_attention='full'. The four_mask path is "
-                "Phase 0a's RT parity guard and must stay byte-comparable to rt_substrate.py."
-            )
-        self.cell_attention = cell_attention
         self.cell_ffn_mode = cell_ffn
-        self.row_ffn_mode = row_ffn
 
-        # --- 1. cell attention ---
+        # --- 1. cell attention (padding-only mask; RT's four masks are retired) ---
         self.cell_norm = RMSNorm(d_model)
-        if cell_attention == "full":
-            self.cell_attn = CellAttention(d_model, n_heads, ladder, rope_time=cell_rope_time,
-                                           backend=cell_attn_backend)
-        else:
-            # Phase 0a: keep RT's four masked attentions verbatim, so the only change is row tokens
-            self.norms = nn.ModuleDict({l: nn.RMSNorm(d_model) for l in REL_ORDER})
-            self.attns = nn.ModuleDict({l: MaskedAttention(d_model, n_heads) for l in REL_ORDER})
+        self.cell_attn = CellAttention(d_model, n_heads, ladder, backend=cell_attn_backend)
 
-        # --- 2. cell FFN: the EXISTING cell-level MoE, unchanged (MoE at both levels) ---
+        # --- 2. cell FFN: the cell-level MoE (MoE at both levels) ---
         self.cell_ffn_norm = RMSNorm(d_model)
         if cell_ffn == "moe":
             self.cell_ffn = MoEFFN(d_model, d_ff, int(cell_route_dim or d_sig),
@@ -201,37 +162,18 @@ class TwoLevelBlock(nn.Module):
             self.cell_ffn = SwiGLU(d_model, d_ff)
 
         # --- 3..6 row level ---
-        self.pool = RowPool(d_model, d_sig, col_name_emb, slots=pool_slots, mode=pool_query)
-        self.row_attn = RowAttention(d_model, d_sig, role_name_emb, ladder, n_heads=n_heads,
-                                     role_bias=role_bias, time_bias=time_bias)
-        if row_ffn == "moe":
-            self.row_ffn = RowMoE(d_model, d_ff, d_sig, num_experts=row_num_experts, k=row_k,
-                                  use_shared=row_use_shared,
-                                  lambda_ortho=lambda_ortho, lambda_balance=lambda_balance)
-        else:
-            self.row_ffn_norm = RMSNorm(d_model)
-            self.row_ffn = SwiGLU(d_model, d_ff)
-        # `attention` is the only mode that returns a diag, so the block branches on it below rather
-        # than on isinstance — keep the two in step if a third stateful mode ever appears.
-        self.broadcast_mode = broadcast
-        if broadcast == "attention":
-            self.broadcast = RowToCellAttention(d_model, d_sig, role_name_emb, ladder,
-                                                n_heads=n_heads, role_bias=role_bias,
-                                                time_bias=time_bias)
-        else:
-            self.broadcast = Broadcast(d_model, mode=broadcast)
+        self.pool = RowPool(d_model, d_sig, col_name_emb, slots=pool_slots)
+        self.row_attn = RowAttention(d_model, d_sig, role_name_emb, ladder, n_heads=n_heads)
+        self.row_ffn = RowMoE(d_model, d_ff, d_sig, num_experts=row_num_experts, k=row_k,
+                              use_shared=row_use_shared,
+                              lambda_ortho=lambda_ortho, lambda_balance=lambda_balance)
+        self.broadcast = Broadcast(d_model)
 
-    def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, masks=None, block_mask=None):
+    def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, block_mask=None):
         """-> ``(h, u, aux_cell, aux_row, diag)``. Aux is split by LEVEL, deliberately."""
-        # 1. cell attention
-        if self.cell_attention == "full":
-            h = h + self.cell_attn(self.cell_norm(h), cb, block_mask)
-        else:
-            for l in REL_ORDER:
-                h = h + self.attns[l](self.norms[l](h), masks[l])
+        h = h + self.cell_attn(self.cell_norm(h), cb, block_mask)          # 1. cell attention
 
-        # 2. cell FFN
-        hn = self.cell_ffn_norm(h)
+        hn = self.cell_ffn_norm(h)                                         # 2. cell FFN
         if self.cell_ffn_mode == "moe":
             y, _g = self.cell_ffn(hn, z)
             h = h + y
@@ -240,26 +182,11 @@ class TwoLevelBlock(nn.Module):
             h = h + self.cell_ffn(hn)
             aux_cell = h.new_zeros(())
 
-        # 3. low -> high
-        u = self.pool(h, u, s, cb)
-
-        # 4. row attention
-        u, diag = self.row_attn(u, s, cb)
-
-        # 5. row FFN
-        if self.row_ffn_mode == "moe":
-            u, aux_row, moe_diag = self.row_ffn(u, s, cb)
-            diag = {**diag, **moe_diag}
-        else:
-            u = u + self.row_ffn(self.row_ffn_norm(u))
-            aux_row = u.new_zeros(())
-
-        # 6. high -> low
-        if self.broadcast_mode == "attention":
-            h, b_diag = self.broadcast(h, u, cb)
-            diag = {**diag, **b_diag}
-        else:
-            h = self.broadcast(h, u, cb)
+        u = self.pool(h, u, s, cb)                                         # 3. low -> high
+        u, diag = self.row_attn(u, s, cb)                                  # 4. row attention
+        u, aux_row, moe_diag = self.row_ffn(u, s, cb)                      # 5. row FFN
+        diag = {**diag, **moe_diag}
+        h = self.broadcast(h, u, cb)                                       # 6. high -> low
         return h, u, aux_cell, aux_row, diag
 
 
@@ -283,7 +210,6 @@ class TwoLevelSubstrate(nn.Module):
         n_heads: int = 8,
         max_hop: int = 8,
         ladder: TimeLadder | None = None,
-        recency_channel: str = "off",
         **block_kw,
     ):
         super().__init__()
@@ -291,26 +217,11 @@ class TwoLevelSubstrate(nn.Module):
         self.row_sig = RowSignature(table_name_emb, role_name_emb, self.ladder,
                                     d_sig=d_sig, max_hop=max_hop)
         self.w_u = nn.Linear(d_model + d_sig, d_model, bias=False)
-        # The recency order-statistic channel reads the *truncation window* of each role's sampled
-        # child set. It is injected into the row token ONCE, before block 0's row attention, and only
-        # ever into the value path — `s` (what both routers read) is built above and never sees it.
-        self.recency_channel = recency_channel
-        if recency_channel != "off":
-            from .recency_stats import RecencyOrderChannel
-
-            # Built inside a FORKED RNG so constructing it does not advance the global stream. Without
-            # this, `x_full` and `base` at the same seed get different weights for every parameter
-            # created after this point, and the arms stop being paired -- which would quietly turn an
-            # init difference into "the mechanism helped".
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(0)
-                self.x_channel = RecencyOrderChannel(d_model, role_name_emb, mode=recency_channel)
         self.blocks = nn.ModuleList(
             TwoLevelBlock(d_model, d_ff, d_sig, self.ladder, col_name_emb, role_name_emb,
                           n_heads=n_heads, **block_kw)
             for _ in range(n_blocks)
         )
-        self.needs_masks = block_kw.get("cell_attention", "full") == "four_mask"
         # Padding does not change between blocks, and `create_block_mask` is the expensive part of
         # the flex path — so it is built once per FORWARD here and handed to every block.
         self.needs_block_mask = block_kw.get("cell_attn_backend", "sdpa") == "flex"
@@ -325,11 +236,6 @@ class TwoLevelSubstrate(nn.Module):
     def forward(self, x: Tensor, cb, *, z: Tensor | None = None):
         s = self.row_sig(cb)                          # [B,R,d_sig] — computed ONCE, reused per block
         u = self._init_rows(x, s, cb)
-        x_diag: dict = {}
-        if self.recency_channel != "off":
-            h_x, x_diag = self.x_channel(cb)          # already scaled by alpha (init 0)
-            u = u + h_x
-        masks = build_relational_masks(cb) if self.needs_masks else None
         block_mask = build_cell_block_mask(cb.is_padding) if self.needs_block_mask else None
 
         h = x
@@ -338,10 +244,9 @@ class TwoLevelSubstrate(nn.Module):
         aux_row_total = x.new_zeros(())
         diags: list[dict] = []
         for blk in self.blocks:
-            h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, masks, block_mask)
+            h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, block_mask)
             aux_cell_total = aux_cell_total + aux_cell
             aux_row_total = aux_row_total + aux_row
             diags.append(diag)
         aux = aux_cell_total + aux_row_total
-        return h, u, aux, {"aux_cell": aux_cell_total, "aux_row": aux_row_total, "blocks": diags,
-                           **x_diag}
+        return h, u, aux, {"aux_cell": aux_cell_total, "aux_row": aux_row_total, "blocks": diags}

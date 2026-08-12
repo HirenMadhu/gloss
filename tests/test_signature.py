@@ -44,20 +44,6 @@ def test_signature_is_value_free():
     assert torch.allclose(z1, z2)
 
 
-def test_recency_bins_untimed_zero_timed_positive_and_resolved():
-    bundle = synthetic_bundle()
-    # seed_time large; events spread across orders of magnitude -> distinct recency buckets
-    cb = _batch(bundle, seed_time=1_000_000.0,
-                event_times=(1_000_000.0 - 5, 1_000_000.0 - 50,
-                             1_000_000.0 - 5000, 1_000_000.0 - 500_000))
-    bins = _signature(bundle).recency_bins(cb)
-    untimed = ~cb.is_timed                       # users + pad
-    timed = cb.is_timed & ~cb.is_padding
-    assert int(bins[untimed].max()) == 0
-    assert int(bins[timed].min()) >= 1
-    assert len(set(bins[timed].tolist())) >= 2   # binning resolves different recencies
-
-
 def test_signature_changes_with_column():
     bundle = synthetic_bundle()
     cb = _batch(bundle)
@@ -70,8 +56,7 @@ def test_signature_changes_with_column():
     assert not torch.allclose(a, b)
 
 
-@pytest.mark.parametrize("time_mode", ["buckets", "rope"])
-def test_column_signature_works_in_both_time_modes_and_is_value_free(time_mode):
+def test_column_signature_is_value_free():
     """`column_signature()` is the diagnostics' way to ask "which expert does column c route to?"
     without a batch. It must exist under BOTH time modes: the old inline version reached for
     `recency_emb`, which only exists under `buckets`, so `specialization_probe` raised
@@ -82,7 +67,7 @@ def test_column_signature_works_in_both_time_modes_and_is_value_free(time_mode):
     C, d_text, d_sig = 7, 16, 8
     name = torch.randn(C, d_text)
     modality = torch.randint(0, 3, (C,))
-    sig = RelationalSignature(name, modality, n_stypes=3, d_sig=d_sig, time_mode=time_mode)
+    sig = RelationalSignature(name, modality, n_stypes=3, d_sig=d_sig, )
     z = sig.column_signature()
     assert z.shape == (C, d_sig)
     assert torch.isfinite(z).all()

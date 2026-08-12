@@ -13,12 +13,19 @@ content**. *"Route on semantics, transform the content."* Balance is a **router-
 uniform load-balancing aux loss), so expert usage may follow the long tail of relation frequencies.
 
 **The load-bearing experiment is the routing-signal ablation, in this one codebase**: `signature` (route on
-the relational signature) vs `value` vs `identity` vs `dense` (plain RT, no MoE), plus `hidden` and a
-param-matched `dense_wide`. It is the **default result**, run on all entity tasks of the three smallest
-RelBench DBs with **TEST-set** accuracy. The headline claim: `signature ≥ value/dense` in-distribution (and,
-in a deferred phase, `signature ≫ identity` on held-out schemas — `identity` references dataset-specific ids
-and *cannot* transfer). If `signature ≈ dense`, the honest output is a **negative result** — the RGCN null:
-RT's frozen-LM token may already let a single shared FFN absorb every column.
+the relational signature) vs `dense` (plain RT FFN, no cell MoE). It is the **default result**, run on all
+entity tasks of the three smallest RelBench DBs with **TEST-set** accuracy. The headline claim:
+`signature ≥ dense` in-distribution. If `signature ≈ dense`, the honest output is a **negative result** — the
+RGCN null: RT's frozen-LM token may already let a single shared FFN absorb every column. The `value` /
+`identity` / `hidden` / `dense_wide` arms (and the deferred `signature ≫ identity` transfer claim) are
+archived under `archive/multi-level/`; reinstating them means restoring that code first.
+
+> **The `multi-level` branch was reduced to the adopted model on 2026-08-12.** The two-level
+> encoder with the **flex** cell backend, the additive `Broadcast` and `route_on: signature` is the
+> only configuration in the live tree. The single-level `arch: rt` substrate, the phase-0a/0b
+> ablation ladder, `RowToCellAttention`, the recency x-channel, the S/C/P/H MoE additions and the
+> four extra routing arms are under **`archive/multi-level/`** — read its README before assuming a
+> switch still exists. **Do not reintroduce them.**
 
 > **The earlier DOC-RT design is RETIRED.** Per-column documentation, the prose corpus, grounding/retrieval,
 > the four doc regimes (full/null/shuffled/name_only), and FiLM conditioning of the cell encoder no longer
@@ -42,7 +49,8 @@ RT's frozen-LM token may already let a single shared FFN absorb every column.
   normative; exact library function names are not** — `relbench`/`pytorch-frame` APIs drift, so adapt.
 
 > implementation.md is written against the *upstream* `snap-stanford/relational-transformer` repo by name, but
-> **we build on this repo's own faithful RT reimplementation** (`gloss/model/rt_substrate.py`) — same
+> **we build on this repo's own faithful RT reimplementation** (now `archive/multi-level/model/rt_substrate.py`,
+> superseded by the two-level `gloss/model/two_level.py`) — same
 > cell-token + relational-mask substrate, SDPA attention, **no upstream clone**.
 
 ## Naming: MoRE = the method, `gloss` = the package
@@ -56,7 +64,7 @@ class is `MoRE` (`gloss/model/more.py`). Retired stacks: DOC-RT under `archive/d
 `.venv` (uv, py3.12): **torch 2.8.0+cu128**, torch_geometric 2.8.0, torch_frame 0.3.0, relbench,
 sentence-transformers, transformers, lightgbm, pytorch-lightning, hydra, wandb. Use `.venv/bin/python`. The dev
 node has an **A40 (46 GB)**; bigger jobs go to SLURM (`gpu`/`priority_gpu`: h100:4 / a40:4; the ablation gate is
-`scripts/run_ablation.sh`, a SLURM job array on **h100**). **flash-attn is installed (2.8.3) but unused** — MoRE's
+`scripts/run_gridsearch.sh`, a SLURM job array on **h100**). **flash-attn is installed (2.8.3) but unused** — MoRE's
 relational attention uses **SDPA**, and its four boolean masks force the math backend (flash kernels don't take
 arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, which runs offline.
 
@@ -79,12 +87,11 @@ arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, w
   `EmbeddingCache` computes-and-writes on a miss rather than failing, so a wrong cache root degrades to a
   silent LM load at train time instead of an error.
 - **Value-free routing = leak-free by construction.** The signature is a pure function of a cell's own
-  `(column, modality, recency)`; no neighborhood/global statistic enters the router. Recency uses **fixed,
-  context-independent** buckets — or, behind `time.mode: rope`, a fixed-frequency ladder
-  (`model/time_encoding.py`) whose `ω` is a non-persistent buffer, never learned. Both are
-  context-independent, so the leak-free claim is unaffected. Unit-tested (`test_routing_invariance.py`).
-- **Six routing arms, one trained encoder:** `signature` (the method) | `value` | `identity` | `hidden` |
-  `dense` (plain RT) | `dense_wide` (param-matched dense, `d_ff×k`). `signature` vs `dense` is the headline.
+  `(column, modality, recency)`; no neighborhood/global statistic enters the router. Recency is the
+  fixed-frequency ladder (`model/time_encoding.py`) whose `ω` is a non-persistent buffer, never
+  learned — context-independent, so the leak-free claim holds. Unit-tested (`test_routing_invariance.py`).
+- **Two routing arms:** `signature` (the method) and `dense` (a single shared SwiGLU = RT's FFN).
+  `signature` vs `dense` is the headline. `value`/`identity`/`hidden`/`hybrid`/`dense_wide` are archived.
 - **Entity tasks, both types.** Binary classification (AUROC) **and** regression (MAE) across all entity tasks
   of the 3 smallest DBs; report **TEST-set** accuracy. Recommendation/link tasks deferred. Regression targets
   are z-scored with TRAIN stats and de-standardized for metrics/eval.
@@ -98,15 +105,17 @@ arbitrary masks); the only other would-be consumer is the frozen Qwen encoder, w
   frozen encoder + cache (`cache.py`) and the per-column name table (`schema.py`); FiLM/grounding stripped; the
   model is plain RT (value dtype-encoder + RT name token).
 - **B. MoRE core.** **[done]** — `model/moe.py` (`SwiGLU` + `MoEFFN` + `ortho_loss`), `model/signature.py`
-  (`RelationalSignature`), MoE wired into `model/rt_substrate.py`, `model/more.py` (`MoRE`, `forward →
-  (logits, aux)`).
+  (`RelationalSignature`), MoE wired into `model/two_level.py` at BOTH levels, `model/more.py`
+  (`MoRE`, `forward → (logits, aux)`).
 - **C. Training + regression.** **[done]** — `train/loop.py` `MoRELitModule` (task-type dispatch, regression
   standardization), `train/losses.py` (`masked_mse`, `task_loss`), `eval/metrics.py` (`regression_metrics`),
   task-type-aware `eval/test_eval.py`.
 - **D. Multi-DB routing-signal ablation (THE GATE).** **[done]** — `eval/ablation.py` (`entity_tasks`,
-  `build_grid`, `run_config`, `aggregate`, `format_table`), `scripts/run_ablation.{py,sh}`,
+  `build_grid`, `run_config`, `aggregate`, `format_table`), `scripts/run_gridsearch.{py,sh}`,
   `scripts/build_schema_cache.{py,sh}`, `eval/diagnostics.py`. **Stop & report at the gate.**
 - **E. Docs sync.** **[this file].**
+- **F. Reduce to the adopted model.** **[done, 2026-08-12]** — every non-adopted arm moved to
+  `archive/multi-level/` (see its README for the full table and the collapsed switches); 258 tests green.
 
 **Deferred** — leave-one-DB-out zero-shot transfer (`signature ≫ identity`, the idea's headline) + masked-cell
 pretraining; true **sparse** MoE dispatch (for active-FLOP parity); recommendation/link tasks; the recency-axis
@@ -123,27 +132,29 @@ cells emitted first so they survive truncation). rel-f1 ≈ 353 cells/seed → `
 
 **Key equations / mechanism:**
 - **Cell token (RT, unchanged — `column_encoder.py`):** `x_{u,c} = W_v Enc_dtype(v_{u,c}) + W_name name_c`
-  (pytorch-frame dtype value embedding + frozen-LM column-name token). No FiLM. `forward(cb, return_value)` also
-  returns the value component for the `value` arm.
+  (pytorch-frame dtype value embedding + frozen-LM column-name token). No FiLM.
 - **Relational signature (the router input — `signature.py`):**
-  `z_{u,c} = RMSNorm(W_s name_c + ψ(modality_c) + φ(recency_{u,c}))` — **value-free**, computed **once**, shared
-  across blocks. `recency` = fixed log-spaced bucket of `seed_time − row_time` (bin 0 = untimed/pad).
-- **MoE FFN (the only new mechanism — `moe.py` + `rt_substrate.py`):** each `RelationalBlock`'s FFN becomes
-  `MoEFFN` = `M` SwiGLU experts + a top-`k` router. `y = Σ_{top-k} softmax(W_g · route_feat) · E_j(h)`.
-  `route_feat` is set by `route_on`: `signature→z`, `hidden→normed h`, `value→value component`,
-  `identity→learned per-column embedding`. **Router input dim is set by the arm** (`d_sig` for
-  signature/identity, `d_model` for hidden/value). Balance: `‖ŴŴᵀ − I‖²_F` summed over blocks → `aux`.
-- **Relational attention (`rt_substrate.py`, unchanged otherwise):** four boolean `[B,S,S]` masks
-  (col/feat/nbr/full) rebuilt each forward; `col→feat→nbr→full` masked **SDPA** attention + the FFN, pre-norm
-  RMSNorm; `n_blocks` blocks; `forward → (states, aux)`.
-- **Head (`heads.py`):** `EntityHead` mean-pools the seed-row cells → logits `[B, out_dim]` (`out_dim=1` for
-  binary and regression).
+  `z_{u,c} = RMSNorm(W_s name_c + ψ(modality_c) + W_τ[sin θ; cos θ])` — **value-free**, computed **once**,
+  shared across blocks. `θ` comes from the fixed `TimeLadder` over `seed_time − row_time`; untimed cells
+  get an all-zero feature pair, so "unknown Δ" stays separable from "Δ = 0".
+- **MoE FFN (the new mechanism — `moe.py`, at BOTH levels in `two_level.py`):** the cell FFN is
+  `MoEFFN` = `M` SwiGLU experts + a top-`k` router on `z` (`d_route = d_sig`), routed-only; the row FFN
+  is `RowMoE` on the row signature, shared + routed. `y = Σ_{top-k} softmax(W_g · z) · E_j(h)`.
+  Balance: `‖ŴŴᵀ − I‖²_F` summed over blocks → `aux`, returned **split by level**.
+- **Two-level block (`two_level.py`), six sublayers:** cell attention (temporal RoPE, **padding-only**
+  mask, `flex` or `sdpa` backend) → cell FFN → `RowPool` (cell→row) → row attention (RoPE +
+  name-derived role bias γ) → `RowMoE` → `Broadcast` (row→cell, additive). Pre-norm RMSNorm and a
+  residual on every sublayer except `RowPool`/`Broadcast`, which are residual but unnormed.
+- **Head (`heads.py`):** `RowTokenHead` reads the seed **root row token** (`row_is_root`) → logits
+  `[B, out_dim]` (`out_dim=1` for binary and regression).
 
-**Memory note (load-bearing for batch sizing):** attention is dense `O(S²)` (4 masks/block; SDPA bool-mask →
-math backend materializes the score matrices for backward). The MoE **dense-combine MVP runs all `M` experts on
-all tokens** → ~`M×` FFN compute/activations per block. Keep `seq_len` tight (512 for rel-f1), batch modest,
-**default `M=4`**; placement configurable (`all` vs `upper_half`). True sparse dispatch (and active-FLOP parity)
-is deferred — so report vanilla `dense` **and** `dense_wide`, and don't claim active-FLOP parity.
+**Memory note (load-bearing for batch sizing):** cell attention is dense `O(S²)`, one attention per block
+(the four RT masks are retired). Under `sdpa` a bool mask forces the math backend, which materializes the
+score matrices for backward; under `flex` the padding block-mask skips them — that is what makes
+`seq_len=3456` on rel-event fit (19.8 GiB vs 53.0 at B=64). The MoE **dense-combine MVP runs all `M` experts
+on all tokens** → ~`M×` FFN compute/activations per block, at BOTH levels. Keep `seq_len` tight, batch
+modest, **default `M=4`**. True sparse dispatch (and active-FLOP parity) is deferred — don't claim
+active-FLOP parity. Measured: 256/4 OOMs above batch 256, 128/2 fits 512.
 
 **Tested invariants / contracts (the test matrix):**
 - **Temporal leakage** — no cell with `row_time > seed_time` (`test_leakage.py`).
@@ -153,17 +164,19 @@ is deferred — so report vanilla `dense` **and** `dense_wide`, and don't claim 
 - **MoE** — top-k gates sum to 1, dense combine = weighted expert sum, `ortho_loss` finite > 0 (`test_moe.py`).
 - **FK-role disambiguation** — two FKs into one table get distinct `fk_role_id` (`test_graph.py`; synthetic
   dual-FK fixture in `conftest.py`).
-- **Cell batch / shapes / model** — RT contracts (`test_shapes.py` = `MoRE` forward over all 6 arms + grad-flow
-  to router & signature; `test_collate.py`, `test_column_encoder.py`); overfit one batch binary **and**
+- **Cell batch / shapes / model** — RT contracts (`test_shapes.py` = `MoRE` forward over both arms + grad-flow
+  to BOTH levels' routers & the signature; `test_collate.py`, `test_column_encoder.py`); overfit one batch binary **and**
   regression (`test_train.py`); losses + regression metrics (`test_losses.py`); ablation bookkeeping —
   grid enumeration + CI aggregation + lift tables (`test_ablation.py`).
 
 **Tests are hermetic** on tiny synthetic dual-FK fixtures (`tests/conftest.py`); only rel-f1-guarded tests touch
 the cached real dataset (MoRE-level tests need real stype stats → rel-f1-guarded).
 
-**Config-driven switches:** `moe.route_on ∈ {signature, hidden, value, identity, dense, dense_wide}`;
-`moe.{num_experts, k, d_sig, lambda_ortho, placement}`; `data.collate.{seq_len, max_fk}`. CLI:
-`run_train.py --route-on / --num-experts / -k / --lambda-ortho / --moe-placement / --dataset / --task / --test`.
+**Config-driven switches:** `moe.route_on ∈ {signature, dense}`; `moe.{num_experts, k, d_sig,
+lambda_ortho}`; `model.two_level.cell.backend ∈ {sdpa, flex}`; `model.two_level.row.{pool_slots,
+num_experts, top_k, use_shared, lambda_ortho, lambda_balance}`; `data.collate.{seq_len, max_fk}`.
+CLI: `run_train.py --route-on / --num-experts / -k / --lambda-ortho / --dataset / --task / --test`;
+`run_gridsearch.py --grid-set {default,small,large} / --cell-attn-backend {sdpa,flex}`.
 
 ## The datasets
 
@@ -210,10 +223,10 @@ Use `.venv/bin/python`.
 source scripts/env.sh                                                        # FIRST, for any local run sharing state with SLURM
 .venv/bin/python scripts/build_schema_cache.py                               # cache Qwen column-name embeddings (prereq)
 sbatch --gpus=1 scripts/prep.sh --datasets rel-hm --encoder qwen             # download + task tables + graph + schema, one DB
-.venv/bin/python scripts/run_ablation.py --list                              # ablation grid size
-.venv/bin/python scripts/run_ablation.py --index N                           # one (dataset,task,signal,seed) arm
-.venv/bin/python scripts/run_ablation.py --aggregate                         # per-(dataset,task) table, Δ vs dense
-sbatch scripts/build_schema_cache.sh                                         # then: N=$(... run_ablation.py --list); sbatch --array=0-$((N-1))%8 scripts/run_ablation.sh
+.venv/bin/python scripts/run_gridsearch.py --list --arch two_level --grid-set large --lr-set single --tasks all --seeds 3
+.venv/bin/python scripts/run_gridsearch.py --index N ...                     # one (config,dataset,task,seed) arm
+.venv/bin/python scripts/aggregate_gridsearch.py --dir results/<out-dir>     # per-task table vs RT / GelGT
+sbatch scripts/build_schema_cache.sh                                         # then: N=$(... --list); sbatch --array=0-$((N-1))%8 scripts/run_gridsearch.sh <same flags>
 .venv/bin/python -m pytest tests/                                            # the test matrix must stay green
 ```
 

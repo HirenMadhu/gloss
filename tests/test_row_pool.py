@@ -13,18 +13,11 @@ import torch
 
 from gloss.model.row_level import RowPool
 
-MODES = ("mean", "signature", "hidden", "hybrid")
-
-
 def dense_reference(pool: RowPool, h, u, s, cb):
     """The pre-rewrite implementation, verbatim, as the oracle."""
     B, R, _ = u.shape
     member = pool._membership(cb, R)                                  # [B,R,S]
-    if pool.mode == "mean":
-        cnt = member.sum(-1, keepdim=True).clamp_min(1)
-        return u + (member.to(h.dtype) @ h) / cnt
-    q_in = {"signature": s, "hidden": u, "hybrid": torch.cat([u, s], dim=-1)}[pool.mode]
-    q = pool.w_q(q_in).view(B, R, pool.slots, pool.d_h)
+    q = pool.w_q(torch.cat([u, s], dim=-1)).view(B, R, pool.slots, pool.d_h)
     k = pool.w_k(pool.col_name_emb[cb.col_idxs.clamp_min(0)])
     v = pool.w_v(h)
     scores = torch.einsum("brmd,bsd->brms", q, k) / pool.d_h ** 0.5
@@ -67,24 +60,22 @@ def make_case(B=3, R=6, S=17, C=9, d=16, d_sig=8, d_text=12, *, seed=0,
     return cb, h, u, s, name_emb
 
 
-@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("case", ["plain", "truncated", "all_padding_seed"])
-def test_segment_softmax_matches_the_dense_reference(mode, case):
+def test_segment_softmax_matches_the_dense_reference(case):
     cb, h, u, s, name_emb = make_case(truncated=(case == "truncated"),
                                       all_padding_seed=(case == "all_padding_seed"))
     torch.manual_seed(0)
-    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4, mode=mode)
+    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4)
     got = pool(h, u, s, cb)
     want = dense_reference(pool, h, u, s, cb)
     assert torch.allclose(got, want, atol=1e-5, rtol=1e-5), (got - want).abs().max()
 
 
-@pytest.mark.parametrize("mode", [m for m in MODES if m != "mean"])
-def test_gradients_match_the_dense_reference(mode):
+def test_gradients_match_the_dense_reference():
     """Equal outputs with unequal gradients would train differently while testing identically."""
     cb, h, u, s, name_emb = make_case()
     torch.manual_seed(0)
-    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4, mode=mode)
+    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4)
 
     def grads(fn):
         pool.zero_grad()
@@ -105,7 +96,7 @@ def test_rows_with_no_cells_pool_to_exactly_zero():
     `seq_len=512`, so this is the common case there, not an edge case."""
     cb, h, u, s, name_emb = make_case()
     torch.manual_seed(0)
-    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4, mode="hybrid")
+    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4)
     out = pool(h, u, s, cb)
     R = u.shape[1]
     occupied = torch.zeros(u.shape[0], R, dtype=torch.bool)
@@ -126,7 +117,7 @@ def test_it_never_materializes_a_dense_row_by_cell_tensor():
 
     cb, h, u, s, name_emb = make_case(B=2, R=8, S=20)
     torch.manual_seed(0)
-    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4, mode="hybrid")
+    pool = RowPool(h.shape[-1], s.shape[-1], name_emb, slots=4)
     B, R, S, M = u.shape[0], u.shape[1], h.shape[1], pool.slots
 
     seen: list[tuple] = []

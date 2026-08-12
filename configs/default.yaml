@@ -19,28 +19,16 @@ data:
                                # every rel-event run. An int is honoured as a hard cap: it ASSERTS on
                                # overflow and never clamps.
 
-# MoE FFN. `route_on` picks the router input (the load-bearing ablation axis); the S/C/P/H additions
-# are OFF by default so the base arm == plain RT + top-k MoE. `run_train.py` / `run_ablation.py` flags
-# override these.
+# MoE FFN. `route_on` picks the cell router input; `dense` drops the cell MoE for a shared SwiGLU
+# (RT's FFN) and is the headline comparison. The S/C/P/H additions are retired to archive/multi-level/.
 moe:
-  route_on: signature          # signature | hybrid(=signature+hidden) | hidden | value | identity | dense | dense_wide
-  d_sig: 128                   # relational-signature width (router input dim for signature/identity)
+  route_on: signature          # signature | dense
+  d_sig: 128                   # relational-signature width (= the router input dim)
   num_experts: 4
   k: 2                         # top-k experts per token
-  lambda_ortho: 0.5            # router-orthogonality (+ HMoE level-1 balance) loss weight
-  placement: all               # all | upper_half
-  # --- ablation additions (default off) ---
-  use_shared: false            # S: always-on shared expert
-  cosine: false                # C: cosine/normalized router over learnable keys
-  tau: 0.3                     #    cosine temperature
-  top_p: null                  # P: adaptive expert count (keep smallest set reaching cumulative mass P)
-  hmoe: false                  # H: hierarchical two-level gate (uses HMoEFFN)
-  n_groups: 4                  #    HMoE: level-1 group count
-  experts_per_group: 2         #    HMoE: experts per group
-  k2: 1                        #    HMoE: within-group top-k2
+  lambda_ortho: 0.5            # router-orthogonality loss weight
 
 model:
-  arch: rt                     # rt | two_level   (rt = the current substrate; the A/B baseline)
   d_model: 256
   n_heads: 8
   n_blocks: 8                  # RelationalBlocks (each = col/feat/nbr/full attention + SwiGLU FFN)
@@ -55,8 +43,6 @@ model:
     d_sig: 128                 # row-signature width (shares the value of moe.d_sig by convention)
     max_hop: 8                 # row_hop embedding size; a small universal integer, legal under §0
     cell:
-      attention: four_mask     # four_mask (Phase 0a) | full (Phase 0b: 4 score matrices -> 1)
-      rope_time: false         # Phase 1 t2 turns this on
       # HOW that attention is computed, not WHICH mask it uses. flex needs attention: full, and
       # gives up bit-exact --deterministic (its backward uses atomics). Its payoff scales with the
       # block grid: ~1.2-1.3x end-to-end at seq_len 512, but it is what makes 1536 affordable.
@@ -64,26 +50,14 @@ model:
       # cell.ffn is NOT a switch here: it follows moe.route_on, because the cell MoE is the EXISTING
       # mechanism and stays unchanged. The MoE lives at BOTH levels (§3.7).
     row:
-      pool_query: mean         # mean (Phase 0a) | signature | hidden | hybrid   (Phase 3 sweeps these)
       pool_slots: 4
-      role_bias: none          # none (Phase 0a) | name_derived (Phase 2 s1). id_lookup is REMOVED (§3.5)
-      time_bias: none          # none (Phase 0a) | rope (t3) | fixed_basis (t3b)
-      ffn: dense               # dense | moe   (Phase 4 r1 turns the ROW MoE on; cell MoE stays on)
       num_experts: 4
       top_k: 2
+      use_shared: true         # the ROW experts are shared+routed; the CELL experts are routed-only
       lambda_ortho: 0.5
       lambda_balance: 0.01     # M·Σ_e f_e p_e, over VALID rows only
-    # additive/film/none hand every cell of a row the SAME vector — its own row's, already averaged
-    # over neighbours by row attention, so a cell cannot ask for a particular neighbour. `attention`
-    # makes step 6 a real row->cell cross-attention (cells query, rows are keys/values, masked to
-    # FK-adjacent rows, same name-derived gamma as row attention). Read `r2c_own_row_mass`: ~1.0
-    # means the cell ignored its neighbours and this collapsed back to additive.
-    broadcast: additive        # additive | film | none | attention
-    head:
-      mode: row_token          # row_token (§3.8) | seed_cells (kept for the Phase 0 parity check)
 
 time:
-  mode: buckets                # buckets (current, and REQUIRED by Phase 0a) | rope (Phase 1 t1+)
   unit: seconds                # canonical, not configurable per dataset — §3.1
   n_freq: 8
   # MEASURED band, not the [0.05, 5.0] changes.md first specified: tau's SPREAD is sigma≈1.6-1.9

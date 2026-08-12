@@ -129,12 +129,11 @@ def test_row_signature_is_value_free():
     assert torch.equal(a, sig(cb))
 
 
-@pytest.mark.parametrize("mode", ["mean", "signature", "hidden", "hybrid"])
-def test_row_pool_all_query_arms_run(mode):
+def test_row_pool_all_query_arms_run():
     cb, K = stub_batch()
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     _, _, col = _tables(K)
-    pool = RowPool(D_MODEL, D_SIG, col, slots=4, mode=mode)
+    pool = RowPool(D_MODEL, D_SIG, col, slots=4, )
     h = torch.randn(B, cb.seq_len, D_MODEL)
     u = torch.zeros(B, R, D_MODEL)
     s = torch.randn(B, R, D_SIG)
@@ -152,7 +151,7 @@ def test_row_pool_softmax_is_scoped_to_a_rows_own_cells():
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     _, _, col = _tables(K)
     torch.manual_seed(0)
-    pool = RowPool(D_MODEL, D_SIG, col, slots=2, mode="hybrid")
+    pool = RowPool(D_MODEL, D_SIG, col, slots=2, )
     h = torch.randn(B, cb.seq_len, D_MODEL)
     u = torch.randn(B, R, D_MODEL)
     s = torch.randn(B, R, D_SIG)
@@ -175,7 +174,7 @@ def test_row_pool_ignores_padding_cells():
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     _, _, col = _tables(K)
     torch.manual_seed(0)
-    pool = RowPool(D_MODEL, D_SIG, col, slots=2, mode="hybrid")
+    pool = RowPool(D_MODEL, D_SIG, col, slots=2, )
     h = torch.randn(B, cb.seq_len, D_MODEL)
     u, s = torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG)
 
@@ -185,14 +184,11 @@ def test_row_pool_ignores_padding_cells():
     assert torch.allclose(base, pool(h2, u, s, cb), atol=1e-6)
 
 
-@pytest.mark.parametrize("time_bias", ["rope", "none", "fixed_basis"])
-@pytest.mark.parametrize("role_bias", ["name_derived", "none"])
-def test_row_attention_all_arms_run_and_stay_finite(time_bias, role_bias):
+def test_row_attention_runs_and_stays_finite():
     cb, K = stub_batch()
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     _, role, _ = _tables(K)
-    att = RowAttention(D_MODEL, D_SIG, role, TimeLadder(), n_heads=N_HEADS,
-                       role_bias=role_bias, time_bias=time_bias)
+    att = RowAttention(D_MODEL, D_SIG, role, TimeLadder(), n_heads=N_HEADS)
     u, s = torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG)
     out, diag = att(u, s, cb)
     assert out.shape == (B, R, D_MODEL)
@@ -221,7 +217,7 @@ def test_masked_pairs_get_no_attention():
     B, R = cb.num_seeds, cb.adj_role.shape[1]
     _, role, _ = _tables(K)
     torch.manual_seed(0)
-    att = RowAttention(D_MODEL, D_SIG, role, TimeLadder(), n_heads=N_HEADS, time_bias="none")
+    att = RowAttention(D_MODEL, D_SIG, role, TimeLadder(), n_heads=N_HEADS, )
     u, s = torch.randn(B, R, D_MODEL), torch.randn(B, R, D_SIG)
 
     # rows 1 and 2 are siblings: both children of 0, no edge between them
@@ -339,11 +335,10 @@ def test_row_moe_padding_rows_do_not_vote_in_balance():
 # ---- broadcast + grad flow ----
 
 
-@pytest.mark.parametrize("mode", ["additive", "film", "none"])
-def test_broadcast_shapes(mode):
+def test_broadcast_shapes():
     cb, K = stub_batch()
     B, R = cb.num_seeds, cb.adj_role.shape[1]
-    bc = Broadcast(D_MODEL, mode=mode)
+    bc = Broadcast(D_MODEL, )
     h = torch.randn(B, cb.seq_len, D_MODEL)
     out = bc(h, torch.randn(B, R, D_MODEL), cb)
     assert out.shape == h.shape and torch.isfinite(out).all()
@@ -355,7 +350,7 @@ def test_grad_reaches_router_signature_wtau_and_b_untimed():
     ladder = TimeLadder()
     sig = _sig(K, ladder)
     _, role, col = _tables(K)
-    pool = RowPool(D_MODEL, D_SIG, col, slots=2, mode="hybrid")
+    pool = RowPool(D_MODEL, D_SIG, col, slots=2, )
     att = RowAttention(D_MODEL, D_SIG, role, ladder, n_heads=N_HEADS)
     moe = RowMoE(D_MODEL, 4 * D_MODEL, D_SIG)
 

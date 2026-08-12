@@ -109,29 +109,3 @@ def test_aggregate_keeps_architectures_separate():
     assert not math.isclose(tl_mean, 0.81, abs_tol=1e-9)
 
 
-def test_phase_presets_differ_and_cover_the_gate():
-    """changes.md §5: phase0a must keep the CELL level RT-like; full must turn the design on."""
-    from pathlib import Path
-
-    # the presets now live in scripts/run_ablation_phases.py, shared by BOTH array runners so they
-    # cannot drift — if they drifted, a grid-search "winner" would not be the same architecture as the
-    # headline run. Import it directly rather than through run_ablation.py (which pulls in torch).
-    import sys
-
-    scripts = Path(__file__).resolve().parents[1] / "scripts"
-    if str(scripts) not in sys.path:
-        sys.path.insert(0, str(scripts))
-    from run_ablation_phases import TWO_LEVEL_PHASES as P
-
-    assert set(P) == {"phase0a", "phase0b", "full"}
-    # phase0a isolates the row-token addition: cell level behaves exactly like RT
-    assert P["phase0a"]["cell_attention"] == "four_mask"
-    assert P["phase0a"]["cell_rope_time"] is False
-    assert P["phase0a"]["time_mode"] == "buckets"      # Phase 0a REQUIRES buckets
-    assert P["phase0a"]["row_ffn"] == "dense"
-    # phase0b changes exactly ONE thing vs phase0a — the cell attention collapse
-    diff = {k for k in P["phase0a"] if P["phase0a"][k] != P["phase0b"][k]}
-    assert diff == {"cell_attention"}, f"phase0b should differ in one switch, differs in {diff}"
-    # full is the proposed design, MoE at BOTH levels with the row experts shared+routed
-    assert P["full"]["row_ffn"] == "moe" and P["full"]["row_use_shared"] is True
-    assert P["full"]["role_bias"] == "name_derived" and P["full"]["time_bias"] == "rope"

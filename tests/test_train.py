@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import torch
 
+from gloss.text.cache import HashEncoder
+from gloss.text.schema import build_table_name_embeddings, role_name_embeddings_with_none
 from gloss.train.loop import MoRELitModule
 from gloss.train.losses import masked_bce, masked_mse
 from gloss.utils.seeding import seed_everything
@@ -21,7 +23,9 @@ def _small_module(bundle, name_emb, entity_table, *, task_type="binary") -> MoRE
     seed_everything(0)
     module = MoRELitModule(
         bundle, name_emb, entity_table, task_type=task_type,
-        model_kwargs=dict(d_model=64, n_blocks=2, n_heads=4, d_ff=128, enc_channels=64),
+        model_kwargs=dict(d_model=64, n_blocks=2, n_heads=4, d_ff=128, enc_channels=64,
+                          table_name_emb=build_table_name_embeddings(bundle, HashEncoder(dim=64)),
+                          role_name_emb=role_name_embeddings_with_none(bundle, HashEncoder(dim=64))),
         lr=5e-3, seq_len=256, max_fk=5,
     )
     return module.to(_DEVICE)

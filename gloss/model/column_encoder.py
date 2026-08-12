@@ -101,23 +101,21 @@ class CellEncoder(nn.Module):
         cell = value + self.name_proj(name).unsqueeze(0)          # + RT name token
         return cell, value
 
-    def forward(self, cb: CellBatch, return_value: bool = False):
-        """-> cell states ``[B, S, d_model]`` (zeros at pad). If ``return_value``, also the value
-        component ``[B, S, d_model]`` (the input to the ``value`` routing arm)."""
+    def forward(self, cb: CellBatch):
+        """-> cell states ``[B, S, d_model]`` (zeros at pad).
+
+        The value component is no longer returned: it fed the retired ``value`` routing arm.
+        ``encode_type`` still yields it, because ``cell = value + name`` is how the cell token is
+        built and separating the two is what makes the additive structure legible."""
         dev = self.name_emb.device
         h = torch.zeros(cb.num_seeds, cb.seq_len, self.d_model, device=dev)
-        hv = torch.zeros_like(h) if return_value else None
         for nt in cb.tf_dict:
             if nt not in self.cell_encoders or nt not in cb.cell_placement:
                 continue
-            cell, value = self.encode_type(nt, cb.tf_dict[nt])   # [n, C, d_model]
+            cell, _value = self.encode_type(nt, cb.tf_dict[nt])  # [n, C, d_model]
             b_idx, s_idx, row_idx, col_idx = cb.cell_placement[nt]
             b_idx, s_idx = b_idx.to(dev), s_idx.to(dev)
             row_idx, col_idx = row_idx.to(dev), col_idx.to(dev)
             h[b_idx, s_idx] = cell[row_idx, col_idx]
-            if return_value:
-                hv[b_idx, s_idx] = value[row_idx, col_idx]
         mask = (~cb.is_padding).to(dev).unsqueeze(-1)
-        if return_value:
-            return h * mask, hv * mask
         return h * mask

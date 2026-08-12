@@ -45,7 +45,6 @@ def main() -> int:
     from gloss.text.schema import build_table_name_embeddings, role_name_embeddings_with_none
     from gloss.train.finetune import _name_encoder, name_embeddings, train_prebuilt
     sys.path.insert(0, str(REPO / "scripts"))
-    from run_ablation_phases import TWO_LEVEL_PHASES
 
     if not torch.cuda.is_available():
         print("no CUDA — this probe is meaningless on CPU")
@@ -56,10 +55,9 @@ def main() -> int:
     name_emb = name_embeddings(bundle, args.dataset, encoder=args.encoder, d_text=d_text)
     enc = _name_encoder(args.dataset, encoder=args.encoder, d_text=d_text)
     mk = dict(d_model=args.d_model, n_blocks=args.n_blocks, n_heads=8, d_ff=args.d_model * 4,
-              num_experts=4, enc_channels=args.d_model, k=2, arch="two_level",
+              num_experts=4, enc_channels=args.d_model, k=2,
               table_name_emb=build_table_name_embeddings(bundle, enc, kind="query"),
-              role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"),
-              **TWO_LEVEL_PHASES["full"])
+              role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query"))
 
     dev = torch.cuda.get_device_name(0)
     total = torch.cuda.get_device_properties(0).total_memory / 2**30

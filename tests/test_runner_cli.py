@@ -32,15 +32,15 @@ def _load(mod_name: str):
 @pytest.mark.parametrize(
     "argv, expected",
     [
-        (["--index", "0", "--arch", "two_level", "--phase", "full", "--encoder", "qwen"],
-         {"arch": "two_level", "phase": "full", "encoder": "qwen"}),
-        (["--index", "5", "--arch", "two_level", "--phase", "phase0a", "--encoder", "harrier"],
-         {"arch": "two_level", "phase": "phase0a", "encoder": "harrier"}),
+        (["--index", "0", "--arch", "two_level", "--encoder", "qwen"],
+         {"arch": "two_level", "encoder": "qwen"}),
+        (["--index", "5", "--arch", "two_level", "--encoder", "harrier"],
+         {"arch": "two_level", "encoder": "harrier"}),
         (["--index", "5", "--encoder", "harrier"],            # the flag that silently ran qwen
-         {"arch": "rt", "phase": "full", "encoder": "harrier"}),
+         {"arch": "two_level", "encoder": "harrier"}),
     ],
 )
-def test_gridsearch_main_forwards_arch_phase_encoder(monkeypatch, tmp_path, argv, expected):
+def test_gridsearch_main_forwards_arch_and_encoder(monkeypatch, tmp_path, argv, expected):
     rg = _load("run_gridsearch")
     seen = {}
 
@@ -66,7 +66,7 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
     seen = {}
     monkeypatch.setattr(rg, "run_index", lambda index, **kw: (seen.update(kw), {})[1])
     monkeypatch.setattr(sys, "argv", [
-        "run_gridsearch.py", "--index", "0", "--arch", "two_level", "--phase", "full",
+        "run_gridsearch.py", "--index", "0", "--arch", "two_level",
         "--encoder", "harrier", "--seeds", "2", "--epochs", "7", "--num-workers", "3",
         "--seq-len", "256", "--max-fk", "4", "--tasks", "regression", "--reg-loss", "l1",
         "--bin-loss", "auc", "--out-dir", str(tmp_path),
@@ -74,15 +74,15 @@ def test_gridsearch_forwards_every_run_index_knob(monkeypatch, tmp_path):
     assert rg.main() == 0
     assert seen == {
         "seeds": 2, "epochs": 7, "num_workers": 3, "seq_len": 256, "max_fk": 4,
-        "out_dir": tmp_path, "arch": "two_level", "phase": "full", "encoder": "harrier",
+        "out_dir": tmp_path, "arch": "two_level", "encoder": "harrier",
         "task_set": "regression", "regression_loss": "l1", "binary_loss": "auc",
         # defaults must be forwarded too — an unset knob that silently keeps run_index's own default
         # is fine only while the two agree, and they drift
         "lr_set": "default", "optimizer": "adamw", "weight_decay": 0.01,
         "target_scaling": "zscore", "clamp_pct": None, "batch_size": None, "accum": 1,
-        "grid_set": "default", "patience": 3, "recency_channel": "off",
+        "grid_set": "default", "patience": 3,
         "select": "argmax", "select_window": 5, "deterministic": False,
-        "cell_attn_backend": "sdpa", "broadcast": None,
+        "cell_attn_backend": "sdpa",
     }
     # the grid `--list` reports must be the grid the run path indexes
     assert len(rg.jobs(2, "two_level")) == len(rg.two_level_grid()) * len(rg.TASKS) * 2
@@ -113,9 +113,6 @@ def test_select_flags_reach_train_prebuilt_and_the_record(monkeypatch, tmp_path)
     assert run("--cell-attn-backend", "flex") == 0
     assert seen["cell_attn_backend"] == "flex"
 
-    # None (not "additive") is the default, so the phase preset stays in charge unless overridden
-    assert run() == 0 and seen["broadcast"] is None
-    assert run("--broadcast", "attention") == 0 and seen["broadcast"] == "attention"
     # flex's backward accumulates with atomics, so a run stamped `deterministic: true` while using
     # it would be claiming a reproducibility it does not have. Refuse the combination outright.
     with pytest.raises(SystemExit):
@@ -155,22 +152,6 @@ def test_task_set_changes_the_index_mapping_consistently(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="unknown task_set"):
         rg.jobs(1, "two_level", "nonsense")
-
-
-def test_ablation_main_forwards_arch_and_phase(monkeypatch, tmp_path):
-    """`run_ablation.py` got this right — pin it so it stays right (the headline arrays depend on it)."""
-    ra = _load("run_ablation")
-    seen = {}
-    monkeypatch.setattr(ra.ablation, "run_config", lambda index, **kw: (seen.update(kw), {})[1])
-    monkeypatch.setattr(sys, "argv", [
-        "run_ablation.py", "--index", "0", "--arch", "two_level", "--phase", "full",
-        "--encoder", "qwen", "--seeds", "3", "--datasets", "rel-f1",
-        "--signals", "signature", "--out-dir", str(tmp_path),
-    ])
-    assert ra.main() == 0
-    assert seen.get("arch") == "two_level"
-    assert seen.get("encoder") == "qwen"
-    assert seen.get("two_level"), "--phase full must resolve to a non-empty two_level switch dict"
 
 
 def test_ablation_record_is_self_describing():
@@ -459,15 +440,16 @@ def test_cell_attn_backend_reaches_the_model_kwargs_not_just_the_record(monkeypa
             assert seen.get("cell_attn_backend") == backend
 
 
-@pytest.mark.parametrize("fn_name", ["router_diagnostics", "x_channel_diagnostics"])
+@pytest.mark.parametrize("fn_name", ["router_diagnostics"])
 def test_diagnostics_helpers_resolve_every_name_they_reference(fn_name):
     """A diagnostic that raises NameError is caught by its own guard and reported as a *string*, so
     the run succeeds and the instrumentation is simply absent.
 
-    `x_channel_diagnostics` shipped referencing `make_loader`/`to_cell_batch`, which are imported
-    INSIDE `router_diagnostics` and therefore not module-level names. Every completed x-arm recorded
-    `x_channel_error: NameError(...)` instead of kappa/alpha -- the two numbers that decide whether
-    the arm tested the hypothesis at all. Compile-time name resolution catches this without a GPU.
+    The now-retired `x_channel_diagnostics` shipped referencing `make_loader`/`to_cell_batch`, which
+    are imported INSIDE `router_diagnostics` and therefore not module-level names. Every completed
+    x-arm recorded `x_channel_error: NameError(...)` instead of kappa/alpha -- the two numbers that
+    decided whether the arm tested its hypothesis at all. Compile-time name resolution catches this
+    without a GPU, and the guard stays for whatever diagnostic is added next.
     """
     import inspect
 

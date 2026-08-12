@@ -142,13 +142,6 @@ def test_an_unknown_backend_is_rejected():
         CellAttention(32, 4, TimeLadder(), backend="flash")
 
 
-def test_flex_refuses_the_four_mask_parity_path():
-    """`four_mask` is the frozen RT parity guard; a different kernel there would void the guard."""
-    with pytest.raises(ValueError, match="requires cell_attention='full'"):
-        TwoLevelBlock(32, 64, 16, TimeLadder(), torch.randn(5, 12), torch.randn(4, 12),
-                      n_heads=4, cell_attention="four_mask", cell_attn_backend="flex")
-
-
 def test_a_head_dim_below_16_is_rejected_at_construction():
     """Flex lowers to `tl.dot`, which needs head_dim >= 16 — and only says so ~40 lines into an
     inductor dump, at the first backward of a training run. `d_model=128, n_heads=8` is exactly on
@@ -173,10 +166,10 @@ def test_the_substrate_builds_the_block_mask_once_per_forward():
               role_name_emb=torch.randn(4, 12), col_name_emb=torch.randn(5, 12))
     sub = TwoLevelSubstrate(32, 64, kw["d_sig"], kw["table_name_emb"], kw["role_name_emb"],
                             kw["col_name_emb"], n_blocks=2, n_heads=2,
-                            cell_attention="full", cell_attn_backend="flex")
+                            cell_attn_backend="flex")
     assert sub.needs_block_mask
     plain = TwoLevelSubstrate(32, 64, kw["d_sig"], kw["table_name_emb"], kw["role_name_emb"],
-                              kw["col_name_emb"], n_blocks=2, n_heads=2, cell_attention="full")
+                              kw["col_name_emb"], n_blocks=2, n_heads=2)
     assert not plain.needs_block_mask
 
 
@@ -246,8 +239,7 @@ def test_the_whole_substrate_agrees_across_backends():
         torch.manual_seed(0)                        # same init for both, or the comparison is noise
         # n_heads=2, not the stub's usual 4: flex needs d_model//n_heads >= FLEX_MIN_HEAD_DIM
         return TwoLevelSubstrate(D_MODEL, 2 * D_MODEL, D_SIG, tab, role, col,
-                                 n_blocks=2, n_heads=2, cell_attention="full",
-                                 cell_rope_time=True, time_bias="rope",
+                                 n_blocks=2, n_heads=2,
                                  cell_attn_backend=backend).to(dev)
 
     torch.manual_seed(1)

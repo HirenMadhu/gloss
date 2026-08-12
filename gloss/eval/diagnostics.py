@@ -55,7 +55,7 @@ def specialization_probe(model) -> dict[int, int]:
     if moe is None:
         return {}
     # Ask the signature for the column table rather than rebuilding it here: this used to inline
-    # `sig.recency_emb(zeros)`, which only exists under time_mode="buckets" and raised AttributeError
+    # `sig.recency_emb(zeros)`, from the retired bucket time mode, which raised AttributeError
     # under "rope" — the mode the two-level runs actually use, so the probe was dead on arrival.
     z = sig.column_signature()                                # [C, d_sig]
     expert = moe._logits(z).argmax(dim=-1)                    # [C]

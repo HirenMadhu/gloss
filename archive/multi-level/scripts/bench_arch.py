@@ -48,7 +48,6 @@ def main() -> int:
 
     from gloss.model.more import MoRE
     from gloss.text.schema import build_table_name_embeddings, role_name_embeddings_with_none
-    from run_ablation_phases import TWO_LEVEL_PHASES
     sys.path.insert(0, str(REPO / "tests"))
     from tests._relf1 import name_table, sample_cell_batch
 
@@ -82,7 +81,6 @@ def main() -> int:
         arch="two_level",
         table_name_emb=build_table_name_embeddings(bundle, enc, kind="query").to(dev),
         role_name_emb=role_name_embeddings_with_none(bundle, enc, kind="query").to(dev),
-        **TWO_LEVEL_PHASES["full"],
     )
 
     rows = []

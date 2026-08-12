@@ -4,7 +4,6 @@ from __future__ import annotations
 import torch
 
 from gloss.data.collate import column_vocab, feature_col_names, to_cell_batch
-from gloss.model.rt_substrate import RTSubstrate, build_relational_masks
 
 from .conftest import ENTITY, make_synth_batch, synthetic_bundle
 
@@ -52,37 +51,3 @@ def test_f2p_neighbors_point_to_parent_user():
         assert nbrs and set(nbrs).issubset(user_nodes)
 
 
-def test_relational_masks():
-    cb = _cb()
-    m = build_relational_masks(cb)
-    B, S = cb.node_idxs.shape
-    for name in ("col", "feat", "nbr", "full"):
-        assert m[name].shape == (B, S, S) and m[name].dtype == torch.bool
-        # no query row fully masked (identity OR-ed in) -> finite softmax
-        assert m[name].any(dim=2).all()
-    b = 0
-    user_tid = synthetic_bundle().node_type_id["user"]
-    event_tid = synthetic_bundle().node_type_id["event"]
-    user_cells = (cb.table_idxs[b] == user_tid).nonzero(as_tuple=True)[0]
-    event_cells = (cb.table_idxs[b] == event_tid).nonzero(as_tuple=True)[0]
-    su, se = int(user_cells[0]), int(event_cells[0])
-    # feat: an event cell attends its parent user (forward FK); nbr is the reverse
-    assert bool(m["feat"][b, se, su])
-    assert bool(m["nbr"][b, su, se])
-    # real cells never attend pad cells
-    pad = cb.is_padding[b]
-    assert not bool(m["full"][b, su][pad].any())
-
-
-def test_substrate_forward_finite_and_pad_zero():
-    cb = _cb()
-    torch.manual_seed(0)
-    x = torch.randn(cb.num_seeds, cb.seq_len, 16)
-    sub = RTSubstrate(d_model=16, n_blocks=2, n_heads=4, d_ff=32)
-    with torch.no_grad():
-        y, aux = sub(x, cb)
-    assert y.shape == x.shape
-    assert float(aux) == 0.0          # dense substrate has no router
-    assert torch.isfinite(y).all()
-    # padded positions are zeroed out
-    assert torch.allclose(y[cb.is_padding], torch.zeros_like(y[cb.is_padding]))
