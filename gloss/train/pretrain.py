@@ -35,6 +35,7 @@ import torch
 
 from ..data.collate import to_cell_batch
 from ..data.masking import build_column_target_spec, gather_masked_targets, sample_cell_mask
+from ..data.pretrain_loader import split_key
 from ..model.mlm_head import MaskedCellHead
 from ..model.more import MoRE
 
@@ -89,6 +90,9 @@ class MoREPretrainLitModule(pl.LightningModule):
         bundle,
         name_emb,
         *,
+        bank=None,
+        bundles: dict | None = None,
+        specs: dict | None = None,
         model_kwargs: dict | None = None,
         route_on: str = "signature",
         p_random: float = 0.15,
@@ -107,6 +111,7 @@ class MoREPretrainLitModule(pl.LightningModule):
     ):
         super().__init__()
         self.bundle = bundle
+        self.bundles = dict(bundles or {})
         self.p_random = p_random
         self.seed_target = seed_target
         self.lambda_ortho = lambda_ortho
@@ -118,6 +123,10 @@ class MoREPretrainLitModule(pl.LightningModule):
         mk = dict(model_kwargs or {})
         mk.pop("d_text", None)
         self.model = MoRE(bundle, name_emb, route_on=route_on, **mk)
+        # Multi-database: ONE set of weights (the schema-free encoder makes them identical across
+        # schemas) plus a bank of frozen tables bound per batch, and one target spec per database.
+        self.bank = bank
+        self.specs = dict(specs) if specs else {}
         self.spec = build_column_target_spec(bundle, self.model.encoder)
         # Tie the head to whatever category table the chosen encoder exposes: torch_frame's learned
         # per-DB embedding (width `enc_channels`) or the schema-free encoder's frozen LABEL table
@@ -138,27 +147,35 @@ class MoREPretrainLitModule(pl.LightningModule):
         the pretrain stream deliberately draws each batch's seeds from one table (see
         `data/pretrain_loader.py`).
         """
-        node_type, raw = batch
-        cb = to_cell_batch(raw, self.bundle, node_type, seq_len=self.seq_len,
+        key, raw = batch
+        dataset, node_type = split_key(key)
+        bundle = self.bundles.get(dataset, self.bundle) if dataset else self.bundle
+        cb = to_cell_batch(raw, bundle, node_type, seq_len=self.seq_len,
                            max_fk=self.max_fk, max_rows=self.max_rows)
-        return node_type, cb.to(device)
+        return key, cb.to(device)
 
     # -- objective ----------------------------------------------------------------------------
-    def _masked_loss(self, node_type, cb, *, step_seed: int):
+    def _masked_loss(self, key, cb, *, step_seed: int):
+        dataset, node_type = split_key(key)
+        spec = self.specs.get(dataset, self.spec)
+        if self.bank is not None and dataset:
+            # Point the shared weights at this database's frozen tables. Pure reference assignment;
+            # safe because every batch is one (dataset, table) and the schedule is rank-identical.
+            self.bank.bind(self.model, dataset)
         g = torch.Generator(device=cb.col_idxs.device).manual_seed(step_seed)
-        mask, seed = sample_cell_mask(cb, self.spec, p_random=self.p_random,
+        mask, seed = sample_cell_mask(cb, spec, p_random=self.p_random,
                                       seed_target=self.seed_target, generator=g)
-        targets = gather_masked_targets(cb, self.spec, mask, seed)
+        targets = gather_masked_targets(cb, spec, mask, seed)
         _logits, aux, cells = self.model(cb, cell_mask=mask, return_cells=True)
-        loss, stats = self.head(cells, targets, self.spec, self.model.category_table(node_type))
+        loss, stats = self.head(cells, targets, spec, self.model.category_table(node_type))
         stats["frac_masked"] = float(mask.sum()) / max(int((~cb.is_padding).sum()), 1)
         stats["occupancy"] = float((~cb.is_padding).float().mean())
         return loss, aux, stats
 
     def training_step(self, batch, batch_idx):
-        node_type, cb = batch
+        key, cb = batch
         # Seeded per global step so the mask is reproducible on resume and identical across ranks.
-        loss, aux, stats = self._masked_loss(node_type, cb,
+        loss, aux, stats = self._masked_loss(key, cb,
                                              step_seed=self.mask_seed * 1_000_003 + self.global_step)
         total = loss + self.lambda_ortho * aux
         self._cells += int((~cb.is_padding).sum())
@@ -169,14 +186,14 @@ class MoREPretrainLitModule(pl.LightningModule):
         self.log("train/cells_per_s", self._cells / max(time.time() - self._t0, 1e-9),
                  batch_size=bs)
         self.log("train/lr", self.optimizers().param_groups[0]["lr"], batch_size=bs)
-        self.log("train/table", float(hash(node_type) % 1000), batch_size=bs)
+        self.log("train/table", float(abs(hash(key)) % 1000), batch_size=bs)
         return total
 
     def validation_step(self, batch, batch_idx):
-        node_type, cb = batch
+        key, cb = batch
         # Fixed seed, so val masks the SAME cells every epoch: otherwise the metric moves because the
         # question changed, not because the model did.
-        loss, aux, stats = self._masked_loss(node_type, cb, step_seed=7_919 + batch_idx)
+        loss, aux, stats = self._masked_loss(key, cb, step_seed=7_919 + batch_idx)
         bs = int(cb.num_seeds)
         self.log("val/loss", loss, prog_bar=True, batch_size=bs, sync_dist=True)
         self.log_dict({f"val/{k}": v for k, v in stats.items()}, batch_size=bs, sync_dist=True)

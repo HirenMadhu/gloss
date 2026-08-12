@@ -315,3 +315,44 @@ different time can carry a different schema. Stable across repeated calls today;
 authoritative and `run_pretrain.py` always uses it.
 
 DoD: `pytest` **327 passed**.
+
+**Phase 4 — multi-database pretraining [done].** `gloss/model/schema_bank.py` +
+`build_multi_pretrain_stream`. Because the schema-free encoder already makes the weights identical
+across schemas, this needed **no adapters and no parameter surgery**: one model, plus a `SchemaBank`
+that rebinds each database's frozen tables (`name_emb`, `cat_emb`, col stats, layout, table/role
+tables) before each batch. Binding is a pointer assignment, safe because every tensor involved is a
+non-persistent buffer, batches are one-`(dataset, table)` by construction, and the schedule is
+rank-identical. The stream is keyed `"<dataset>/<table>"` with table weights ∝ maskable rows scaled by
+a per-dataset weight (without it rel-event's 44.8M rows would drown rel-f1's 0.1M, a 450x ratio).
+Smoke: rel-f1 + rel-stack, one 7.3M-param model over 14 seed tables, trains and validates.
+
+*Bug found:* `SchemaBank.to()` never fired — `nn.Module.to` recurses into children via `_apply`, so a
+`to()` override on a child is skipped when the *parent* moves, which is what Lightning does. Symptom
+was a CPU/CUDA mismatch on the first non-anchor batch. Overrides `_apply` now.
+
+`tests/test_schema_bank.py` pins the two claims the design rests on: binding leaves every `state_dict`
+entry byte-identical, and **a model bound to database B produces the same logits and cell states as a
+model built on B**.
+
+**Phase 5 — calibration + production launchers [done].** `scripts/calibrate_fanout.py`,
+`scripts/run_pretrain.sh` (4xH100, `--cpus-per-task=40` because the collate is the bottleneck at
+121-353 ms/batch against the sampler's 50-60, DDP with `find_unused_parameters` for sparse dispatch
+and per-node-type encoders, always `--resume`), and `scripts/launch_lodo.sh` (7 folds or the all-7
+model, chained with `--dependency=afterany` for the 16 h wall).
+
+**Measured fanout on rel-f1 @ seq_len=1024** — the default `[12,12]` is half empty:
+
+| fanout | cells/seed | occupancy | R | truncated |
+|---|---|---|---|---|
+| [6,6] | 277 | 27% | 63 | 0 |
+| [12,12] | 517 | 50% | 117 | 0 |
+| [24,24] | 894 | **87%** | 243 | 8 |
+| [48,48] | 986 | 96% | 375 | 19 |
+
+Throughput is flat at ~27k cells/s across all four, so a richer fanout is nearly free per *cell* —
+it buys ~3x more content per sequence for the same cell throughput. Two bugs fixed here: the
+recommendation preferred max occupancy, which selects the arm that truncates *hardest*; and
+`launch_lodo.sh` sized memory off `--holdout rel-amazon`, which is precisely the one fold that does
+**not** load rel-amazon (also `A || B && C` groups as `(A||B) && C` in bash).
+
+DoD: `pytest` **332 passed**.

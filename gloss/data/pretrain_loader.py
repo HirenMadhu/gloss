@@ -206,14 +206,53 @@ class RoundRobinLoader:
 
 def build_pretrain_stream(bundle, spec, *, split: str = "train", steps: int, batch_size: int = 64,
                           num_neighbors=None, num_workers: int = 0, seed: int = 0,
-                          max_seeds_per_table: int | None = None) -> RoundRobinLoader:
-    """The whole thing: eligible seeds -> per-table loaders -> one weighted round-robin stream."""
+                          max_seeds_per_table: int | None = None,
+                          key_prefix: str = "") -> RoundRobinLoader:
+    """The whole thing: eligible seeds -> per-table loaders -> one weighted round-robin stream.
+
+    ``key_prefix`` namespaces the stream keys as ``"<dataset>/<table>"`` so several databases can be
+    merged into one mixture without their table names colliding (rel-f1 and rel-stack both have
+    ``users``-like tables, and `to_cell_batch` needs the *table*, the trainer needs the *database*).
+    """
     tables = build_seed_tables(bundle, spec, split,
                                generator=torch.Generator().manual_seed(seed))
     loaders, weights = {}, {}
     for st in tables:
-        loaders[st.node_type] = make_pretrain_loader(
+        key = f"{key_prefix}{st.node_type}"
+        loaders[key] = make_pretrain_loader(
             bundle, st, num_neighbors=num_neighbors, batch_size=batch_size,
             shuffle=(split == "train"), num_workers=num_workers, max_seeds=max_seeds_per_table)
-        weights[st.node_type] = st.weight
+        weights[key] = st.weight
+    return RoundRobinLoader(loaders, weights, steps=steps, seed=seed)
+
+
+def split_key(key: str) -> tuple[str, str]:
+    """``"rel-f1/results"`` -> ``("rel-f1", "results")``; a bare table -> ``("", table)``."""
+    return tuple(key.split("/", 1)) if "/" in key else ("", key)  # type: ignore[return-value]
+
+
+def build_multi_pretrain_stream(bundles: dict, specs: dict, *, split: str = "train", steps: int,
+                                batch_size: int = 64, num_neighbors=None, num_workers: int = 0,
+                                seed: int = 0, max_seeds_per_table: int | None = None,
+                                dataset_weights: dict | None = None) -> RoundRobinLoader:
+    """One mixture over several databases, keyed ``"<dataset>/<table>"``.
+
+    Table weights stay proportional to **maskable rows** within a database and are then scaled by
+    ``dataset_weights`` (default 1.0 each). Without that scaling the mixture is dominated by whichever
+    database is largest — rel-event alone is 44.8M rows against rel-f1's 0.1M, a 450x ratio, so the
+    small databases would contribute essentially nothing over a 50k-step budget. Making it an explicit
+    knob keeps the choice visible instead of implicit in the row counts.
+    """
+    loaders, weights = {}, {}
+    for ds, bundle in bundles.items():
+        sub = build_pretrain_stream(bundle, specs[ds], split=split, steps=1,
+                                    batch_size=batch_size, num_neighbors=num_neighbors,
+                                    num_workers=num_workers, seed=seed,
+                                    max_seeds_per_table=max_seeds_per_table,
+                                    key_prefix=f"{ds}/")
+        scale = float((dataset_weights or {}).get(ds, 1.0))
+        total = sum(sub.probs.tolist()) or 1.0
+        for i, name in enumerate(sub.names):
+            loaders[name] = sub.loaders[name]
+            weights[name] = float(sub.probs[i]) / total * scale
     return RoundRobinLoader(loaders, weights, steps=steps, seed=seed)
