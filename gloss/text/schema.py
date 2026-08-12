@@ -149,10 +149,19 @@ def category_index(bundle) -> tuple[dict[tuple[str, str], tuple[int, int]], list
 
 
 def build_category_name_embeddings(bundle, encode, *, kind: str = "document") -> Tensor:
-    """Frozen ``[1 + total_categories, d_text]`` table of category-label embeddings (row 0 = zero)."""
+    """Frozen ``[1 + total_categories, d_text]`` table of category-label embeddings (row 0 = zero).
+
+    Row 0's placeholder is embedded and then zeroed, rather than skipped, so the table has the
+    encoder's width **even when the database has no categorical columns at all**. rel-avito is exactly
+    that case (0 of 26 columns), and returning a width-1 table there made the shared
+    ``proj_cat`` come out ``Linear(1, e)`` instead of ``Linear(d_text, e)`` — which silently broke the
+    identical-weights property for every run containing rel-avito, i.e. 6 of the 7 LODO folds and the
+    all-7 model.
+    """
     _index, texts = category_index(bundle)
-    emb = _embed(texts[1:], encode, kind) if len(texts) > 1 else torch.zeros(0, 1)
-    return torch.cat([torch.zeros(1, emb.shape[-1], dtype=emb.dtype), emb], dim=0)
+    emb = _embed(texts, encode, kind)
+    emb[0] = 0.0                                   # the unknown / missing slot
+    return emb
 
 
 def _embed(texts: list[str], encode, kind: str) -> Tensor:

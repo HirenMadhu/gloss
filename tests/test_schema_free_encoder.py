@@ -143,3 +143,19 @@ def test_timestamp_year_uses_one_global_normalizer():
                                 build_category_name_embeddings(bundle, ENC), d_model=D_MODEL)
     assert enc.year_stats.shape == (2,), "one mean and one std for the entire database"
     assert float(enc.year_stats[1]) > 0
+
+
+@rel_f1_available
+def test_a_database_with_no_categorical_columns_still_gives_the_right_width():
+    """rel-avito has 0 categorical columns of 26. Its frozen label table must still be `d_text` wide,
+    or the SHARED `proj_cat` comes out `Linear(1, e)` and every mixture containing rel-avito loses the
+    identical-weights property -- 6 of the 7 LODO folds and the all-7 model."""
+    from gloss.data.collate import column_vocab
+
+    bundle, _t = bundle_and_task()
+    table = build_category_name_embeddings(bundle, ENC)
+    assert table.shape[-1] == ENC.dim, table.shape
+    assert torch.equal(table[0], torch.zeros(ENC.dim)), "row 0 is the unknown slot and must be zero"
+    # the width must come from the ENCODER, never from the number of categories
+    assert table.shape[0] == 1 + sum(n for _b, n in category_index(bundle)[0].values())
+    assert len(column_vocab(bundle)) > 0
