@@ -296,7 +296,10 @@ def test_row_moe_dense_combine_equals_weighted_expert_sum(use_shared):
     x = moe.norm(u)
     ref = sum(g[..., e:e + 1] * moe.experts[e](x) for e in range(4))
     if use_shared:
-        ref = ref + moe.shared(x)          # always-on, NOT multiplied by any gate
+        # `shared` is None or a ModuleList (it generalized from a bare module when the cell level
+        # gained a shared *pool*); `use_shared=True` still means exactly one, ungated.
+        assert len(moe.shared) == 1
+        ref = ref + sum(m(x) for m in moe.shared)   # always-on, NOT multiplied by any gate
     assert torch.allclose(out - u, ref, atol=1e-5)
 
 
@@ -389,7 +392,7 @@ def test_shared_expert_is_always_on_regardless_of_gates():
     x = shared.norm(u)
     routed = sum(g[..., e:e + 1] * shared.experts[e](x) for e in range(shared.num_experts))
     # output = u + routed + shared(x); the shared term is NOT gated
-    assert torch.allclose(out - u - routed, shared.shared(x), atol=1e-5)
+    assert torch.allclose(out - u - routed, sum(m(x) for m in shared.shared), atol=1e-5)
 
 
 def test_routed_only_still_available_for_the_ablation():

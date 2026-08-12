@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .moe import SwiGLU
+from .moe import DISPATCHES, SwiGLU, apply_shared, sparse_combine
 from .time_encoding import TimeLadder
 
 # `adj_role` direction classes for γ's `c^(h)_dir` term (§3.5): three learned directions, so `K`
@@ -376,30 +376,43 @@ class RowMoE(nn.Module):
         num_experts: int = 4,
         k: int = 2,
         use_shared: bool = True,
+        num_shared: int | None = None,
         lambda_ortho: float = 0.5,
         lambda_balance: float = 0.01,
+        dispatch: str = "dense",
     ):
         super().__init__()
+        if dispatch not in DISPATCHES:
+            raise ValueError(f"unknown dispatch {dispatch!r}; expected one of {DISPATCHES}")
         self.num_experts = num_experts
         self.k = min(k, num_experts)
         self.lambda_ortho = lambda_ortho
         self.lambda_balance = lambda_balance
+        self.dispatch = dispatch
         self.norm = RMSNorm(d_model)
         self.experts = nn.ModuleList(SwiGLU(d_model, d_ff) for _ in range(num_experts))
-        # SHARED + ROUTED (DeepSeek-MoE style), and ON by default at the row level. The shared expert
-        # is always applied, so the routed experts only have to model what is *specific* to a row's
+        # SHARED + ROUTED (DeepSeek-MoE style), and ON by default at the row level. Shared experts are
+        # always applied, so the routed experts only have to model what is *specific* to a row's
         # signature rather than re-learning the shared transform in every expert. Note the cell level
-        # keeps `use_shared=False` (its `+S` arm measured as only mildly positive, on regression
+        # defaults to no shared expert (its `+S` arm measured as only mildly positive, on regression
         # alone), so the two levels deliberately differ here.
-        self.shared = SwiGLU(d_model, d_ff) if use_shared else None
+        #
+        # `use_shared` is the original boolean and stays the default path; `num_shared` generalizes it
+        # to a pool and wins when given. `self.shared` is None or a ModuleList, never a bare module.
+        n_shared = int(use_shared) if num_shared is None else int(num_shared)
+        self.num_shared = n_shared
+        self.shared = nn.ModuleList(SwiGLU(d_model, d_ff) for _ in range(n_shared)) or None
         self.w_g = nn.Parameter(torch.randn(num_experts, d_sig) * d_sig ** -0.5)
         self.log_T = nn.Parameter(torch.zeros(()))                         # T = exp(0) = 1.0
 
-    def gates(self, z: Tensor) -> Tensor:
+    def _gates_topi(self, z: Tensor) -> tuple[Tensor, Tensor]:
         logits = (F.normalize(z, dim=-1) @ F.normalize(self.w_g, dim=-1).t()) / self.log_T.exp()
         topv, topi = logits.topk(self.k, dim=-1)
         masked = torch.full_like(logits, float("-inf")).scatter_(-1, topi, topv)
-        return torch.softmax(masked, dim=-1)
+        return torch.softmax(masked, dim=-1), topi
+
+    def gates(self, z: Tensor) -> Tensor:
+        return self._gates_topi(z)[0]
 
     def ortho_loss(self) -> Tensor:
         W = F.normalize(self.w_g, dim=-1)
@@ -419,15 +432,22 @@ class RowMoE(nn.Module):
         return self.num_experts * (f * p).sum()
 
     def forward(self, u: Tensor, z: Tensor, cb) -> tuple[Tensor, Tensor, dict]:
-        g = self.gates(z)
+        g, topi = self._gates_topi(z)
         x = self.norm(u)
-        y = torch.zeros_like(u)
-        for e, expert in enumerate(self.experts):                          # dense combine (MVP)
-            y = y + g[..., e:e + 1] * expert(x)
-        if self.shared is not None:
-            y = y + self.shared(x)                                         # always-on, ungated
-
         valid = cb.row_valid
+        if self.dispatch == "sparse":
+            # Padding rows are a large fraction of R (the axis is fitted to the widest seed in the
+            # batch), and unlike the cell level they were never masked out of the dense combine.
+            y = sparse_combine(x, g, topi, self.experts, valid=valid)
+            if self.shared is not None:
+                y = y + apply_shared(x, self.shared, valid=valid)
+        else:
+            y = torch.zeros_like(u)
+            for e, expert in enumerate(self.experts):                      # dense combine
+                y = y + g[..., e:e + 1] * expert(x)
+            if self.shared is not None:
+                y = y + apply_shared(x, self.shared)                       # always-on, ungated
+
         aux = self.lambda_ortho * self.ortho_loss() \
             + self.lambda_balance * self.balance_loss(g, valid)
 

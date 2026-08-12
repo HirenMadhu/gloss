@@ -19,7 +19,8 @@ from .conftest import rel_f1_available
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _small_module(bundle, name_emb, entity_table, *, task_type="binary") -> MoRELitModule:
+def _small_module(bundle, name_emb, entity_table, *, task_type="binary",
+                  device=None) -> MoRELitModule:
     seed_everything(0)
     module = MoRELitModule(
         bundle, name_emb, entity_table, task_type=task_type,
@@ -28,7 +29,7 @@ def _small_module(bundle, name_emb, entity_table, *, task_type="binary") -> MoRE
                           role_name_emb=role_name_embeddings_with_none(bundle, HashEncoder(dim=64))),
         lr=5e-3, seq_len=256, max_fk=5,
     )
-    return module.to(_DEVICE)
+    return module.to(device or _DEVICE)
 
 
 @rel_f1_available
@@ -82,19 +83,41 @@ def test_gradients_reach_encoder_and_head():
 
 @rel_f1_available
 def test_regression_overfits_single_batch():
-    """The regression path (continuous target via masked MSE) can memorize one batch."""
+    """The regression path (continuous target via masked MSE) can memorize one batch.
+
+    Pinned to **CPU**, unlike the rest of this module, and the reason is measured. This test used to
+    fail about one run in three, from two independent causes:
+
+    1. *The fixture, not the model.* ``HashTextEmbedder`` seeded its per-string RNG with Python's
+       builtin ``hash()``, which is randomized per process, so ``sample_cell_batch`` materialized a
+       different rel-f1 every run. Fixed at the source in ``gloss/data/graph.py``.
+    2. *The optimization does not survive CUDA nondeterminism.* ``RowPool``'s ``index_add``
+       reductions use CUDA atomics (its own docstring says so), giving ~1.5e-7 between two identical
+       forwards. Compounded over a few hundred AdamW steps that is not last-bit noise, it is a
+       different basin: with the fixture fixed and ``init`` identical to 4 decimal places, three
+       sequential CUDA trials of this exact fit reached 0.5431 / 0.0000 / 1.1412 at step 200, and the
+       third was still at 0.9655 at step 600. ``seed_everything(deterministic_torch=True)`` does not
+       help — it passes ``warn_only=True`` and the offending scatter has no deterministic CUDA
+       kernel to fall back to.
+
+    On CPU the same fit is bit-reproducible (0.000004 at step 200 in three consecutive trials, five
+    orders of magnitude under the threshold) and *faster* than the CUDA path, 16 s against 34 s, since
+    the model is deliberately tiny. The binary sibling above stays on CUDA: it converges to 0.0000 by
+    step 200 in every trial, so it has no margin to lose.
+    """
     bundle, task, cb = sample_cell_batch(seq_len=256, batch_size=16)
-    cb = cb.to(_DEVICE)
+    cb = cb.to("cpu")
     name_emb = name_table()
-    module = _small_module(bundle, name_emb, task.entity_table, task_type="regression")
+    module = _small_module(bundle, name_emb, task.entity_table, task_type="regression",
+                           device="cpu")
     torch.manual_seed(0)
-    y = torch.randn(int(cb.num_seeds), device=_DEVICE)         # synthetic continuous target
+    y = torch.randn(int(cb.num_seeds))                         # synthetic continuous target
     has = torch.ones_like(cb.has_target)
     opt = torch.optim.AdamW(module.parameters(), lr=5e-3, weight_decay=0.0)
     with torch.no_grad():
         init = masked_mse(module(cb), y, has).item()
     final = init
-    for _ in range(200):
+    for _ in range(300):
         opt.zero_grad()
         loss = masked_mse(module(cb), y, has)
         loss.backward()

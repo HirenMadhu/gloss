@@ -151,3 +151,48 @@ DoD: `pytest` **65 passed, 2 skipped** (new: shared/cosine/top-p in `test_moe.py
 grad-flow + additions forward in `test_shapes.py`; `test_ablation` green via the `variant` fallback). Hash-
 encoder smokes on the H200 trained the `hybrid` arm and S/H additions and produced a per-variant aggregate
 table with Δ vs a chosen baseline. Real runs use the **harrier** schema cache (one-time prep) on `gpu_h200`.
+
+---
+
+**Masked-cell pretraining, Phase 0 — a real cell-text encoder [done].** `build_gloss_graph` had a
+`text_embedder` argument that **no call site anywhere ever passed** (18 checked), so every graph cache
+on scratch held `EMB_DIM=32` `HashTextEmbedder` noise for free-text **cell values**. That is not a
+corner: rel-trial is 47/102 columns free text, rel-stack 15/32, rel-f1 13/45 — roughly half of every
+schema was blank input. (The frozen **qwen column-NAME** table, which is what the router routes on, was
+always real and is untouched. Two text tables, two jobs; see `prep_data.py`'s header.)
+
+Added `minilm` (`all-MiniLM-L12-v2`, d=384 — RT's own cell-text encoder) to `ENCODER_MODELS` plus
+`text/cache.py:value_encoder`, routed through sentence-transformers rather than `HFLastTokenEmbedder`
+(MiniLM is mean-pooled; last-token pooling would return a padding position). `--text-encoder` threads
+through `build_gloss_graph` → `prep_data.py` → `prep.sh`, and `paths.graph_cache_dir(ds, enc)` keys the
+cache by encoder — `hash` keeps the historical un-suffixed layout, so **every previously reported
+grid/leaderboard number stays readable at the path it was written to**. Measured corpus cost at d=384:
+138 GB / ~96.3M free-text cells (qwen-2560 would have been 918 GB and ~430 GB resident just to load
+rel-amazon). 6 of 7 DBs rebuilt, all reporting `EMB_DIM=384`; rel-amazon still running.
+
+Two bugs found by doing it. (1) sentence-transformers 5.x rejects `float('nan')` outright where
+`HashTextEmbedder`'s `str(s)` swallowed it, so missing text cells killed the pass — `_as_texts` maps
+them to `""`. (2) `prep.sh` ended with `echo`, so its six failed jobs reported `COMPLETED` / rc=0;
+it now propagates the exit code.
+
+**Phase 1 — true sparse MoE dispatch [done].** `MoEFFN`/`RowMoE` evaluated **every** expert on **every**
+token and multiplied the non-top-k ones by a zero gate: the gate was sparse, the compute was not
+(`M×` the FFN FLOPs and activations of a plain SwiGLU). `dispatch ∈ {dense, sparse}` — sparse buckets
+tokens per expert via `moe.sparse_combine` and honours a `valid` mask, which at the cell level is the
+larger win, since a sampled sequence runs 6–20% full at `seq_len=1024` on every DB measured.
+`num_shared` adds ungated always-on experts at either level (`RowMoE.use_shared` still means exactly 1;
+`shared` is now `None`-or-`ModuleList`). `TwoLevelSubstrate` gains `grad_checkpoint` and `mean_aux`
+(aux is a sum over blocks, so `lambda_ortho=0.5` tuned at E=4/8-blocks is a different objective at
+E=8/10-blocks/two-levels). **Dense stays the default and is byte-identical**, so nothing measured moves.
+`tests/test_sparse_moe.py`: sparse ≡ dense in **output and gradients**, shared experts ungated,
+`valid` zeroes exactly the excluded tokens, dense ignores `valid`, grad-checkpointed ≡ plain.
+
+*Two flakes fixed on the way, neither caused by the above.* `HashTextEmbedder` seeded its per-string
+RNG with Python's builtin `hash()` — **randomized per process** — so every cache-less
+`build_gloss_graph` materialized a *different* rel-f1 (its sibling `HashEncoder` always used
+`hashlib`). Now `hashlib`; cached bundles are unaffected because they never call an embedder.
+`test_regression_overfits_single_batch` additionally could not survive CUDA nondeterminism: with the
+fixture fixed and `init` identical to 4 dp, three sequential CUDA trials hit 0.5431 / 0.0000 / 1.1412
+at step 200 and the third was still 0.9655 at step 600 — different basins, not last-bit noise, out of
+`RowPool`'s atomic `index_add`. Pinned to CPU, where it is bit-reproducible (0.000004 at step 200,
+three trials) and *faster*. DoD: `pytest` **281 passed** (258 + 23 new), twice, in 39 s.

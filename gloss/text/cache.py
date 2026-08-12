@@ -32,11 +32,61 @@ QUERY_INSTRUCTION = (
 ENCODER_MODELS = {
     "qwen": "Qwen/Qwen3-Embedding-4B",          # d_text 2560
     "harrier": "microsoft/harrier-oss-v1-27b",   # d_text 5376 (Gemma-3-27B backbone; needs bf16)
+    "minilm": "sentence-transformers/all-MiniLM-L12-v2",   # d 384 — RT's own CELL-TEXT encoder
 }
+
+#: Encoders that must go through sentence-transformers rather than :class:`HFLastTokenEmbedder`.
+#: MiniLM is an encoder-only, **mean-pooled** model — last-token pooling would silently return the
+#: embedding of a padding/`[SEP]` position instead of the sentence. ST reads the pooling config off
+#: the model card, so it gets this right for free.
+ST_ENCODERS = ("qwen", "minilm")
+
+
+def value_encoder(label_or_id: str, *, batch_size: int = 1024, device: str | None = None):
+    """A frozen encoder for **cell VALUES** (free text inside the data), not column names.
+
+    Two text tables exist in this repo and they are not the same thing:
+
+    * column / table / role **names** — tens of strings per DB, embedded with ``qwen`` and memoized by
+      :class:`EmbeddingCache`. That is the table the router routes on (``gloss/text/schema.py``).
+    * free-text **cell values** — ~96M strings across the 7 RelBench DBs, embedded once at graph
+      materialization and stored densely in the TensorFrame. This function is for those.
+
+    Do **not** wrap the result in :class:`EmbeddingCache`: at 96M distinct strings the memo dict is the
+    problem rather than the fix, and ``make_pkey_fkey_graph``'s per-table graph cache already makes the
+    pass idempotent. ``batch_size`` defaults far above the name-table default because this pass is
+    GPU-bound over tens of millions of short strings.
+
+    ``d_text`` here also sets the on-disk size of every text column (``n_cells x d x 4`` bytes), which
+    is why ``minilm`` (384) and not ``qwen`` (2560) is the default for values: 138 GB corpus-wide
+    instead of 918 GB, and ~64 GB rather than ~430 GB resident to load rel-amazon.
+    """
+    model_id = ENCODER_MODELS.get(label_or_id, label_or_id)
+    if label_or_id in ST_ENCODERS or model_id.startswith("sentence-transformers/"):
+        return QwenEncoder(model_id, batch_size=batch_size, device=device)
+    return make_text_encoder(label_or_id, device=device, batch_size=batch_size)
 
 
 def _l2(x: Tensor) -> Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _as_texts(texts) -> list[str]:
+    """Coerce an embedder input batch to plain strings, mapping missing values to ``""``.
+
+    Needed for **cell values**, not for names: a free-text column with missing entries arrives from
+    pandas as ``float('nan')``, and sentence-transformers 5.x rejects it outright
+    (``ValueError: Unsupported input type: float``) rather than stringifying it the way
+    :class:`HashTextEmbedder`'s ``str(s)`` silently did. Mapping NaN to the empty string keeps the
+    row count aligned with the TensorFrame, which is what the dense embedding column requires.
+    """
+    out: list[str] = []
+    for t in texts:
+        if t is None or (isinstance(t, float) and t != t):     # NaN is the only x != x
+            out.append("")
+        else:
+            out.append(t if isinstance(t, str) else str(t))
+    return out
 
 
 class HashEncoder:
@@ -92,7 +142,7 @@ class QwenEncoder:
     def __call__(self, texts: list[str], kind: str = "document") -> Tensor:
         prompt = self.query_instruction if kind == "query" else None
         emb = self.model.encode(
-            list(texts),
+            _as_texts(texts),
             prompt=prompt,
             batch_size=self.batch_size,
             convert_to_numpy=False,

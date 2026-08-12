@@ -19,6 +19,7 @@ needs a ``TextEmbedderConfig``. For Phase-0 substrate work we default to a cheap
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -243,7 +244,22 @@ class HashTextEmbedder:
 
     Maps each string to a fixed pseudo-random unit-ish vector via a seeded RNG on its hash. Meaningless
     semantically, but stable and fast — enough to materialize node features for shape/leakage tests and
-    the --dry-run. Real cell-text semantics are a later concern (swap via `build_gloss_graph(..., text_embedder=...)`).
+    the --dry-run. For anything measured, pass a real encoder
+    (``build_gloss_graph(..., text_encoder='minilm')``): roughly half of every RelBench schema is
+    free text, so this fallback blanks out half the input.
+
+    **The seed is `hashlib`, not the builtin `hash()`.** Python randomizes string hashing per process
+    unless ``PYTHONHASHSEED`` is set in the *parent* environment, and ``seed_everything`` sets it too
+    late to matter (it only affects processes spawned afterwards). With the builtin, every process
+    materialized a *different* rel-f1: measured drift of ~1e-3 in a freshly built batch's loss, which
+    is what made ``test_regression_overfits_single_batch`` fail about one run in three against a
+    threshold it otherwise clears by two orders of magnitude. ``HashEncoder`` in ``text/cache.py``
+    (the column-NAME table) always used ``hashlib`` and was never affected.
+
+    Cached graphs are unaffected either way: ``make_pkey_fkey_graph(cache_dir=...)`` loads the
+    materialized TensorFrame from disk and never calls an embedder, so every number reported off a
+    cached bundle stands. Only freshly built (cache-less) bundles change — and they change from
+    "different every process" to "the same every process".
     """
 
     def __init__(self, dim: int = 32):
@@ -252,7 +268,8 @@ class HashTextEmbedder:
     def __call__(self, sentences: list[str]) -> Tensor:  # noqa: D401
         out = torch.empty(len(sentences), self.dim)
         for i, s in enumerate(sentences):
-            g = torch.Generator().manual_seed(hash(str(s)) & 0x7FFFFFFF)
+            digest = hashlib.sha256(str(s).encode()).hexdigest()[:16]
+            g = torch.Generator().manual_seed(int(digest, 16) & 0x7FFFFFFF)
             out[i] = torch.rand(self.dim, generator=g)
         return out
 
@@ -352,12 +369,25 @@ def build_gloss_graph(
     dataset_name: str = "rel-f1",
     *,
     text_embedder: Callable[[list[str]], Tensor] | None = None,
+    text_encoder: str | None = None,
     text_embed_dim: int = 32,
     text_batch_size: int = 256,
     cache_dir: str | None = None,
     download: bool = False,
 ) -> GraphBundle:
-    """Load a RelBench dataset and build the HALOS graph bundle (graph + stats + vocabs)."""
+    """Load a RelBench dataset and build the graph bundle (graph + stats + vocabs).
+
+    ``text_encoder`` names the frozen encoder for **free-text cell values** (``'minilm'``, ``'qwen'``,
+    or a raw HF id); ``text_embedder`` passes a callable directly. With neither, values fall back to
+    :class:`HashTextEmbedder` — deterministic pseudo-random vectors, which is fine for shape/leakage
+    tests and was, until 2026-08-12, silently what every real run used as well. Roughly half of every
+    RelBench schema is free text (rel-trial 47/102 columns, rel-stack 15/32), so that fallback is a
+    dev convenience, not a sane training default: pass ``text_encoder`` for anything measured.
+
+    ``cache_dir`` must be keyed by the same encoder (``utils.paths.graph_cache_dir(ds, enc)``) — the
+    materialized TensorFrames *contain* the embedded values, so reusing a hash-built cache for a
+    minilm run would silently serve the wrong data.
+    """
     from relbench.datasets import get_dataset
     from relbench.modeling.graph import make_pkey_fkey_graph
     from relbench.modeling.utils import get_stype_proposal
@@ -366,7 +396,14 @@ def build_gloss_graph(
     dataset = get_dataset(dataset_name, download=download)
     db = dataset.get_db(upto_test_timestamp=False)
     stype_dict = get_stype_proposal(db)
-    embedder = text_embedder if text_embedder is not None else HashTextEmbedder(text_embed_dim)
+    if text_embedder is not None:
+        embedder = text_embedder
+    elif text_encoder and text_encoder != "hash":
+        from ..text.cache import value_encoder
+
+        embedder = value_encoder(text_encoder)
+    else:
+        embedder = HashTextEmbedder(text_embed_dim)
     cfg = TextEmbedderConfig(text_embedder=embedder, batch_size=text_batch_size)
     data, col_stats = make_pkey_fkey_graph(db, stype_dict, text_embedder_cfg=cfg, cache_dir=cache_dir)
 

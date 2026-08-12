@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from .flex_cell import (FLEX_MIN_HEAD_DIM, HAS_FLEX, build_cell_block_mask, cell_score_mod,
@@ -139,12 +140,15 @@ class TwoLevelBlock(nn.Module):
         cell_route_dim: int | None = None,
         cell_num_experts: int = 4,
         cell_k: int = 2,
+        cell_num_shared: int = 0,
         pool_slots: int = 4,
         row_num_experts: int = 4,
         row_k: int = 2,
         row_use_shared: bool = True,
+        row_num_shared: int | None = None,
         lambda_ortho: float = 0.5,
         lambda_balance: float = 0.01,
+        dispatch: str = "dense",
     ):
         super().__init__()
         self.cell_ffn_mode = cell_ffn
@@ -157,7 +161,8 @@ class TwoLevelBlock(nn.Module):
         self.cell_ffn_norm = RMSNorm(d_model)
         if cell_ffn == "moe":
             self.cell_ffn = MoEFFN(d_model, d_ff, int(cell_route_dim or d_sig),
-                                   num_experts=cell_num_experts, k=cell_k)
+                                   num_experts=cell_num_experts, k=cell_k,
+                                   num_shared=cell_num_shared, dispatch=dispatch)
         else:
             self.cell_ffn = SwiGLU(d_model, d_ff)
 
@@ -165,8 +170,9 @@ class TwoLevelBlock(nn.Module):
         self.pool = RowPool(d_model, d_sig, col_name_emb, slots=pool_slots)
         self.row_attn = RowAttention(d_model, d_sig, role_name_emb, ladder, n_heads=n_heads)
         self.row_ffn = RowMoE(d_model, d_ff, d_sig, num_experts=row_num_experts, k=row_k,
-                              use_shared=row_use_shared,
-                              lambda_ortho=lambda_ortho, lambda_balance=lambda_balance)
+                              use_shared=row_use_shared, num_shared=row_num_shared,
+                              lambda_ortho=lambda_ortho, lambda_balance=lambda_balance,
+                              dispatch=dispatch)
         self.broadcast = Broadcast(d_model)
 
     def forward(self, h: Tensor, u: Tensor, z: Tensor, s: Tensor, cb, block_mask=None):
@@ -175,7 +181,10 @@ class TwoLevelBlock(nn.Module):
 
         hn = self.cell_ffn_norm(h)                                         # 2. cell FFN
         if self.cell_ffn_mode == "moe":
-            y, _g = self.cell_ffn(hn, z)
+            # Padding is handed to the sparse path and ignored by the dense one (see MoEFFN.forward).
+            # It is the bigger of the two savings here: a sampled sequence runs 6-20% full at
+            # seq_len=1024 on every DB measured except rel-f1's widest seed table.
+            y, _g = self.cell_ffn(hn, z, valid=~cb.is_padding)
             h = h + y
             aux_cell = self.cell_ffn.ortho_loss()
         else:
@@ -210,10 +219,19 @@ class TwoLevelSubstrate(nn.Module):
         n_heads: int = 8,
         max_hop: int = 8,
         ladder: TimeLadder | None = None,
+        grad_checkpoint: bool = False,
+        mean_aux: bool = False,
         **block_kw,
     ):
         super().__init__()
         self.ladder = ladder or TimeLadder()
+        self.grad_checkpoint = grad_checkpoint
+        # `aux` is a SUM over blocks, so its scale grows with depth AND with the expert count (the
+        # ortho term is over an E x E Gram matrix). lambda_ortho=0.5 was tuned at E=4 / 8 blocks; at
+        # E=8 / 10 blocks / two levels the same lambda is a different objective. `mean_aux` divides by
+        # n_blocks so lambda means the same thing at any depth. Off by default: switching it on would
+        # move every reported number.
+        self.mean_aux = mean_aux
         self.row_sig = RowSignature(table_name_emb, role_name_emb, self.ladder,
                                     d_sig=d_sig, max_hop=max_hop)
         self.w_u = nn.Linear(d_model + d_sig, d_model, bias=False)
@@ -239,14 +257,23 @@ class TwoLevelSubstrate(nn.Module):
         block_mask = build_cell_block_mask(cb.is_padding) if self.needs_block_mask else None
 
         h = x
-        aux = x.new_zeros(())
         aux_cell_total = x.new_zeros(())
         aux_row_total = x.new_zeros(())
         diags: list[dict] = []
         for blk in self.blocks:
-            h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, block_mask)
+            if self.grad_checkpoint and self.training:
+                # `use_reentrant=False` is required: the reentrant autograd path cannot handle a
+                # block that returns a dict, and it silently drops grads for inputs that are not
+                # tensors (z, s and cb all are, or contain, non-tensor state).
+                h, u, aux_cell, aux_row, diag = torch.utils.checkpoint.checkpoint(
+                    blk, h, u, z, s, cb, block_mask, use_reentrant=False)
+            else:
+                h, u, aux_cell, aux_row, diag = blk(h, u, z, s, cb, block_mask)
             aux_cell_total = aux_cell_total + aux_cell
             aux_row_total = aux_row_total + aux_row
             diags.append(diag)
+        if self.mean_aux and self.blocks:
+            aux_cell_total = aux_cell_total / len(self.blocks)
+            aux_row_total = aux_row_total / len(self.blocks)
         aux = aux_cell_total + aux_row_total
         return h, u, aux, {"aux_cell": aux_cell_total, "aux_row": aux_row_total, "blocks": diags}
