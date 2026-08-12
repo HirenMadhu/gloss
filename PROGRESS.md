@@ -196,3 +196,39 @@ fixture fixed and `init` identical to 4 dp, three sequential CUDA trials hit 0.5
 at step 200 and the third was still 0.9655 at step 600 — different basins, not last-bit noise, out of
 `RowPool`'s atomic `index_add`. Pinned to CPU, where it is bit-reproducible (0.000004 at step 200,
 three trials) and *faster*. DoD: `pytest` **281 passed** (258 + 23 new), twice, in 39 s.
+
+**Phase 2 — the masked-cell objective [done].** `gloss/data/masking.py` (`ColumnTargetSpec`,
+`maskable_cells`, `sample_cell_mask`, `gather_masked_targets`), a per-stype mask token in
+`CellEncoder`, `gloss/model/mlm_head.py`, and `MoRE.forward(cell_mask=, return_cells=)` — the
+substrate already computed the cell states and `more.py:80` was throwing them away.
+
+*Objective.* Hybrid: one masked cell on the seed root row (RT's shape — `rt-v1` masks exactly one cell
+per sequence, the seed's target column) **plus** Bernoulli-`p` over the remaining candidates.
+`p_random=0` is the RT-faithful arm, `seed_target=False` is plain BERT. Maskable = numerical
+(Huber on the col-stats z-score, the same normalization `LinearEncoder` applies to the input) +
+categorical (CE). Excluded, each for a reason: **timestamp** (relbench republishes the time column as
+`row_time` on every cell of the row, so predicting it is reading it), **text/embedding** (RT:
+"masking text not supported"), multicategorical, zero-variance and `__const__` columns. NaN cells are
+removed from the pool *before* the draw, so a masked position always has a label.
+
+*The categorical head is tied to the encoder's own category table.* torch_frame keeps one `nn.Embedding`
+per table for all its categorical columns with a per-column `offset`; the head projects to
+`enc_channels` and scores against `emb.weight[cat_base : cat_base+n_cat]`. So the head has **no**
+vocabulary-shaped parameter and loads onto an unseen schema unchanged (§0) — asserted, along with the
+encoder-offset-vs-`col_stats`-cumsum cross-check.
+
+*Three things measured while building it, all of which change how the loader must work.*
+(1) **rel-f1's entity table `drivers` has zero maskable columns** (all 6 are text/timestamp), so the
+seed-target half is structurally silent on every rel-f1 driver task; 7 of rel-trial's 15 tables are
+the same, including `facilities_studies` at 1.87M rows (~half that DB). This is why Phase 3 weights
+seed tables by *maskable* rows rather than raw rows. Pinned as a test.
+(2) **`nn.ModuleDict` has no `.get`** — a `.get("categorical")` silently returned None for every
+table, so the tied head fell back to no categorical branch and the offset cross-check never ran.
+(3) **RT's zero-init numerical decoder passes no gradient into the trunk at step 0** (`dloss/dh =
+err*W = 0`), so a naive "gradients reach the encoder" check fails against a healthy model. The
+categorical branch is not zero-init and does feed the trunk immediately; both are asserted separately.
+
+DoD: `pytest` **304 passed**, twice (`test_masking.py` 14, `test_pretrain_head.py` 9). Masks never land
+on padding / unmaskable / NaN cells; targets match a hand gather through `cell_placement`; a masked
+cell's routing signature `z` is **bit-identical** to the unmasked one (the property the method rests
+on); the objective overfits one batch on CPU.

@@ -74,8 +74,30 @@ class MoRE(nn.Module):
         )
         self.head = RowTokenHead(d_model, out_dim)
 
-    def forward(self, cb: CellBatch):
-        x = self.encoder(cb)
+    def category_table(self, node_type: str):
+        """The per-DB categorical embedding matrix for ``node_type``, or None.
+
+        Exposed so :class:`~gloss.model.mlm_head.MaskedCellHead` can tie its logits to it instead of
+        owning a vocabulary-shaped output layer of its own.
+        """
+        enc = self.encoder.cell_encoders
+        if node_type not in enc:
+            return None
+        # nn.ModuleDict has no `.get`; use membership + indexing or this silently returns None.
+        sub = getattr(enc[node_type], "encoder_dict", None)
+        if sub is None or "categorical" not in sub:
+            return None
+        return sub["categorical"].emb.weight
+
+    def forward(self, cb: CellBatch, *, cell_mask=None, return_cells: bool = False):
+        """-> ``(logits, aux)``, or ``(logits, aux, cells)`` when ``return_cells``.
+
+        ``cell_mask`` withholds those cells' values (masked-cell pretraining); ``return_cells`` hands
+        back the ``[B, S, d_model]`` cell states the substrate already computes and this method
+        otherwise discards, which is what the reconstruction head reads.
+        """
+        x = self.encoder(cb, cell_mask)
         z = self.signature(cb)
-        _cells, rows, aux, _diag = self.substrate(x, cb, z=z)
-        return self.head(rows, cb), aux                       # [B, out_dim], scalar aux
+        cells, rows, aux, _diag = self.substrate(x, cb, z=z)
+        logits = self.head(rows, cb)                          # [B, out_dim], scalar aux
+        return (logits, aux, cells) if return_cells else (logits, aux)

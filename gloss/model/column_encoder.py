@@ -25,6 +25,7 @@ from torch import Tensor, nn
 
 from ..data.collate import CellBatch, column_vocab, feature_col_names
 from ..data.graph import GraphBundle
+from ..text.schema import build_column_modality_ids
 
 
 def _default_stype_encoders(col_names_dict):
@@ -89,6 +90,16 @@ class CellEncoder(nn.Module):
         self.w_v = nn.Linear(enc_channels, d_model)
         self.name_proj = nn.Linear(self.d_text, d_model)
 
+        # Masked-cell pretraining: the value component is replaced by a learned vector, PER MODALITY.
+        # RT does exactly this (`mask_embs = ParameterDict({t: Parameter(randn(d_model))})`, one per
+        # datatype). Sized by the pinned `N_STYPES`, never by `C`, so it is legal under the §0
+        # no-dataset-artifact rule and transfers to a schema it never saw.
+        from ..text.schema import N_STYPES
+
+        self.mask_emb = nn.Embedding(N_STYPES, d_model)
+        modality_id, _ = build_column_modality_ids(bundle)
+        self.register_buffer("modality_id", modality_id, persistent=False)
+
     def encode_type(self, nt: str, tf) -> tuple[Tensor, Tensor]:
         """Encode all rows of one node type -> (cell, value) each ``[n, C, d_model]`` (sorted cols)."""
         x, col_names = self.cell_encoders[nt](tf)                 # [n, C0, enc_channels]
@@ -101,8 +112,30 @@ class CellEncoder(nn.Module):
         cell = value + self.name_proj(name).unsqueeze(0)          # + RT name token
         return cell, value
 
-    def forward(self, cb: CellBatch):
+    def masked_token(self, cb: CellBatch) -> torch.Tensor:
+        """``[B, S, d_model]`` — what a masked cell looks like: ``mask_emb[modality] + W_name name_c``.
+
+        The **name token survives masking**, exactly as in RT: the model is always told *which* column
+        it is being asked to reconstruct, and only the value is withheld. Note the routing signature
+        (``model/signature.py``) is value-free, so it is unchanged here too — a masked cell still
+        routes to the experts its column, modality and recency imply. That is what makes the objective
+        well-posed under this architecture rather than merely compatible with it.
+        """
+        gid = cb.col_idxs.clamp_min(0)
+        B, S = gid.shape
+        flat = gid.reshape(-1)
+        name = self.name_emb.index_select(0, flat).view(B, S, -1)
+        mod = self.modality_id.index_select(0, flat).view(B, S)
+        return self.mask_emb(mod) + self.name_proj(name)
+
+    def forward(self, cb: CellBatch, cell_mask: torch.Tensor | None = None):
         """-> cell states ``[B, S, d_model]`` (zeros at pad).
+
+        ``cell_mask`` (``[B, S]`` bool) replaces those cells' encoded value with the learned per-stype
+        mask token; see :meth:`masked_token`. The value encoder still runs on the masked cells and its
+        output is discarded — wasteful by a hair, and the alternative (corrupting ``feat_dict`` before
+        the stype encoders) would mean reaching into torch_frame's tensors, which is how you leak a
+        value by accident.
 
         The value component is no longer returned: it fed the retired ``value`` routing arm.
         ``encode_type`` still yields it, because ``cell = value + name`` is how the cell token is
@@ -117,5 +150,8 @@ class CellEncoder(nn.Module):
             b_idx, s_idx = b_idx.to(dev), s_idx.to(dev)
             row_idx, col_idx = row_idx.to(dev), col_idx.to(dev)
             h[b_idx, s_idx] = cell[row_idx, col_idx]
+        if cell_mask is not None:
+            cm = cell_mask.to(dev).unsqueeze(-1)
+            h = torch.where(cm, self.masked_token(cb), h)
         mask = (~cb.is_padding).to(dev).unsqueeze(-1)
         return h * mask
